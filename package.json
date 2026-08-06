@@ -1,0 +1,23 @@
+{
+  "name": "handoff",
+  "version": "0.1.0",
+  "description": "Search across every local coding-agent session (Claude Code, Codex, OpenCode, Pi, Muse, Grok) and resume any one of them in any agent.",
+  "type": "module",
+  "bin": {
+    "handoff": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.7.0",
+    "commander": "^14.0.1",
+    "fuzzysort": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

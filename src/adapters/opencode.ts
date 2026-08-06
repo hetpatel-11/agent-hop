@@ -16,15 +16,27 @@ function hasOpencode(): boolean {
   }
 }
 
+const MAX_BODY_CHARS = 40000;
+
 async function listSessions(): Promise<SessionRef[]> {
   if (!existsSync(DB_PATH) || !hasOpencode()) return [];
 
+  // Pull message text via a SQL join (not `opencode export` per session --
+  // that would mean one subprocess spawn per session just to list, far too
+  // slow at scale). Still pure SQL, so this stays fast.
   let out: string;
   try {
     out = execFileSync(
       "sqlite3",
       ["-json", `file:${DB_PATH}?mode=ro`,
-       "SELECT id, directory, title, time_updated FROM session WHERE directory IS NOT NULL ORDER BY time_updated DESC LIMIT 500"],
+       `SELECT s.id, s.directory, s.title, s.time_updated,
+               SUBSTR(GROUP_CONCAT(json_extract(p.data, '$.text'), ' '), 1, ${MAX_BODY_CHARS}) AS body
+        FROM session s
+        LEFT JOIN part p ON p.session_id = s.id AND json_extract(p.data, '$.type') = 'text'
+        WHERE s.directory IS NOT NULL
+        GROUP BY s.id
+        ORDER BY s.time_updated DESC
+        LIMIT 500`],
       { encoding: "utf-8" }
     );
   } catch {
@@ -32,7 +44,7 @@ async function listSessions(): Promise<SessionRef[]> {
   }
   if (!out.trim()) return [];
 
-  let rows: { id: string; directory: string; title?: string; time_updated?: number }[];
+  let rows: { id: string; directory: string; title?: string; time_updated?: number; body?: string }[];
   try {
     rows = JSON.parse(out);
   } catch {
@@ -45,6 +57,7 @@ async function listSessions(): Promise<SessionRef[]> {
     projectPath: row.directory,
     title: (row.title ?? "(untitled)").slice(0, 80),
     snippet: row.title ?? "",
+    body: row.body ?? row.title ?? "",
     updatedAt: row.time_updated ?? Date.now(),
     raw: {},
   }));

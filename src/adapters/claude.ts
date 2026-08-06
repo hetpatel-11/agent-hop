@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -18,20 +18,34 @@ function encodeDir(cwd: string): string {
   return real.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
+const MAX_BODY_CHARS = 40000;
+
 async function listSessions(): Promise<SessionRef[]> {
   const files = findFiles(PROJECTS_DIR, (p) => p.endsWith(".jsonl"));
   const out: SessionRef[] = [];
   for (const file of files) {
-    const lines = readJsonlLines(file);
     let cwd: string | undefined;
     let firstUserText = "";
-    for (const obj of lines) {
+    let body = "";
+    for await (const obj of readJsonlLinesLazy(file)) {
       if (typeof obj.cwd === "string") cwd = obj.cwd;
-      if (!firstUserText && obj.type === "user") {
-        const message = obj.message as { content?: unknown } | undefined;
-        if (typeof message?.content === "string") firstUserText = message.content;
+      if (obj.type !== "user" && obj.type !== "assistant") continue;
+      const message = obj.message as { role?: string; content?: unknown } | undefined;
+      let text = "";
+      if (typeof message?.content === "string") {
+        text = message.content;
+      } else if (Array.isArray(message?.content)) {
+        text = message.content
+          .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+          .map((b) => b.text)
+          .join(" ");
       }
-      if (cwd && firstUserText) break;
+      if (!text) continue;
+      if (!firstUserText && obj.type === "user") firstUserText = text;
+      if (body.length < MAX_BODY_CHARS) body += text + " ";
+      // once we have a title candidate and enough body text, parsing the
+      // rest of a huge file just to discard it is wasted work
+      if (cwd && firstUserText && body.length >= MAX_BODY_CHARS) break;
     }
     if (!cwd) continue;
     const sessionId = file.split("/").pop()!.replace(/\.jsonl$/, "");
@@ -41,6 +55,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: firstUserText.slice(0, 80) || "(empty)",
       snippet: firstUserText.slice(0, 200),
+      body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

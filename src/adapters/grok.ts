@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".grok", "sessions");
 
@@ -13,6 +13,8 @@ function extractUserQuery(text: string): string | null {
   if (start === -1 || end === -1) return null;
   return text.slice(start + "<user_query>".length, end).trim();
 }
+
+const MAX_BODY_CHARS = 40000;
 
 async function listSessions(): Promise<SessionRef[]> {
   const summaryFiles = findFiles(SESSIONS_DIR, (p) => p.endsWith("summary.json"));
@@ -33,17 +35,21 @@ async function listSessions(): Promise<SessionRef[]> {
     if (!sessionId || !cwd) continue;
 
     let firstUserText = "";
-    for (const obj of readJsonlLines(chatFile)) {
+    let body = "";
+    for await (const obj of readJsonlLinesLazy(chatFile)) {
       if (obj.type === "user" && Array.isArray(obj.content)) {
         for (const b of obj.content as { text?: string }[]) {
           const q = extractUserQuery(b.text ?? "");
           if (q) {
-            firstUserText = q;
+            if (!firstUserText) firstUserText = q;
+            if (body.length < MAX_BODY_CHARS) body += q + " ";
             break;
           }
         }
+      } else if (obj.type === "assistant" && typeof obj.content === "string" && obj.content.trim()) {
+        if (body.length < MAX_BODY_CHARS) body += obj.content.trim() + " ";
       }
-      if (firstUserText) break;
+      if (firstUserText && body.length >= MAX_BODY_CHARS) break;
     }
 
     out.push({
@@ -52,6 +58,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: (summary.generated_title as string) || firstUserText.slice(0, 80) || "(empty)",
       snippet: firstUserText.slice(0, 200),
+      body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(chatFile),
       raw: { file: chatFile },
     });

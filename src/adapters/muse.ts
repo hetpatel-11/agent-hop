@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const SESSIONS_DIR = join(homedir(), ".local", "share", "muse", "sessions");
@@ -18,24 +18,31 @@ function hasMuse(): boolean {
   }
 }
 
+const MAX_BODY_CHARS = 40000;
+
 async function listSessions(): Promise<SessionRef[]> {
   const files = findFiles(SESSIONS_DIR, (p) => p.endsWith("session.jsonl") && !p.includes("/subagent/"));
   const out: SessionRef[] = [];
   for (const file of files) {
-    const lines = readJsonlLines(file);
     const sessionId = file.split("/").slice(-2, -1)[0];
     let cwd: string | undefined;
     let firstPrompt = "";
-    for (const d of lines) {
-      const payload = d.payload as { kind?: string; record?: Record<string, unknown> } | undefined;
+    let body = "";
+    for await (const d of readJsonlLinesLazy(file)) {
+      const payload = d.payload as { kind?: string; record?: Record<string, unknown>; event?: Record<string, unknown> } | undefined;
       if (payload?.kind === "route_facts") {
         cwd = (payload.record as { cwd?: string } | undefined)?.cwd;
       }
       const rec = payload?.record as { kind?: string; command?: { kind?: string; prompt?: string } } | undefined;
-      if (!firstPrompt && rec?.kind === "received" && rec.command?.kind === "turn_submit" && rec.command.prompt) {
-        firstPrompt = rec.command.prompt;
+      if (rec?.kind === "received" && rec.command?.kind === "turn_submit" && rec.command.prompt) {
+        if (!firstPrompt) firstPrompt = rec.command.prompt;
+        if (body.length < MAX_BODY_CHARS) body += rec.command.prompt + " ";
       }
-      if (cwd && firstPrompt) break;
+      const ev = payload?.event as { kind?: string; text?: string } | undefined;
+      if (ev?.kind === "assistant_message_committed" && ev.text) {
+        if (body.length < MAX_BODY_CHARS) body += ev.text + " ";
+      }
+      if (cwd && firstPrompt && body.length >= MAX_BODY_CHARS) break;
     }
     if (!cwd) continue;
     out.push({
@@ -44,6 +51,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: firstPrompt.slice(0, 80) || "(empty)",
       snippet: firstPrompt.slice(0, 200),
+      body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

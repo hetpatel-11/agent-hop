@@ -8,7 +8,7 @@ import type { ToolName, SessionRef } from "./types.js";
 
 const program = new Command();
 program
-  .name("handoff")
+  .name("resumeagent")
   .description("Search across every local coding-agent session and resume any one in any agent.")
   .argument("[query]", "search query (omitted = interactive prompt)")
   .option("-a, --agent <tool>", "restrict search to one agent (claude|codex|opencode|pi|muse|grok)")

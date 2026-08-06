@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -18,31 +18,34 @@ function encodeDir(cwd: string): string {
   return "--" + components.join("-") + "--";
 }
 
+const MAX_BODY_CHARS = 40000;
+
 async function listSessions(): Promise<SessionRef[]> {
   const files = findFiles(SESSIONS_DIR, (p) => p.endsWith(".jsonl"));
   const out: SessionRef[] = [];
   for (const file of files) {
-    const lines = readJsonlLines(file);
     let sessionId: string | undefined;
     let cwd: string | undefined;
     let firstUserText = "";
-    for (const obj of lines) {
+    let body = "";
+    for await (const obj of readJsonlLinesLazy(file)) {
       if (obj.type === "session") {
         sessionId = obj.id as string | undefined;
         cwd = obj.cwd as string | undefined;
         continue;
       }
-      if (!firstUserText && obj.type === "message") {
-        const message = obj.message as { role?: string; content?: unknown } | undefined;
-        if (message?.role === "user" && Array.isArray(message.content)) {
-          const parts = message.content
-            .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-            .map((b) => b.text);
-          const text = parts.join("\n").trim();
-          if (text) firstUserText = text;
-        }
-      }
-      if (sessionId && cwd && firstUserText) break;
+      if (obj.type !== "message") continue;
+      const message = obj.message as { role?: string; content?: unknown } | undefined;
+      if (message?.role !== "user" && message?.role !== "assistant") continue;
+      if (!Array.isArray(message.content)) continue;
+      const parts = message.content
+        .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+        .map((b) => b.text);
+      const text = parts.join("\n").trim();
+      if (!text) continue;
+      if (!firstUserText && message.role === "user") firstUserText = text;
+      if (body.length < MAX_BODY_CHARS) body += text + " ";
+      if (sessionId && cwd && firstUserText && body.length >= MAX_BODY_CHARS) break;
     }
     if (!sessionId || !cwd) continue;
     out.push({
@@ -51,6 +54,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: firstUserText.slice(0, 80) || "(empty)",
       snippet: firstUserText.slice(0, 200),
+      body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

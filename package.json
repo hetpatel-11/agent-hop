@@ -16,8 +16,7 @@
   ],
   "dependencies": {
     "@clack/prompts": "^1.7.0",
-    "commander": "^14.0.1",
-    "fuzzysort": "^3.1.0"
+    "commander": "^14.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.7.2",

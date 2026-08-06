@@ -1,4 +1,4 @@
-# handoff
+# resumeagent
 
 Search across every local coding-agent session on your machine — Claude Code,
 Codex, OpenCode, Pi, Muse, and Grok Build — and resume any one of them in any
@@ -8,7 +8,7 @@ target agent picks up with the real conversation history.
 ## Install
 
 ```bash
-npm install -g handoff
+npm install -g resumeagent
 ```
 
 (Not published yet — for now, clone and build locally, see [Development](#development).)
@@ -16,7 +16,7 @@ npm install -g handoff
 ## Usage
 
 ```bash
-handoff
+resumeagent
 ```
 
 Walks you through:
@@ -31,7 +31,7 @@ Walks you through:
 Non-interactive / scriptable form:
 
 ```bash
-handoff "auth migration" --agent claude --resume-in codex
+resumeagent "auth migration" --agent claude --resume-in codex
 ```
 
 | Flag | Description |
@@ -59,7 +59,7 @@ against a real model.
 
 Each tool stores sessions on disk in its own format — some as flat JSONL
 files, some behind an official export/import CLI, one as an event-sourced
-trace log. `handoff` normalizes all of them to one shape:
+trace log. `resumeagent` normalizes all of them to one shape:
 
 ```ts
 interface Turn { role: "user" | "assistant"; text: string }
@@ -99,10 +99,10 @@ Adding a new agent means writing one new adapter file; nothing else changes.
 
 ```bash
 git clone <this-repo>
-cd handoff
+cd resumeagent
 npm install
 npm run build
-npm link   # makes `handoff` available globally, pointing at your local build
+npm link   # makes `resumeagent` available globally, pointing at your local build
 ```
 
 `npm run dev` runs the CLI directly via `tsx`, no build step needed.

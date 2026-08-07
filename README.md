@@ -32,6 +32,12 @@ exact session.
 npm install -g agent-hop
 ```
 
+Or with Bun, if you already use it:
+
+```bash
+bun install -g agent-hop
+```
+
 ## Usage
 
 ```bash

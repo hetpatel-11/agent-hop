@@ -4,8 +4,23 @@ import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
+import { cleanTitle } from "../util.js";
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
+
+/** The real installed opencode version, e.g. "1.18.15" -- a hardcoded guess
+ * here goes stale the moment opencode updates itself (this was already
+ * stuck at "1.17.7" against a real 1.18.15 install by the time this was
+ * caught). Falls back to a generic placeholder if opencode isn't on PATH. */
+function opencodeCliVersion(): string {
+  try {
+    const out = execFileSync("opencode", ["--version"], { encoding: "utf-8" });
+    const match = out.match(/(\d+\.\d+\.\d+)/);
+    return match ? match[1] : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 function hasOpencode(): boolean {
   try {
@@ -51,16 +66,23 @@ async function listSessions(): Promise<SessionRef[]> {
     return [];
   }
 
-  return rows.map((row) => ({
-    tool: "opencode" as const,
-    sessionId: row.id,
-    projectPath: row.directory,
-    title: (row.title ?? "(untitled)").slice(0, 80),
-    snippet: row.title ?? "",
-    body: row.body ?? row.title ?? "",
-    updatedAt: row.time_updated ?? Date.now(),
-    raw: {},
-  }));
+  return rows.map((row) => {
+    // OpenCode's own placeholder before it auto-generates a real title --
+    // useless for search/display, prefer real body content when we have it.
+    const isPlaceholder = !row.title || /^New session - \d{4}-\d{2}-\d{2}/.test(row.title);
+    const bodyFirstLine = (row.body ?? "").trim().split(/\s+/).slice(0, 20).join(" ");
+    const title = cleanTitle(isPlaceholder && bodyFirstLine ? bodyFirstLine : (row.title ?? "(untitled)"));
+    return {
+      tool: "opencode" as const,
+      sessionId: row.id,
+      projectPath: row.directory,
+      title: title || "(untitled)",
+      snippet: title.slice(0, 200),
+      body: row.body ?? row.title ?? "",
+      updatedAt: row.time_updated ?? Date.now(),
+      raw: {},
+    };
+  });
 }
 
 function exportSession(sessionId: string): { info: Record<string, unknown>; messages: { info: Record<string, unknown>; parts: { type: string; text?: string }[] }[] } | null {
@@ -173,15 +195,19 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   const exportShape = {
     info: {
       id: newSessionId,
-      parentID: newSessionId,
+      // no parentID -- a real top-level session doesn't have one (confirmed
+      // against a live `opencode export`). Setting it (even to its own new
+      // id) makes opencode treat the session as a child/subagent session
+      // instead of a normal top-level chat, which is why the resumed
+      // session was rendering as if it were "thinking" as a subagent.
       slug: "resumed-via-handoff",
       projectID: "global",
       directory: projectPath,
       path: projectPath.replace(/^\//, ""),
-      title: "Resumed via handoff",
+      title: (turns.find((t) => t.role === "user")?.text ?? "Resumed via agentresume").slice(0, 80),
       agent: "build",
       model: { id: "big-pickle", providerID: "opencode" },
-      version: "1.17.7",
+      version: opencodeCliVersion(),
       time: { created: nowMs, updated: nowMs },
     },
     messages,
@@ -193,8 +219,13 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   try {
     // must run with cwd=projectPath -- opencode ties the imported session to
     // whatever directory the `import` process was actually run from, not the
-    // "directory" field inside the JSON payload.
-    execFileSync("opencode", ["import", tmpFile], { stdio: "pipe", cwd: projectPath });
+    // "directory" field inside the JSON payload. If the original project dir
+    // no longer exists on disk (moved/deleted since the source session was
+    // created), fall back to homedir() -- otherwise spawnSync throws a
+    // misleading ENOENT that looks like "opencode not found" when the real
+    // problem is the missing cwd.
+    const importCwd = existsSync(projectPath) ? projectPath : homedir();
+    execFileSync("opencode", ["import", tmpFile], { stdio: "pipe", cwd: importCwd });
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -203,7 +234,12 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
 }
 
 function resumeCmd(sessionId: string, _projectPath: string): string[] {
-  return ["opencode", "run", "--session", sessionId];
+  // `opencode run` is for one-shot non-interactive messages -- it errors
+  // ("You must provide a message or a command") if given only --session with
+  // no message, even though the session id is valid. The default top-level
+  // command (no subcommand) is what actually opens the interactive TUI
+  // resumed at a given session.
+  return ["opencode", "--session", sessionId];
 }
 
 export const opencodeAdapter: Adapter = { tool: "opencode", listSessions, read, write, resumeCmd };

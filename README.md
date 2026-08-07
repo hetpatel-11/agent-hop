@@ -1,27 +1,25 @@
-# resumeagent
+# agentresume
 
 Search across every local coding-agent session on your machine — Claude Code,
-Codex, OpenCode, Pi, Muse, and Grok Build — and resume any one of them in any
+Codex, OpenCode, Pi, and Grok Build — and resume any one of them in any
 other agent. Not a summary, not a briefing: a genuine native resume, so the
 target agent picks up with the real conversation history.
 
 ## Install
 
 ```bash
-npm install -g resumeagent
+npm install -g agentresume
 ```
-
-(Not published yet — for now, clone and build locally, see [Development](#development).)
 
 ## Usage
 
 ```bash
-resumeagent
+agentresume
 ```
 
 Walks you through:
 
-1. **Which agent(s) to search?** — all six, or restrict to one
+1. **Which agent(s) to search?** — all five, or restrict to one
 2. **Search for:** — fuzzy match across session titles, snippets, and project paths
 3. **Pick a session** — numbered list with tool, title, project, and recency
 4. **Resume in which agent?** — defaults to the same tool (native resume), or
@@ -31,7 +29,7 @@ Walks you through:
 Non-interactive / scriptable form:
 
 ```bash
-resumeagent "auth migration" --agent claude --resume-in codex
+agentresume "auth migration" --agent claude --resume-in codex
 ```
 
 | Flag | Description |
@@ -47,19 +45,20 @@ resumeagent "auth migration" --agent claude --resume-in codex
 | Codex | ✅ | ✅ |
 | OpenCode | ✅ | ✅ |
 | Pi | ✅ | ✅ |
-| Muse Code | ✅ | ✅ (echo-provider skeleton + content splice — see below) |
 | Grok Build | ✅ | ✅ |
 
 Every adapter has been verified with a real live model call actually
-recalling injected content across a resume, except Muse, which is verified
-structurally (zero-error load, correct content in the trace) without spending
-against a real model.
+recalling injected content across a resume.
+
+Muse Code support was removed for now — the write/resume path needs live
+Muse API access to verify correctly, which isn't available here. May come
+back once that's testable end-to-end.
 
 ## How it works
 
 Each tool stores sessions on disk in its own format — some as flat JSONL
 files, some behind an official export/import CLI, one as an event-sourced
-trace log. `resumeagent` normalizes all of them to one shape:
+trace log. `agentresume` normalizes all of them to one shape:
 
 ```ts
 interface Turn { role: "user" | "assistant"; text: string }
@@ -88,10 +87,6 @@ Adding a new agent means writing one new adapter file; nothing else changes.
   the insert with zero visible error.
 - **Pi**: JSONL under `~/.pi/agent/sessions/--<encoded-cwd>--/`. Unlike
   Claude, Pi only replaces `/`, leaving `_` and `.` in path components intact.
-- **Muse Code**: event-sourced trace log, no documented way to hand-author a
-  session. `write` generates a real skeleton via `muse exec --provider echo`
-  (genuinely muse-authored, zero model cost), then splices real content into
-  the placeholder prompt/response fields.
 - **Grok Build**: `chat_history.jsonl` + `summary.json` per session, directory
   keyed by URL-encoded cwd.
 
@@ -99,17 +94,15 @@ Adding a new agent means writing one new adapter file; nothing else changes.
 
 ```bash
 git clone <this-repo>
-cd resumeagent
+cd agentresume
 npm install
 npm run build
-npm link   # makes `resumeagent` available globally, pointing at your local build
+npm link   # makes `agentresume` available globally, pointing at your local build
 ```
 
 `npm run dev` runs the CLI directly via `tsx`, no build step needed.
 
 ## Known limitations
 
-- The Muse and OpenCode adapters shell out to their respective CLIs at
-  write-time, so cross-tool conversion *into* those formats only works on
-  machines that have them installed.
-- Not yet published to npm.
+- The OpenCode adapter shells out to its CLI at write-time, so cross-tool
+  conversion *into* that format only works on machines that have it installed.

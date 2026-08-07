@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, cleanTitle } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".grok", "sessions");
 
@@ -56,7 +56,7 @@ async function listSessions(): Promise<SessionRef[]> {
       tool: "grok",
       sessionId,
       projectPath: cwd,
-      title: (summary.generated_title as string) || firstUserText.slice(0, 80) || "(empty)",
+      title: cleanTitle((summary.generated_title as string) || firstUserText) || "(empty)",
       snippet: firstUserText.slice(0, 200),
       body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(chatFile),
@@ -142,10 +142,71 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
 
   writeFileSync(join(sessionDir, "chat_history.jsonl"), lines.join("\n") + "\n");
 
+  // chat_history.jsonl alone launches `grok --resume` fine (it's what backs
+  // API continuation) but the TUI doesn't show prior turns from it -- a real
+  // session directory also has updates.jsonl, an Agent Client Protocol
+  // (ACP) `session/update` event stream that's what the TUI actually
+  // replays to render history. Without it, resume "works" (loads, no
+  // crash, continues fine) but the conversation looks empty. Confirmed by
+  // diffing a real session directory's file list against what this adapter
+  // was writing (missing this file entirely) and inspecting its real event
+  // schema directly.
+  const sessionStartSec = Math.floor(now.getTime() / 1000);
+  const updates: string[] = [];
+  let updatePromptIdx = 0;
+  turns.forEach((turn, i) => {
+    const eventNum = i + 1;
+    const ts = sessionStartSec + i;
+    if (turn.role === "user") {
+      updates.push(
+        JSON.stringify({
+          timestamp: ts,
+          method: "session/update",
+          params: {
+            sessionId: newId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text: turn.text },
+              _meta: { modelId: "grok-4.5", promptIndex: updatePromptIdx },
+            },
+            _meta: { eventId: `${newId}-${eventNum}`, agentTimestampMs: ts * 1000 },
+          },
+        })
+      );
+      updatePromptIdx++;
+    } else {
+      updates.push(
+        JSON.stringify({
+          timestamp: ts,
+          method: "session/update",
+          params: {
+            sessionId: newId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: turn.text },
+            },
+            _meta: {
+              totalTokens: 0,
+              eventId: `${newId}-${eventNum}`,
+              agentTimestampMs: ts * 1000,
+              promptId: newId,
+              streamStartMs: ts * 1000,
+              turnStartMs: ts * 1000,
+              updateType: "AgentMessageChunk",
+              chunkId: eventNum,
+            },
+          },
+        })
+      );
+    }
+  });
+  writeFileSync(join(sessionDir, "updates.jsonl"), updates.join("\n") + "\n");
+
   const nowIso = now.toISOString();
+  const realTitle = (turns.find((t) => t.role === "user")?.text ?? "Resumed via agentresume").slice(0, 80);
   const summary = {
     info: { id: newId, cwd: realCwd },
-    session_summary: "Resumed via handoff",
+    session_summary: realTitle,
     created_at: nowIso,
     updated_at: nowIso,
     num_messages: turns.length,
@@ -156,7 +217,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
     request_id: randomUUID(),
     grok_home: join(homedir(), ".grok"),
     last_active_at: nowIso,
-    generated_title: "Resumed via handoff",
+    generated_title: realTitle,
     agent_name: "grok-build-plan",
     sandbox_profile: "off",
     reasoning_effort: "low",

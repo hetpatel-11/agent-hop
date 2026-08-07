@@ -2,10 +2,26 @@ import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
+
+/** The real installed Claude Code version, e.g. "2.1.198" -- a hardcoded
+ * guess here inevitably goes stale the moment Claude Code updates itself
+ * (confirmed happening for real with opencode's equivalent field while
+ * auditing this). Falls back to a generic placeholder if claude isn't on
+ * PATH, which would fail write() well before this matters in practice. */
+function claudeCliVersion(): string {
+  try {
+    const out = execFileSync("claude", ["--version"], { encoding: "utf-8" });
+    const match = out.match(/(\d+\.\d+\.\d+)/);
+    return match ? match[1] : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 function encodeDir(cwd: string): string {
   let real = cwd;
@@ -25,7 +41,8 @@ async function listSessions(): Promise<SessionRef[]> {
   const out: SessionRef[] = [];
   for (const file of files) {
     let cwd: string | undefined;
-    let firstUserText = "";
+    let firstUserText = ""; // any length -- fallback
+    let titleText = ""; // first *substantive* user message -- preferred
     let body = "";
     for await (const obj of readJsonlLinesLazy(file)) {
       if (typeof obj.cwd === "string") cwd = obj.cwd;
@@ -41,20 +58,24 @@ async function listSessions(): Promise<SessionRef[]> {
           .join(" ");
       }
       if (!text) continue;
-      if (!firstUserText && obj.type === "user") firstUserText = text;
+      if (obj.type === "user") {
+        if (!firstUserText) firstUserText = text;
+        if (!titleText && text.length >= MIN_TITLE_CHARS) titleText = text;
+      }
       if (body.length < MAX_BODY_CHARS) body += text + " ";
       // once we have a title candidate and enough body text, parsing the
       // rest of a huge file just to discard it is wasted work
-      if (cwd && firstUserText && body.length >= MAX_BODY_CHARS) break;
+      if (cwd && titleText && body.length >= MAX_BODY_CHARS) break;
     }
     if (!cwd) continue;
     const sessionId = file.split("/").pop()!.replace(/\.jsonl$/, "");
+    const title = cleanTitle(titleText || firstUserText);
     out.push({
       tool: "claude",
       sessionId,
       projectPath: cwd,
-      title: firstUserText.slice(0, 80) || "(empty)",
-      snippet: firstUserText.slice(0, 200),
+      title: title || "(empty)",
+      snippet: title.slice(0, 200),
       body: body.slice(0, MAX_BODY_CHARS),
       updatedAt: mtimeMs(file),
       raw: { file },
@@ -96,6 +117,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
     mkdirSync(projectPath, { recursive: true });
     realCwd = realpathSync(projectPath);
   }
+  const cliVersion = claudeCliVersion(); // computed once, reused per turn below
   const encoded = encodeDir(realCwd);
   const sessionDir = join(PROJECTS_DIR, encoded);
   mkdirSync(sessionDir, { recursive: true });
@@ -124,7 +146,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         entrypoint: "cli",
         cwd: realCwd,
         sessionId: newId,
-        version: "2.1.198",
+        version: cliVersion,
       };
     } else {
       entry = {
@@ -146,7 +168,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         entrypoint: "cli",
         cwd: realCwd,
         sessionId: newId,
-        version: "2.1.198",
+        version: cliVersion,
       };
     }
     lines.push(JSON.stringify(entry));

@@ -1,14 +1,15 @@
 {
-  "name": "resumeagent",
+  "name": "agentresume",
   "version": "0.1.0",
-  "description": "Search across every local coding-agent session (Claude Code, Codex, OpenCode, Pi, Muse, Grok) and resume any one of them in any agent.",
+  "description": "Search across every local coding-agent session (Claude Code, Codex, OpenCode, Pi, Grok) and resume any one of them in any agent.",
   "type": "module",
   "bin": {
-    "resumeagent": "./dist/cli.js"
+    "agentresume": "./dist/cli.js",
+    "are": "./dist/cli.js"
   },
   "license": "MIT",
   "scripts": {
-    "build": "tsc -p .",
+    "build": "tsc -p . && chmod +x dist/cli.js",
     "dev": "tsx src/cli.ts"
   },
   "files": [
@@ -16,9 +17,13 @@
   ],
   "dependencies": {
     "@clack/prompts": "^1.7.0",
-    "commander": "^14.0.1"
+    "@huggingface/tokenizers": "^0.1.3",
+    "commander": "^14.0.1",
+    "figlet": "^1.11.4",
+    "onnxruntime-web": "^1.27.0"
   },
   "devDependencies": {
+    "@types/figlet": "^1.7.0",
     "@types/node": "^24.7.2",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"

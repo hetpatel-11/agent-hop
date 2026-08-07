@@ -3,7 +3,6 @@ import { claudeAdapter } from "./claude.js";
 import { codexAdapter } from "./codex.js";
 import { opencodeAdapter } from "./opencode.js";
 import { piAdapter } from "./pi.js";
-import { museAdapter } from "./muse.js";
 import { grokAdapter } from "./grok.js";
 
 export const ADAPTERS: Record<ToolName, Adapter> = {
@@ -11,7 +10,6 @@ export const ADAPTERS: Record<ToolName, Adapter> = {
   codex: codexAdapter,
   opencode: opencodeAdapter,
   pi: piAdapter,
-  muse: museAdapter,
   grok: grokAdapter,
 };
 

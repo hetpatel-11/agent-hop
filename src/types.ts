@@ -5,7 +5,11 @@ export interface Turn {
   text: string;
 }
 
-export type ToolName = "claude" | "codex" | "opencode" | "pi" | "muse" | "grok";
+// "muse" removed for now -- resumeCmd was using the wrong muse subcommand
+// (exec --session-id, headless-only) instead of the real interactive
+// `muse resume <uuid>`, and there's no way to verify the fix without muse
+// API access. Re-add once that can actually be tested end-to-end.
+export type ToolName = "claude" | "codex" | "opencode" | "pi" | "grok";
 
 export interface SessionRef {
   tool: ToolName;
@@ -20,6 +24,10 @@ export interface SessionRef {
   body?: string;
   updatedAt: number; // unix ms, for recency sorting
   raw?: Record<string, unknown>; // adapter-specific extra data (e.g. file path)
+  /** Excerpt around the matched query terms (ANSI-highlighted), set by
+   * searchSessions() so the picker can show *why* a result matched instead
+   * of just its opening line. Absent for a no-query (recency) listing. */
+  matchSnippet?: string;
 }
 
 export interface Adapter {

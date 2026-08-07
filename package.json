@@ -3,6 +3,28 @@
   "version": "0.0.1",
   "description": "Search all your coding-agent chats, then continue any session in any agent.",
   "type": "module",
+  "keywords": [
+    "ai-agents",
+    "coding-agents",
+    "agent-context",
+    "agent-memory",
+    "claude-code",
+    "codex",
+    "opencode",
+    "grok",
+    "cli",
+    "terminal",
+    "semantic-search",
+    "hybrid-search",
+    "session-search",
+    "session-management",
+    "cross-agent",
+    "developer-tools",
+    "local-first",
+    "typescript",
+    "productivity",
+    "ai-coding"
+  ],
   "bin": {
     "agent-hop": "dist/cli.js",
     "ah": "dist/cli.js"

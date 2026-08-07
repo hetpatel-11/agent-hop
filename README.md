@@ -2,7 +2,7 @@
   <img src="assets/screenshot.png" alt="agent-hop searching local agent sessions" width="100%">
 </p>
 
-**Find the agent chat you lost, then continue it in the agent you want.**
+**Search all your coding-agent chats, then continue any session in any agent.**
 
 # agent-hop
 

@@ -1,7 +1,7 @@
 {
   "name": "agent-hop",
   "version": "0.0.1",
-  "description": "Find coding-agent chats and hop them into any other agent, with full conversation history intact.",
+  "description": "Search all your coding-agent chats, then continue any session in any agent.",
   "type": "module",
   "bin": {
     "agent-hop": "dist/cli.js",

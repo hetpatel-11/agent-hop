@@ -1,6 +1,6 @@
 {
   "name": "agentresume",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Search across every local coding-agent session (Claude Code, Codex, OpenCode, Pi, Grok) and resume any one of them in any agent.",
   "type": "module",
   "bin": {

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 
@@ -38,7 +38,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let firstUserText = "";
     let firstAssistantText = "";
     let titleText = "";
-    let body = "";
+    const body = new BodySampler(MAX_BODY_CHARS);
     for await (const obj of readJsonlLinesLazy(file)) {
       if (obj.type === "session_meta") {
         const payload = obj.payload as { id?: string; cwd?: string } | undefined;
@@ -67,8 +67,7 @@ async function listSessions(): Promise<SessionRef[]> {
       } else if (!firstAssistantText) {
         firstAssistantText = text;
       }
-      if (body.length < MAX_BODY_CHARS) body += text + " ";
-      if (sessionId && cwd && titleText && body.length >= MAX_BODY_CHARS) break;
+      body.append(text);
     }
     if (!sessionId || !cwd) continue;
     const title = cleanTitle(titleText || firstUserText || firstAssistantText || `(${cwd.split("/").pop()}, no readable content)`);
@@ -78,7 +77,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title,
       snippet: title.slice(0, 200),
-      body: body.slice(0, MAX_BODY_CHARS),
+      body: body.value(),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

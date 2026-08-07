@@ -116,6 +116,10 @@ const FUZZY_MATCH_WEIGHT = 0.6;
 // signal ("ux" typed as the start of "uxp"), not a guessed correction the
 // way a typo-fix is. Still below 1.0 so a genuine exact match always wins.
 const PREFIX_MATCH_WEIGHT = 0.85;
+// A concatenated query like "agenthop" should still match documents that
+// tokenized it as "agent hop" or "agent-hop". This is neither a typo nor a
+// prefix; it is decompounding an unknown token into known corpus terms.
+const COMPOUND_MATCH_WEIGHT = 0.9;
 
 class BM25 {
   private readonly k1 = 1.5;
@@ -171,11 +175,46 @@ class BM25 {
  * edit distance does: "auth" -> "authentication" is 10 edits apart but a
  * 4-character exact prefix); otherwise fall back to edit-distance typo
  * tolerance. A token matching none of these contributes nothing. */
+function splitCompoundToken(term: string, bm25: BM25): string[] | undefined {
+  // Avoid turning short/noisy tokens into accidental two-letter fragments.
+  if (term.length < 6) return undefined;
+
+  const memo = new Map<number, string[] | undefined>();
+  const solve = (start: number): string[] | undefined => {
+    if (start === term.length) return [];
+    if (memo.has(start)) return memo.get(start);
+
+    for (let end = term.length; end >= start + 2; end--) {
+      const part = term.slice(start, end);
+      if (!bm25.hasTerm(part)) continue;
+      const rest = solve(end);
+      if (rest) {
+        const result = [part, ...rest];
+        memo.set(start, result);
+        return result;
+      }
+    }
+
+    memo.set(start, undefined);
+    return undefined;
+  };
+
+  const parts = solve(0);
+  // Require at least two real words. This keeps normal exact-vocab terms
+  // untouched and only handles true concatenations.
+  return parts && parts.length >= 2 ? parts : undefined;
+}
+
 function expandQueryTerms(queryTerms: string[], bm25: BM25, vocabTree: BKTree, prefixIndex: PrefixIndex): WeightedTerm[] {
   const expanded: WeightedTerm[] = [];
   for (const term of queryTerms) {
     if (bm25.hasTerm(term)) {
       expanded.push({ term, weight: 1 });
+      continue;
+    }
+    const compoundParts = splitCompoundToken(term, bm25);
+    if (compoundParts) {
+      for (const part of compoundParts) expanded.push({ term: part, weight: COMPOUND_MATCH_WEIGHT });
       continue;
     }
     const prefixMatches = prefixIndex.search(term);
@@ -292,11 +331,12 @@ function buildLexicalIndex(sessions: SessionRef[]): LexicalIndex {
   return { bm25, vocabTree, prefixIndex, sessions };
 }
 
-function lexicalScores(index: LexicalIndex, trimmedQuery: string): { queryTerms: string[]; bm25Normalized: number[] } {
+function lexicalScores(index: LexicalIndex, trimmedQuery: string): { queryTerms: string[]; matchTerms: string[]; bm25Normalized: number[] } {
   const queryTerms = tokenize(trimmedQuery);
   const weighted = expandQueryTerms(queryTerms, index.bm25, index.vocabTree, index.prefixIndex);
+  const matchTerms = [...new Set([...queryTerms, ...weighted.map((t) => t.term)])];
   const bm25Scores = index.sessions.map((_, i) => index.bm25.score(i, weighted));
-  return { queryTerms, bm25Normalized: minMaxNormalize(bm25Scores) };
+  return { queryTerms, matchTerms, bm25Normalized: minMaxNormalize(bm25Scores) };
 }
 
 /** Exact-match tier, recency multiplier, meaningful-score cutoff, and
@@ -407,15 +447,15 @@ export function buildRanker(sessions: SessionRef[]): Ranker {
     rank(query: string, limit = 15): SessionRef[] {
       const trimmed = query.trim();
       if (!trimmed) return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
-      const { queryTerms, bm25Normalized } = lexicalScores(index, trimmed);
-      return applyRankingLayers(sessions, queryTerms, trimmed, bm25Normalized, limit, 0.1);
+      const { matchTerms, bm25Normalized } = lexicalScores(index, trimmed);
+      return applyRankingLayers(sessions, matchTerms, trimmed, bm25Normalized, limit, 0.1);
     },
 
     async refineWithSemantic(query: string, limit = 15): Promise<SessionRef[]> {
       const trimmed = query.trim();
       if (!trimmed) return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
 
-      const { queryTerms, bm25Normalized } = lexicalScores(index, trimmed);
+      const { matchTerms, bm25Normalized } = lexicalScores(index, trimmed);
 
       let semanticNormalized = new Array(sessions.length).fill(0);
       try {
@@ -430,7 +470,7 @@ export function buildRanker(sessions: SessionRef[]): Ranker {
       }
 
       const relevance = sessions.map((_, i) => BM25_WEIGHT * bm25Normalized[i] + SEMANTIC_WEIGHT * semanticNormalized[i]);
-      return applyRankingLayers(sessions, queryTerms, trimmed, relevance, limit, 0.15);
+      return applyRankingLayers(sessions, matchTerms, trimmed, relevance, limit, 0.15);
     },
   };
 }

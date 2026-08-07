@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, cleanTitle } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".grok", "sessions");
 
@@ -35,21 +35,20 @@ async function listSessions(): Promise<SessionRef[]> {
     if (!sessionId || !cwd) continue;
 
     let firstUserText = "";
-    let body = "";
+    const body = new BodySampler(MAX_BODY_CHARS);
     for await (const obj of readJsonlLinesLazy(chatFile)) {
       if (obj.type === "user" && Array.isArray(obj.content)) {
         for (const b of obj.content as { text?: string }[]) {
           const q = extractUserQuery(b.text ?? "");
           if (q) {
             if (!firstUserText) firstUserText = q;
-            if (body.length < MAX_BODY_CHARS) body += q + " ";
+            body.append(q);
             break;
           }
         }
       } else if (obj.type === "assistant" && typeof obj.content === "string" && obj.content.trim()) {
-        if (body.length < MAX_BODY_CHARS) body += obj.content.trim() + " ";
+        body.append(obj.content.trim());
       }
-      if (firstUserText && body.length >= MAX_BODY_CHARS) break;
     }
 
     out.push({
@@ -58,7 +57,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: cleanTitle((summary.generated_title as string) || firstUserText) || "(empty)",
       snippet: firstUserText.slice(0, 200),
-      body: body.slice(0, MAX_BODY_CHARS),
+      body: body.value(),
       updatedAt: mtimeMs(chatFile),
       raw: { file: chatFile },
     });

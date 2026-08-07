@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -43,7 +43,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let cwd: string | undefined;
     let firstUserText = ""; // any length -- fallback
     let titleText = ""; // first *substantive* user message -- preferred
-    let body = "";
+    const body = new BodySampler(MAX_BODY_CHARS);
     for await (const obj of readJsonlLinesLazy(file)) {
       if (typeof obj.cwd === "string") cwd = obj.cwd;
       if (obj.type !== "user" && obj.type !== "assistant") continue;
@@ -62,10 +62,7 @@ async function listSessions(): Promise<SessionRef[]> {
         if (!firstUserText) firstUserText = text;
         if (!titleText && text.length >= MIN_TITLE_CHARS) titleText = text;
       }
-      if (body.length < MAX_BODY_CHARS) body += text + " ";
-      // once we have a title candidate and enough body text, parsing the
-      // rest of a huge file just to discard it is wasted work
-      if (cwd && titleText && body.length >= MAX_BODY_CHARS) break;
+      body.append(text);
     }
     if (!cwd) continue;
     const sessionId = file.split("/").pop()!.replace(/\.jsonl$/, "");
@@ -76,7 +73,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: title || "(empty)",
       snippet: title.slice(0, 200),
-      body: body.slice(0, MAX_BODY_CHARS),
+      body: body.value(),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

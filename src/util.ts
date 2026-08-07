@@ -98,6 +98,32 @@ export function mtimeMs(path: string): number {
  * candidate; the raw first message is still kept as a fallback. */
 export const MIN_TITLE_CHARS = 15;
 
+export class BodySampler {
+  private first = "";
+  private head = "";
+  private tail = "";
+  private total = 0;
+
+  constructor(
+    private readonly maxChars = 40000,
+    private readonly headChars = 20000,
+    private readonly tailChars = 20000
+  ) {}
+
+  append(text: string): void {
+    if (!text) return;
+    const segment = text + " ";
+    this.total += segment.length;
+    if (this.first.length < this.maxChars) this.first += segment.slice(0, this.maxChars - this.first.length);
+    if (this.head.length < this.headChars) this.head += segment.slice(0, this.headChars - this.head.length);
+    this.tail = (this.tail + segment).slice(-this.tailChars);
+  }
+
+  value(): string {
+    return this.total <= this.maxChars ? this.first : `${this.head} … ${this.tail}`;
+  }
+}
+
 const MAX_TITLE_CHARS = 80;
 
 /**

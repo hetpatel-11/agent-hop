@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -28,7 +28,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let cwd: string | undefined;
     let firstUserText = "";
     let titleText = "";
-    let body = "";
+    const body = new BodySampler(MAX_BODY_CHARS);
     for await (const obj of readJsonlLinesLazy(file)) {
       if (obj.type === "session") {
         sessionId = obj.id as string | undefined;
@@ -48,8 +48,7 @@ async function listSessions(): Promise<SessionRef[]> {
         if (!firstUserText) firstUserText = text;
         if (!titleText && text.length >= MIN_TITLE_CHARS) titleText = text;
       }
-      if (body.length < MAX_BODY_CHARS) body += text + " ";
-      if (sessionId && cwd && titleText && body.length >= MAX_BODY_CHARS) break;
+      body.append(text);
     }
     if (!sessionId || !cwd) continue;
     const title = cleanTitle(titleText || firstUserText);
@@ -59,7 +58,7 @@ async function listSessions(): Promise<SessionRef[]> {
       projectPath: cwd,
       title: title || "(empty)",
       snippet: title.slice(0, 200),
-      body: body.slice(0, MAX_BODY_CHARS),
+      body: body.value(),
       updatedAt: mtimeMs(file),
       raw: { file },
     });

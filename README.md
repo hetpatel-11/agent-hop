@@ -116,8 +116,3 @@ npm link   # makes `agentresume` available globally, pointing at your local buil
 ```
 
 `npm run dev` runs the CLI directly via `tsx`, no build step needed.
-
-## Known limitations
-
-- The OpenCode adapter shells out to its CLI at write-time, so cross-tool
-  conversion *into* that format only works on machines that have it installed.

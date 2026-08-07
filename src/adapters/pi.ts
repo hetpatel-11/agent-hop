@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -29,6 +29,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let firstUserText = "";
     let titleText = "";
     const body = new BodySampler(MAX_BODY_CHARS);
+    let stoppedEarly = false;
     for await (const obj of readJsonlLinesLazy(file)) {
       if (obj.type === "session") {
         sessionId = obj.id as string | undefined;
@@ -49,6 +50,24 @@ async function listSessions(): Promise<SessionRef[]> {
         if (!titleText && text.length >= MIN_TITLE_CHARS) titleText = text;
       }
       body.append(text);
+      if (sessionId && cwd && titleText && body.hasHead()) {
+        stoppedEarly = true;
+        break;
+      }
+    }
+    if (stoppedEarly) {
+      body.markSampled();
+      for (const obj of readJsonlTailLines(file)) {
+        if (obj.type !== "message") continue;
+        const message = obj.message as { role?: string; content?: unknown } | undefined;
+        if (message?.role !== "user" && message?.role !== "assistant") continue;
+        if (!Array.isArray(message.content)) continue;
+        const parts = message.content
+          .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+          .map((b) => b.text);
+        const text = parts.join("\n").trim();
+        if (text) body.append(text);
+      }
     }
     if (!sessionId || !cwd) continue;
     const title = cleanTitle(titleText || firstUserText);

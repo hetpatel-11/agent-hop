@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 
@@ -39,6 +39,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let firstAssistantText = "";
     let titleText = "";
     const body = new BodySampler(MAX_BODY_CHARS);
+    let stoppedEarly = false;
     for await (const obj of readJsonlLinesLazy(file)) {
       if (obj.type === "session_meta") {
         const payload = obj.payload as { id?: string; cwd?: string } | undefined;
@@ -68,6 +69,25 @@ async function listSessions(): Promise<SessionRef[]> {
         firstAssistantText = text;
       }
       body.append(text);
+      if (sessionId && cwd && titleText && body.hasHead()) {
+        stoppedEarly = true;
+        break;
+      }
+    }
+    if (stoppedEarly) {
+      body.markSampled();
+      for (const obj of readJsonlTailLines(file)) {
+        if (obj.type !== "response_item") continue;
+        const payload = obj.payload as { type?: string; role?: string; content?: unknown } | undefined;
+        if (payload?.type !== "message" || !Array.isArray(payload.content)) continue;
+        if (payload.role !== "user" && payload.role !== "assistant") continue;
+        const parts = payload.content
+          .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && ["input_text", "output_text", "text"].includes((b as { type?: string }).type ?? ""))
+          .map((b) => b.text);
+        const text = parts.join("\n").trim();
+        if (!text || text.startsWith("<environment_context>") || text.startsWith("# Context from my IDE") || text.startsWith("# AGENTS.md instructions") || text.startsWith("<recommended_plugins>")) continue;
+        body.append(text);
+      }
     }
     if (!sessionId || !cwd) continue;
     const title = cleanTitle(titleText || firstUserText || firstAssistantText || `(${cwd.split("/").pop()}, no readable content)`);

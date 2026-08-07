@@ -1,4 +1,4 @@
-import { readFileSync, statSync, readdirSync, createReadStream } from "node:fs";
+import { readFileSync, statSync, readdirSync, createReadStream, openSync, readSync, closeSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 
@@ -54,6 +54,46 @@ export async function* readJsonlLinesLazy(path: string): AsyncGenerator<Record<s
   }
 }
 
+export function readJsonlTailLines(path: string, maxBytes = 768 * 1024): Record<string, unknown>[] {
+  let fd: number | undefined;
+  try {
+    const size = statSync(path).size;
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    const buffer = Buffer.allocUnsafe(length);
+    fd = openSync(path, "r");
+    readSync(fd, buffer, 0, length, start);
+
+    let raw = buffer.toString("utf-8");
+    if (start > 0) {
+      const firstNewline = raw.indexOf("\n");
+      raw = firstNewline === -1 ? "" : raw.slice(firstNewline + 1);
+    }
+
+    const out: Record<string, unknown>[] = [];
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        out.push(JSON.parse(trimmed));
+      } catch {
+        // skip partial or malformed lines
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 /** Recursively find files matching a predicate, without pulling in a glob dependency. */
 export function findFiles(root: string, matches: (path: string) => boolean, maxDepth = 8): string[] {
   const out: string[] = [];
@@ -103,6 +143,7 @@ export class BodySampler {
   private head = "";
   private tail = "";
   private total = 0;
+  private sampled = false;
 
   constructor(
     private readonly maxChars = 40000,
@@ -119,8 +160,16 @@ export class BodySampler {
     this.tail = (this.tail + segment).slice(-this.tailChars);
   }
 
+  hasHead(): boolean {
+    return this.head.length >= this.headChars;
+  }
+
+  markSampled(): void {
+    this.sampled = true;
+  }
+
   value(): string {
-    return this.total <= this.maxChars ? this.first : `${this.head} … ${this.tail}`;
+    return !this.sampled && this.total <= this.maxChars ? this.first : `${this.head} … ${this.tail}`;
   }
 }
 

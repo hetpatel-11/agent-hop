@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, cleanTitle, BodySampler } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, cleanTitle, BodySampler } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".grok", "sessions");
 
@@ -36,6 +36,7 @@ async function listSessions(): Promise<SessionRef[]> {
 
     let firstUserText = "";
     const body = new BodySampler(MAX_BODY_CHARS);
+    let stoppedEarly = false;
     for await (const obj of readJsonlLinesLazy(chatFile)) {
       if (obj.type === "user" && Array.isArray(obj.content)) {
         for (const b of obj.content as { text?: string }[]) {
@@ -48,6 +49,26 @@ async function listSessions(): Promise<SessionRef[]> {
         }
       } else if (obj.type === "assistant" && typeof obj.content === "string" && obj.content.trim()) {
         body.append(obj.content.trim());
+      }
+      if (firstUserText && body.hasHead()) {
+        stoppedEarly = true;
+        break;
+      }
+    }
+    if (stoppedEarly) {
+      body.markSampled();
+      for (const obj of readJsonlTailLines(chatFile)) {
+        if (obj.type === "user" && Array.isArray(obj.content)) {
+          for (const b of obj.content as { text?: string }[]) {
+            const q = extractUserQuery(b.text ?? "");
+            if (q) {
+              body.append(q);
+              break;
+            }
+          }
+        } else if (obj.type === "assistant" && typeof obj.content === "string" && obj.content.trim()) {
+          body.append(obj.content.trim());
+        }
       }
     }
 

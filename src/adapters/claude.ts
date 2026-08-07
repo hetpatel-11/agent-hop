@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -44,6 +44,7 @@ async function listSessions(): Promise<SessionRef[]> {
     let firstUserText = ""; // any length -- fallback
     let titleText = ""; // first *substantive* user message -- preferred
     const body = new BodySampler(MAX_BODY_CHARS);
+    let stoppedEarly = false;
     for await (const obj of readJsonlLinesLazy(file)) {
       if (typeof obj.cwd === "string") cwd = obj.cwd;
       if (obj.type !== "user" && obj.type !== "assistant") continue;
@@ -63,6 +64,27 @@ async function listSessions(): Promise<SessionRef[]> {
         if (!titleText && text.length >= MIN_TITLE_CHARS) titleText = text;
       }
       body.append(text);
+      if (cwd && titleText && body.hasHead()) {
+        stoppedEarly = true;
+        break;
+      }
+    }
+    if (stoppedEarly) {
+      body.markSampled();
+      for (const obj of readJsonlTailLines(file)) {
+        if (obj.type !== "user" && obj.type !== "assistant") continue;
+        const message = obj.message as { role?: string; content?: unknown } | undefined;
+        let text = "";
+        if (typeof message?.content === "string") {
+          text = message.content;
+        } else if (Array.isArray(message?.content)) {
+          text = message.content
+            .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+            .map((b) => b.text)
+            .join(" ");
+        }
+        if (text) body.append(text);
+      }
     }
     if (!cwd) continue;
     const sessionId = file.split("/").pop()!.replace(/\.jsonl$/, "");

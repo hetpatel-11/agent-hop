@@ -1,9 +1,24 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="agentresume" width="100%">
+</p>
+
 # agentresume
 
-Search across every local coding-agent session on your machine — Claude Code,
-Codex, OpenCode, Pi, and Grok Build — and resume any one of them in any
-other agent. Not a summary, not a briefing: a genuine native resume, so the
-target agent picks up with the real conversation history.
+If you use more than one coding agent — Claude Code, Codex, OpenCode, Pi,
+Grok Build — you've hit this: a great conversation happens in one of them,
+and then it's stuck there. Switching agents (or just losing track of which
+one you used) means starting over: re-explaining the bug, the codebase, the
+decisions you already made.
+
+`agentresume` finds any past conversation across all of them from one search
+box, and drops you back into it — in the *same* agent, or a completely
+different one — with the real conversation history intact, not a summary.
+The target agent picks up exactly where you left off, because as far as it
+can tell, it's the one that had the conversation.
+
+**What it saves you:** the 10-15 minutes of re-explaining context every time
+you want to pick a thread back up, plus never having to remember "which
+tool was I even using for that."
 
 ## Install
 
@@ -93,7 +108,7 @@ Adding a new agent means writing one new adapter file; nothing else changes.
 ## Development
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/hetpatel-11/agentresume.git
 cd agentresume
 npm install
 npm run build

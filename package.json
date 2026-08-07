@@ -8,6 +8,14 @@
     "are": "./dist/cli.js"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hetpatel-11/agentresume.git"
+  },
+  "homepage": "https://github.com/hetpatel-11/agentresume#readme",
+  "bugs": {
+    "url": "https://github.com/hetpatel-11/agentresume/issues"
+  },
   "scripts": {
     "build": "tsc -p . && chmod +x dist/cli.js",
     "dev": "tsx src/cli.ts"

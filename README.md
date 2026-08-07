@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="agentresume" width="100%">
+  <img src="assets/screenshot.png" alt="agentresume searching local agent sessions" width="100%">
 </p>
 
 # agentresume

@@ -21,6 +21,7 @@
     "dev": "tsx src/cli.ts"
   },
   "files": [
+    "assets/screenshot.png",
     "dist"
   ],
   "dependencies": {

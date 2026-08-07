@@ -21,17 +21,17 @@ program
 
 program.parse();
 
-/** A full block-letter logo is the whole point of a "massive" banner, but it's
- * ~71 columns wide -- unusable if it wraps. Fall back to the compact wordmark
- * in a narrow terminal or when stdout isn't a real TTY (piped output). */
+/** A full block-letter logo is the whole point of a "massive" banner, but at
+ * ~97 columns wide it's unusable if it wraps. Fall back to the compact
+ * wordmark in a narrow terminal or when stdout isn't a real TTY (piped output). */
 function printBanner(): void {
-  const big = figlet.textSync("agentresume", { font: "ANSI Shadow" });
+  const big = figlet.textSync("agent resume", { font: "ANSI Shadow" });
   const bigWidth = Math.max(...big.split("\n").map((l) => l.length));
   const columns = process.stdout.columns ?? 0;
   if (process.stdout.isTTY && columns >= bigWidth) {
     console.log(color.bold(color.cyan(big)));
   } else {
-    console.log(`\n  ${color.bold(color.cyan("agent"))}${color.bold(color.green("resume"))}\n`);
+    console.log(`\n  ${color.bold(color.cyan("agent"))} ${color.bold(color.green("resume"))}\n`);
   }
 }
 

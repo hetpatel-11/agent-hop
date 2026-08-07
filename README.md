@@ -1,43 +1,47 @@
 <p align="center">
-  <img src="assets/screenshot.png" alt="agentresume searching local agent sessions" width="100%">
+  <img src="assets/screenshot.png" alt="agent-hop searching local agent sessions" width="100%">
 </p>
 
-**Search every local coding-agent chat, then resume it in any agent.**
+**Find the agent chat you lost, then continue it in the agent you want.**
 
-# agentresume
+# agent-hop
 
-If you use more than one coding agent — Claude Code, Codex, OpenCode, Pi,
-Grok Build — you've hit this: a great conversation happens in one of them,
-and then it's stuck there. Switching agents (or just losing track of which
-one you used) means starting over: re-explaining the bug, the codebase, the
-decisions you already made.
+Your best coding-agent context is probably trapped in the wrong tool.
 
-`agentresume` finds any past conversation across all of them from one search
-box, and drops you back into it — in the *same* agent, or a completely
-different one — with the real conversation history intact, not a summary.
-The target agent picks up exactly where you left off, because as far as it
-can tell, it's the one that had the conversation.
+`agent-hop` searches your local Claude Code, Codex, OpenCode, Pi, and Grok
+Build sessions from one picker, then resumes the selected chat in the original
+agent or converts it into another agent's native session format.
 
-**What it saves you:** the 10-15 minutes of re-explaining context every time
-you want to pick a thread back up, plus never having to remember "which
-tool was I even using for that."
+Why use it:
+
+- **Stop hunting through project folders** — search every supported agent's
+  local history from one command.
+- **Stop re-explaining context** — resume with the real conversation history,
+  not a summary.
+- **Switch agents without starting over** — hop a Codex chat into OpenCode,
+  Claude Code into Codex, Grok into Pi, and more.
+- **Use it interactively or from scripts** — humans get a picker; agents can
+  call the deterministic non-interactive mode.
+
+Use it when you remember the topic, but not the tool, project directory, or
+exact session.
 
 ## Install
 
 ```bash
-npm install -g agentresume
+npm install -g agent-hop
 ```
 
 ## Usage
 
 ```bash
-agentresume
+agent-hop
 ```
 
 or the short alias:
 
 ```bash
-are
+ah
 ```
 
 Walks you through:
@@ -52,13 +56,31 @@ Walks you through:
 Non-interactive / scriptable form:
 
 ```bash
-agentresume "auth migration" --agent claude --resume-in codex
+agent-hop "auth migration" --agent claude --resume-in codex
 ```
 
 | Flag | Description |
 |---|---|
 | `-a, --agent <tool>` | Restrict search to one agent |
 | `-r, --resume-in <tool>` | Resume the picked session in this agent (default: same tool) |
+
+### Agent/script mode
+
+Agents should avoid the interactive picker. Use the explicit form:
+
+```bash
+ah "<specific query>" --agent <source-agent> --resume-in <target-agent>
+```
+
+Example:
+
+```bash
+ah "adobe premiere mcp setup" --agent codex --resume-in opencode
+```
+
+In non-interactive mode, `agent-hop` automatically chooses the top-ranked
+session instead of asking you to pick one. Use a specific query and `--agent`
+whenever possible; vague queries like `"adobe"` may resume the wrong chat.
 
 ## Why it exists
 
@@ -70,7 +92,7 @@ And when you are trying to find "that one chat where we debugged the auth
 flow," the built-in resume pickers usually only search one tool, one project,
 or one narrow session store.
 
-`agentresume` makes your local agent history feel like one searchable workspace:
+`agent-hop` makes your local agent history feel like one searchable workspace:
 
 - find the right thread without remembering which project directory it came from
 - continue in the original agent when that is what you want
@@ -97,7 +119,7 @@ back once that's testable end-to-end.
 
 ## How it works
 
-`agentresume` has two layers:
+`agent-hop` has two layers:
 
 1. A **search layer** that indexes the local session stores from each supported
    agent.
@@ -123,7 +145,7 @@ Search is designed to feel instant while still catching non-literal matches:
 - **No native dependency required.** The embedding runtime uses WASM, so the npm
   package stays portable and avoids native ONNX install friction.
 
-The vector index lives under `~/.agentresume/` and updates incrementally. New or
+The vector index lives under `~/.agent-hop/` and updates incrementally. New or
 changed sessions are indexed in the background; already-indexed sessions are
 reused.
 
@@ -131,7 +153,7 @@ reused.
 
 Each tool stores sessions on disk in its own format — some as flat JSONL
 files, some behind an official export/import CLI, and some with separate
-display/replay event streams. `agentresume` normalizes all of them to one shape:
+display/replay event streams. `agent-hop` normalizes all of them to one shape:
 
 ```ts
 interface Turn { role: "user" | "assistant"; text: string }
@@ -168,19 +190,19 @@ Adding a new agent means writing one new adapter file; nothing else changes.
 
 ### Launch behavior
 
-On Unix-like systems, `agentresume` uses true process replacement (`execve`) for
+On Unix-like systems, `agent-hop` uses true process replacement (`execve`) for
 the final launch when possible. That means once the target agent starts, there
-is no parent `agentresume` process left holding the terminal. This keeps raw TTY
+is no parent `agent-hop` process left holding the terminal. This keeps raw TTY
 input responsive for interactive agents like OpenCode and Pi.
 
 ## Development
 
 ```bash
-git clone https://github.com/hetpatel-11/agentresume.git
-cd agentresume
+git clone https://github.com/hetpatel-11/agent-hop.git
+cd agent-hop
 npm install
 npm run build
-npm link   # makes `agentresume` available globally, pointing at your local build
+npm link   # makes `agent-hop` available globally, pointing at your local build
 ```
 
 `npm run dev` runs the CLI directly via `tsx`, no build step needed.

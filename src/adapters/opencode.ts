@@ -204,7 +204,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       projectID: "global",
       directory: projectPath,
       path: projectPath.replace(/^\//, ""),
-      title: (turns.find((t) => t.role === "user")?.text ?? "Resumed via agentresume").slice(0, 80),
+      title: (turns.find((t) => t.role === "user")?.text ?? "Resumed via agent-hop").slice(0, 80),
       agent: "build",
       model: { id: "big-pickle", providerID: "opencode" },
       version: opencodeCliVersion(),

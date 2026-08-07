@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const MODEL_DIR = join(homedir(), ".agentresume", "model");
+const MODEL_DIR = join(homedir(), ".agent-hop", "model");
 const MODEL_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx";
 const TOKENIZER_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
 const TOKENIZER_CONFIG_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json";
@@ -30,7 +30,7 @@ async function downloadFile(url: string, dest: string, onProgress?: (msg: string
 }
 
 /** Downloads the embedding model + tokenizer on first use (~23MB total),
- * cached under ~/.agentresume/model/ forever after. Every call after the
+ * cached under ~/.agent-hop/model/ forever after. Every call after the
  * first is instant (cache hit). */
 export async function ensureModel(onProgress?: (msg: string) => void): Promise<void> {
   mkdirSync(MODEL_DIR, { recursive: true });

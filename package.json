@@ -1,20 +1,20 @@
 {
-  "name": "agentresume",
+  "name": "agent-hop",
   "version": "0.0.1",
-  "description": "Search across every local coding-agent session (Claude Code, Codex, OpenCode, Pi, Grok) and resume any one of them in any agent.",
+  "description": "Find coding-agent chats and hop them into any other agent, with full conversation history intact.",
   "type": "module",
   "bin": {
-    "agentresume": "./dist/cli.js",
-    "are": "./dist/cli.js"
+    "agent-hop": "dist/cli.js",
+    "ah": "dist/cli.js"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hetpatel-11/agentresume.git"
+    "url": "git+https://github.com/hetpatel-11/agent-hop.git"
   },
-  "homepage": "https://github.com/hetpatel-11/agentresume#readme",
+  "homepage": "https://github.com/hetpatel-11/agent-hop#readme",
   "bugs": {
-    "url": "https://github.com/hetpatel-11/agentresume/issues"
+    "url": "https://github.com/hetpatel-11/agent-hop/issues"
   },
   "scripts": {
     "build": "tsc -p . && chmod +x dist/cli.js",

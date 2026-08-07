@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import type { SessionRef } from "./types.js";
 import { ensureModel, embedText } from "./embed.js";
 
-const INDEX_DIR = join(homedir(), ".agentresume");
+const INDEX_DIR = join(homedir(), ".agent-hop");
 const INDEX_PATH = join(INDEX_DIR, "index.json");
 const CHUNK_CHARS = 2000; // MiniLM works best on focused text, not huge blobs
 const CHUNK_OVERLAP = 200; // avoid splitting a relevant sentence exactly at a chunk boundary

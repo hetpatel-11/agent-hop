@@ -203,7 +203,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   writeFileSync(join(sessionDir, "updates.jsonl"), updates.join("\n") + "\n");
 
   const nowIso = now.toISOString();
-  const realTitle = (turns.find((t) => t.role === "user")?.text ?? "Resumed via agentresume").slice(0, 80);
+  const realTitle = (turns.find((t) => t.role === "user")?.text ?? "Resumed via agent-hop").slice(0, 80);
   const summary = {
     info: { id: newId, cwd: realCwd },
     session_summary: realTitle,

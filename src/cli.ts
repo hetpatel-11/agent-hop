@@ -12,7 +12,7 @@ import type { ToolName, SessionRef } from "./types.js";
 
 const program = new Command();
 program
-  .name("agentresume")
+  .name("agent-hop")
   .description("Search across every local coding-agent session and resume any one in any agent.")
   .argument("[query]", "search query (omitted = interactive prompt)")
   .option("-a, --agent <tool>", "restrict search to one agent (claude|codex|opencode|pi|grok)")
@@ -25,7 +25,7 @@ program.parse();
  * ~97 columns wide it's unusable if it wraps. Fall back to the compact
  * wordmark in a narrow terminal or when stdout isn't a real TTY (piped output). */
 function printBanner(): void {
-  const big = figlet.textSync("agent resume", { font: "ANSI Shadow" });
+  const big = figlet.textSync("agent hop", { font: "ANSI Shadow" });
   const bigWidth = Math.max(...big.split("\n").map((l) => l.length));
   const columns = process.stdout.columns ?? 0;
   if (process.stdout.isTTY && columns >= bigWidth) {
@@ -48,7 +48,7 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
   p.intro(color.dim("search every agent's sessions, resume any one in a different agent"));
 
   if (nonInteractive && queryArg === undefined) {
-    p.cancel("Running non-interactively (no TTY) -- a search query is required, e.g. `agentresume \"oauth bug\"`.");
+    p.cancel("Running non-interactively (no TTY) -- a search query is required, e.g. `agent-hop \"oauth bug\"`.");
     process.exit(1);
   }
 
@@ -390,7 +390,7 @@ function sessionOption(r: SessionRef): { value: SessionRef; label: string; hint:
 // (semantically "unavailable option"), which reads as broken/wrong for a
 // plain status message. The caller checks this id defensively after the
 // prompt resolves instead, in case it's ever selected.
-const STATUS_SENTINEL_ID = "__agentresume_status__";
+const STATUS_SENTINEL_ID = "__agent-hop_status__";
 function statusOption(text: string): { value: SessionRef; label: string } {
   const sentinel: SessionRef = {
     tool: "claude",

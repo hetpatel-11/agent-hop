@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { toolTag, highlightDate, color } from "./theme.js";
 import { collectSessions, searchSessions, buildRanker, ensureIndexingTriggered, TOOL_NAMES } from "./search.js";
 import { ADAPTERS } from "./adapters/index.js";
+import { checkForUpdate } from "./update-check.js";
 import type { ToolName, SessionRef } from "./types.js";
 
 const program = new Command();
@@ -31,7 +32,7 @@ function printBanner(): void {
   if (process.stdout.isTTY && columns >= bigWidth) {
     console.log(color.bold(color.cyan(big)));
   } else {
-    console.log(`\n  ${color.bold(color.cyan("agent"))} ${color.bold(color.green("resume"))}\n`);
+    console.log(`\n  ${color.bold(color.cyan("agent"))} ${color.bold(color.green("hop"))}\n`);
   }
 }
 
@@ -50,6 +51,28 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
   if (nonInteractive && queryArg === undefined) {
     p.cancel("Running non-interactively (no TTY) -- a search query is required, e.g. `agent-hop \"oauth bug\"`.");
     process.exit(1);
+  }
+
+  // Update check: cached (at most once/day) and network-timeout-bounded, so
+  // this never meaningfully delays a launch even offline. Skipped entirely
+  // in non-interactive mode -- a script/agent invocation shouldn't ever stop
+  // to ask a human "update now or later?".
+  if (!nonInteractive) {
+    const update = await checkForUpdate();
+    if (update.updateAvailable) {
+      const choice = await p.select({
+        message: `A new version of agent-hop is available (${update.current} → ${update.latest}).`,
+        options: [
+          { value: "later", label: "Later", hint: "just continue" },
+          { value: "now", label: "Update now", hint: "npm/bun install -g, then re-run agent-hop" },
+        ],
+      });
+      if (!p.isCancel(choice) && choice === "now") {
+        await runUpdate();
+        p.outro("Updated. Run `agent-hop` again to use the new version.");
+        return;
+      }
+    }
   }
 
   // Step 1: which agent(s) to search
@@ -345,6 +368,23 @@ function resolveExecutable(cmd: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Runs the global reinstall with visible output. Tries npm first (the
+ * documented default install path); if that fails outright (e.g. this was
+ * actually installed via bun and npm's global root doesn't have it), falls
+ * back to bun rather than leaving the user stuck. Never throws -- worst case
+ * is "update now" silently does nothing and they're no worse off than before. */
+async function runUpdate(): Promise<void> {
+  const tryInstall = (cmd: string, args: string[]) =>
+    new Promise<boolean>((resolve) => {
+      const child = spawn(cmd, args, { stdio: "inherit" });
+      child.on("error", () => resolve(false));
+      child.on("exit", (code) => resolve(code === 0));
+    });
+
+  const npmOk = await tryInstall("npm", ["install", "-g", "agent-hop@latest"]);
+  if (!npmOk) await tryInstall("bun", ["install", "-g", "agent-hop@latest"]);
 }
 
 function cancelExit(): void {

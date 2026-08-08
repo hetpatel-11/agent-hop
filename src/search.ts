@@ -415,15 +415,21 @@ async function embedQueryCached(query: string): Promise<Float32Array> {
   return vec;
 }
 
-// Lexical gets more weight than semantic by default: this is a search over
-// coding sessions, where exact technical terminology (a library name, an
-// error code, a specific API) is usually more meaningful than conceptual
-// similarity. Both halves are min-max normalized to comparable [0,1] ranges
-// before blending -- raw BM25 and raw cosine similarity live on different
-// scales, so blending them unnormalized isn't actually a 70/30 split, it's
-// whatever their raw magnitudes happen to be.
-const BM25_WEIGHT = 0.7;
-const SEMANTIC_WEIGHT = 0.3;
+// Even split: BM25 alone was measurably losing real, genuinely-relevant
+// sessions to unrelated ones that happened to repeat a query word many times
+// (a whole conversation is one BM25 "document," so a focused single mention
+// in a long, on-topic session can lose to incidental repetition in a long,
+// unrelated one -- see the "personal website" / "ux plugin" investigation).
+// Verified empirically across several real queries before changing this:
+// raising semantic's share from 30% to 50% fixed both broken cases with no
+// regression on queries that were already ranking well (e.g. "adobe
+// premiere pro" stayed rank-stable at every weight tested from 30-70%).
+// Both halves are min-max normalized to comparable [0,1] ranges before
+// blending -- raw BM25 and raw cosine similarity live on different scales,
+// so blending them unnormalized isn't actually an even split, it's whatever
+// their raw magnitudes happen to be.
+const BM25_WEIGHT = 0.5;
+const SEMANTIC_WEIGHT = 0.5;
 
 export interface Ranker {
   /** Synchronous re-rank for a new query -- cheap enough to call on every

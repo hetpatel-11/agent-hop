@@ -1,6 +1,6 @@
 {
   "name": "agent-hop",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Search all your coding-agent chats, then continue any session in any agent.",
   "type": "module",
   "keywords": [

@@ -2,7 +2,7 @@
   <img src="assets/screenshot.png" alt="agent-hop searching local agent sessions" width="100%">
 </p>
 
-**Search all your coding-agent chats, then continue any session in any agent.**
+**Search all your coding-agent chats, then resume any session in any agent.**
 
 # agent-hop
 

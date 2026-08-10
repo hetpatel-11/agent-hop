@@ -27,6 +27,17 @@ function codexCliVersion(): string {
   }
 }
 
+/** Codex forwards replayed function calls to an API that only accepts
+ * function names matching /^[a-zA-Z0-9_-]+$/. Other agents may use display
+ * labels with spaces or punctuation, so normalize them before writing. */
+export function sanitizeCodexFunctionName(name: string): string {
+  const sanitized = name
+    .replace(/^[^a-zA-Z0-9_-]+/, "")
+    .replace(/[^a-zA-Z0-9_-]+$/, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_");
+  return sanitized || "unknown_tool";
+}
+
 const MAX_BODY_CHARS = 40000;
 
 const ENV_PREFIXES = ["<environment_context>", "# Context from my IDE", "# AGENTS.md instructions", "<recommended_plugins>"];
@@ -247,11 +258,8 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   for (const turn of turns) {
     const ts = new Date().toISOString();
     // Real function_call/function_call_output response_items, not inlined
-    // text -- confirmed safe by actually forging one (with a tool name
-    // codex never registered, e.g. Claude's "Bash") and resuming it for
-    // real: it loaded and the model correctly recalled the exact fake
-    // result, zero schema/validation error. Codex's loader just replays
-    // whatever's in the rollout; it doesn't validate tool names.
+    // text. Codex does not require these names to correspond to currently
+    // registered tools, but its API still validates the function-name shape.
     // Codex's own -i flag flattens non-image attachments (PDFs, text files)
     // into plain input_text rather than a distinct binary block -- but that
     // only works because codex extracts real readable text from the file
@@ -286,7 +294,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         JSON.stringify({
           timestamp: ts,
           type: "response_item",
-          payload: { type: "function_call", name: tc.name, arguments: tc.input, call_id: callId },
+          payload: { type: "function_call", name: sanitizeCodexFunctionName(tc.name), arguments: tc.input, call_id: callId },
         })
       );
       lines.push(

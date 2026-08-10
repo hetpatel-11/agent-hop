@@ -40,7 +40,8 @@
   },
   "scripts": {
     "build": "tsc -p . && chmod +x dist/cli.js",
-    "dev": "tsx src/cli.ts"
+    "dev": "tsx src/cli.ts",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "files": [
     "dist"

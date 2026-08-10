@@ -65,8 +65,8 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
       const choice = await p.select({
         message: `A new version of agent-hop is available (${update.current} → ${update.latest}).`,
         options: [
-          { value: "later", label: "Later", hint: "just continue" },
-          { value: "now", label: "Update now", hint: "npm/bun install -g, then re-run agent-hop" },
+          { value: "now", label: "Update now (recommended)", hint: "npm/bun install -g, then re-run agent-hop" },
+          { value: "later", label: "Later" },
         ],
       });
       if (!p.isCancel(choice) && choice === "now") {

@@ -25,6 +25,9 @@ Why use it:
   Claude Code into Codex, Grok into Pi, and more.
 - **Use it interactively or from scripts** — humans get a picker; agents can
   call the deterministic non-interactive mode.
+- **100% local** — everything, including semantic search, runs on your
+  machine. Your sessions, including tool calls and attachments, never leave
+  your disk.
 
 Use it when you remember the topic, but not the tool, project directory, or
 exact session.

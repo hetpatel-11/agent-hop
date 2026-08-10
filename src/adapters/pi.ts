@@ -142,10 +142,16 @@ async function read(ref: SessionRef): Promise<Turn[]> {
       if (rec) {
         let out = "";
         if (Array.isArray(message?.content)) {
-          out = (message!.content as unknown[])
+          const contentArr = message!.content as unknown[];
+          out = contentArr
             .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
             .map((b) => b.text)
             .join("\n");
+          // A toolResult's content can carry an image block too (same flat
+          // shape as everywhere else in Pi) -- e.g. our own synthetic
+          // attachment tool result, or a real tool that returns an image
+          // directly. Extract it into a real attachment instead of losing it.
+          pendingAttachments.push(...extractPiAttachments(contentArr));
         } else if (typeof message?.content === "string") {
           out = message.content;
         }
@@ -251,9 +257,26 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       }
       return { type: "toolCall", id: toolCallIds[i], name: tc.name, arguments: args };
     });
+    // Pi declares `api: "anthropic-messages"` (see below) -- the same
+    // backing API as claude.ts, which was confirmed for real to reject
+    // image blocks on assistant messages ("'image' blocks are not permitted
+    // within assistant turns"). Rather than assume Pi shares that
+    // restriction, an assistant-side image is carried as a synthetic
+    // toolCall's result instead, matching the same pattern already proven
+    // safe for Claude/Grok -- correct either way, and avoids relying on an
+    // untested assumption about a restriction we can't currently verify
+    // live (Pi testing here is blocked by an unrelated account usage limit).
+    const attachmentToolCallId = turn.role === "assistant" && imageBlocks.length ? `call-${randomUUID()}-attachment` : null;
+    const allToolCallBlocks = attachmentToolCallId
+      ? [...toolCallBlocks, { type: "toolCall", id: attachmentToolCallId, name: "imported_attachment", arguments: {} }]
+      : toolCallBlocks;
     const message: Record<string, unknown> = {
       role: turn.role,
-      content: [...imageBlocks, ...(combinedText ? [{ type: "text", text: combinedText }] : []), ...toolCallBlocks],
+      content: [
+        ...(turn.role === "user" ? imageBlocks : []),
+        ...(combinedText ? [{ type: "text", text: combinedText }] : []),
+        ...allToolCallBlocks,
+      ],
       timestamp: Date.now(),
     };
     if (turn.role === "assistant") {
@@ -300,6 +323,25 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
             toolCallId: toolCallIds[i],
             toolName: toolCalls[i].name,
             content: [{ type: "text", text: toolCalls[i].output ?? "" }],
+            timestamp: Date.now(),
+          },
+        })
+      );
+      parentId = resultId;
+    }
+    if (attachmentToolCallId) {
+      const resultId = randomUUID().replace(/-/g, "").slice(0, 8);
+      lines.push(
+        JSON.stringify({
+          type: "message",
+          id: resultId,
+          parentId,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId: attachmentToolCallId,
+            toolName: "imported_attachment",
+            content: imageBlocks,
             timestamp: Date.now(),
           },
         })

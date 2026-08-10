@@ -248,8 +248,29 @@ async function read(ref: SessionRef): Promise<Turn[]> {
           const id = block.tool_use_id;
           const rec = typeof id === "string" ? callIndex.get(id) : undefined;
           if (rec) {
-            const out = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
-            rec.output = truncate(out, MAX_TOOL_OUTPUT_CHARS);
+            if (typeof block.content === "string") {
+              rec.output = truncate(block.content, MAX_TOOL_OUTPUT_CHARS);
+            } else if (Array.isArray(block.content)) {
+              // A tool_result's content can itself carry image/document
+              // blocks -- both our own synthetic attachment tool_result and
+              // a genuine real tool (e.g. a screenshot/file-read tool) can
+              // return one this way. Extract those into real attachments
+              // rather than flattening the whole array to escaped JSON text.
+              const textParts: string[] = [];
+              for (const item of block.content as unknown[]) {
+                if (!item || typeof item !== "object") continue;
+                const itemBlock = item as Record<string, unknown>;
+                if (itemBlock.type === "text" && typeof itemBlock.text === "string") {
+                  textParts.push(itemBlock.text);
+                } else if (itemBlock.type === "image" || itemBlock.type === "document") {
+                  const att = extractAttachmentBlock(itemBlock);
+                  if (att) pendingAttachments.push(att);
+                }
+              }
+              if (textParts.length) rec.output = truncate(textParts.join("\n"), MAX_TOOL_OUTPUT_CHARS);
+            } else {
+              rec.output = truncate(JSON.stringify(block.content ?? ""), MAX_TOOL_OUTPUT_CHARS);
+            }
           }
         } else if (block.type === "text" && typeof block.text === "string") {
           const t = block.text.trim();
@@ -346,6 +367,20 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       }
       return { type: "tool_use", id: toolUseIds[i], name: tc.name, input };
     });
+    // 'image'/'document' blocks are only permitted in user turns -- confirmed
+    // for real: a resumed session with an attachment block on an assistant
+    // message fails with "API Error: 400 ... 'image' blocks are not
+    // permitted within assistant turns" the moment the conversation is
+    // continued. A tool_result's content, unlike an assistant message's own
+    // content, *is* allowed to carry image/document blocks (this is exactly
+    // how a real screenshot/file-reading tool returns one) -- so an
+    // assistant-side attachment is carried as the result of a synthetic
+    // tool_use instead, the same pattern already used for Grok's identical
+    // "no assistant-message-level attachment slot" constraint.
+    const attachmentToolUseId = attachmentBlocks.length ? `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}` : null;
+    const allToolUseBlocks = attachmentToolUseId
+      ? [...toolUseBlocks, { type: "tool_use", id: attachmentToolUseId, name: "imported_attachment", input: {} }]
+      : toolUseBlocks;
     entry = {
       parentUuid,
       isSidechain: false,
@@ -354,8 +389,8 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
         type: "message",
         role: "assistant",
-        content: [...attachmentBlocks, ...(combinedText ? [{ type: "text", text: combinedText }] : []), ...toolUseBlocks],
-        stop_reason: toolCalls.length ? "tool_use" : "end_turn",
+        content: [...(combinedText ? [{ type: "text", text: combinedText }] : []), ...allToolUseBlocks],
+        stop_reason: allToolUseBlocks.length ? "tool_use" : "end_turn",
         stop_sequence: null,
       },
       type: "assistant",
@@ -371,11 +406,14 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
     parentUuid = myUuid;
     lastUuid = myUuid;
 
-    // Real tool calls need a matching tool_result reply (as its own "user"
-    // role message, per Claude's own API convention -- see read() above)
-    // immediately after, or the transcript is structurally incomplete.
-    if (toolCalls.length) {
+    // Real tool calls (and a synthetic attachment tool_use, if any) need a
+    // matching tool_result reply (as its own "user" role message, per
+    // Claude's own API convention -- see read() above) immediately after,
+    // or the transcript is structurally incomplete.
+    if (allToolUseBlocks.length) {
       const resultUuid = randomUUID();
+      const resultContent: Record<string, unknown>[] = toolCalls.map((tc, i) => ({ type: "tool_result", tool_use_id: toolUseIds[i], content: tc.output ?? "" }));
+      if (attachmentToolUseId) resultContent.push({ type: "tool_result", tool_use_id: attachmentToolUseId, content: attachmentBlocks });
       const resultEntry = {
         parentUuid,
         isSidechain: false,
@@ -383,7 +421,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         type: "user",
         message: {
           role: "user",
-          content: toolCalls.map((tc, i) => ({ type: "tool_result", tool_use_id: toolUseIds[i], content: tc.output ?? "" })),
+          content: resultContent,
         },
         uuid: resultUuid,
         timestamp: new Date().toISOString(),

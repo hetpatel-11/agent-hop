@@ -210,6 +210,23 @@ export function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + `\n…(truncated, ${s.length - max} more chars)` : s;
 }
 
+/** OpenAI-style function-calling backends (Codex's API, and any
+ * OpenAI/Azure-backed model Pi can route to via `--model auto`) validate a
+ * function name against /^[a-zA-Z0-9_-]+$/ when a conversation is
+ * continued -- confirmed for real on both: a cross-agent tool label with
+ * spaces/punctuation (e.g. a display name like "Web search:") loads and
+ * resumes fine, then fails with a 400 the moment the conversation actually
+ * continues. Anthropic's API does not enforce this on historical tool_use
+ * names (also confirmed live), but sanitizing unconditionally is harmless
+ * there and safer than assuming which backend a target will use. */
+export function sanitizeToolName(name: string): string {
+  const sanitized = name
+    .replace(/^[^a-zA-Z0-9_-]+/, "")
+    .replace(/[^a-zA-Z0-9_-]+$/, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_");
+  return sanitized || "unknown_tool";
+}
+
 /** Renders tool calls as a plain-text block -- the shared fallback shape for
  * cross-agent conversion (native write() paths) and for --print's output,
  * since no structured tool_use/tool_result schema is portable across all

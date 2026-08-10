@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, sanitizeToolName } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -255,7 +255,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       } catch {
         // not JSON -- keep the raw string
       }
-      return { type: "toolCall", id: toolCallIds[i], name: tc.name, arguments: args };
+      return { type: "toolCall", id: toolCallIds[i], name: sanitizeToolName(tc.name), arguments: args };
     });
     // Pi declares `api: "anthropic-messages"` (see below) -- the same
     // backing API as claude.ts, which was confirmed for real to reject
@@ -321,7 +321,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
           message: {
             role: "toolResult",
             toolCallId: toolCallIds[i],
-            toolName: toolCalls[i].name,
+            toolName: sanitizeToolName(toolCalls[i].name),
             content: [{ type: "text", text: toolCalls[i].output ?? "" }],
             timestamp: Date.now(),
           },

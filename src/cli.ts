@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import * as p from "@clack/prompts";
 import figlet from "figlet";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { toolTag, highlightDate, color } from "./theme.js";
@@ -10,6 +10,7 @@ import { collectSessions, searchSessions, buildRanker, ensureIndexingTriggered, 
 import { ADAPTERS } from "./adapters/index.js";
 import { checkForUpdate } from "./update-check.js";
 import { trimTurnsToBudget } from "./util.js";
+import { resolveExecutable } from "./executable.js";
 import type { ToolName, SessionRef } from "./types.js";
 
 const program = new Command();
@@ -290,6 +291,15 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
     projectPath = homedir();
   }
 
+  // Check before conversion: writing a target-native session is pointless if
+  // the target CLI cannot be launched, and previously left an orphaned
+  // converted session followed by an unhandled spawn ENOENT stack trace.
+  const targetCommand = targetAdapter.resumeCmd(sessionId, projectPath)[0];
+  if (!resolveExecutable(targetCommand)) {
+    p.cancel(`Cannot resume in ${targetTool}: "${targetCommand}" is not installed or not on PATH.`);
+    process.exit(1);
+  }
+
   if (targetTool !== picked.tool) {
     const convertSpinner = p.spinner();
     convertSpinner.start(`Converting ${picked.tool} session for ${targetTool}...`);
@@ -364,22 +374,11 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
     cwd: projectPath,
     stdio: "inherit",
   });
+  child.on("error", (err) => {
+    p.cancel(`Failed to launch ${targetTool}: ${err.message}`);
+    process.exit(1);
+  });
   child.on("exit", (code) => process.exit(code ?? 0));
-}
-
-/** Resolves a bare command name (e.g. "opencode") to its full path via the
- * OS's own lookup (`which`/`where`) -- execve needs a real path, it doesn't
- * do PATH search the way spawn() does. Returns null on any failure rather
- * than throwing, so the caller can safely fall back to spawn(). */
-function resolveExecutable(cmd: string): string | null {
-  try {
-    const finder = process.platform === "win32" ? "where" : "which";
-    const out = execFileSync(finder, [cmd], { encoding: "utf-8" });
-    const resolved = out.split("\n")[0].trim();
-    return resolved || null;
-  } catch {
-    return null;
-  }
 }
 
 /** Runs the global reinstall with visible output. Tries npm first (the

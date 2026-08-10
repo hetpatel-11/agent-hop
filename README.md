@@ -129,6 +129,10 @@ or one narrow session store.
 | Pi | ✅ | ✅ |
 | Grok Build | ✅ | ✅ |
 
+`agent-hop` converts and launches sessions; it does not install the agent
+clients themselves. The agent selected under "Resume in which agent?" must
+already be installed and available on `PATH`.
+
 Every adapter has been verified with a real live model call actually
 recalling injected content across a resume.
 

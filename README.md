@@ -1,5 +1,7 @@
 https://github.com/user-attachments/assets/e80fbf5b-a899-4da2-a41f-43e1d6248d75
 
+*In demo: a Claude Code session, continued in Codex — as it is.*
+
 **Search all your coding-agent chats, then resume any session in any agent.**
 
 # agent-hop
@@ -16,8 +18,9 @@ Why use it:
   local history from one command.
 - **Stop re-explaining context** — resume with the real conversation history,
   not a summary.
-- **Keep the actual work, not just the words** — shell commands, file edits,
-  MCP calls, images, and PDFs carry over too, not just the text.
+- **Keep the actual work, not just the words** — tool calls (shell commands,
+  file edits, MCP calls) and file attachments (images, PDFs) carry over too,
+  not just the text.
 - **Switch agents without starting over** — hop a Codex chat into OpenCode,
   Claude Code into Codex, Grok into Pi, and more.
 - **Use it interactively or from scripts** — humans get a picker; agents can

@@ -1,6 +1,7 @@
 import { readFileSync, statSync, readdirSync, createReadStream, openSync, readSync, closeSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
+import type { ToolCallRecord, Turn } from "./types.js";
 
 export function readJsonlLines(path: string): Record<string, unknown>[] {
   let raw: string;
@@ -197,6 +198,120 @@ export function cleanTitle(raw: string): string {
   const lastSpace = cut.lastIndexOf(" ");
   const trimmed = lastSpace > MAX_TITLE_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut;
   return trimmed.trimEnd() + "…";
+}
+
+// A tool call's output can legitimately be a whole file dump or command log
+// -- capped per-call so one giant `cat` doesn't blow the entire turn budget,
+// while still keeping enough to be useful (unlike dropping tool calls
+// entirely, which was the previous behavior).
+export const MAX_TOOL_OUTPUT_CHARS = 3000;
+
+export function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + `\n…(truncated, ${s.length - max} more chars)` : s;
+}
+
+/** Renders tool calls as a plain-text block -- the shared fallback shape for
+ * cross-agent conversion (native write() paths) and for --print's output,
+ * since no structured tool_use/tool_result schema is portable across all
+ * five agents' formats. Deliberately terse and consistent regardless of
+ * which agent originally made the call. */
+/** Every real coding-agent tool call whose input is a shell/exec-style
+ * invocation is keyed the same handful of ways across agents (Codex's
+ * exec_command uses "cmd", Claude's Bash tool uses "command", etc.) --
+ * pulling the actual command out and rendering it as a real shell block is
+ * what makes it read like a native tool call instead of a JSON envelope
+ * dump. `description` is common alongside it (a human-readable one-liner
+ * of intent) and reads naturally as a comment above the command, matching
+ * how agents already narrate "why" before "what". */
+function extractShellCommand(parsed: unknown): { command: string; description?: string } | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+  for (const key of ["command", "cmd", "script"]) {
+    if (typeof obj[key] === "string") {
+      const description = typeof obj.description === "string" ? obj.description : undefined;
+      return { command: obj[key] as string, description };
+    }
+  }
+  return null;
+}
+
+/** Every target TUI renders markdown in assistant messages (that's how
+ * they render their own tool output), so real code fences read as a
+ * proper formatted block instead of a raw inline JSON dump -- which is
+ * what the plain "[tool call: x]\ninput: {...}" version produced, and
+ * looked like an unstyled wall of text next to everything else the TUI
+ * renders normally. The JSON itself also needs pretty-printing: a raw
+ * single-line stringified arguments blob (escaped quotes, embedded
+ * newlines as literal \n) reads as an unreadable wall of text even inside
+ * a fence -- confirmed genuinely bad by looking at a real screenshot of a
+ * resumed tool call, not just theorized. */
+export function renderToolCalls(toolCalls?: ToolCallRecord[]): string {
+  if (!toolCalls || toolCalls.length === 0) return "";
+  return toolCalls
+    .map((tc) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(tc.input);
+      } catch {
+        parsed = undefined;
+      }
+
+      let input: string;
+      const shell = parsed !== undefined ? extractShellCommand(parsed) : null;
+      if (shell) {
+        const comment = shell.description ? `# ${shell.description}\n` : "";
+        input = `\`\`\`bash\n${comment}${shell.command}\n\`\`\``;
+      } else if (parsed !== undefined) {
+        input = `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+      } else {
+        input = `\`\`\`\n${tc.input}\n\`\`\``;
+      }
+
+      const output = tc.output ? `\nOutput:\n\`\`\`\n${tc.output}\n\`\`\`` : "";
+      return `**Tool call: \`${tc.name}\`**\n${input}${output}`;
+    })
+    .join("\n\n");
+}
+
+// Full tool-call I/O (now preserved in full, not just narration text) can
+// make a real long-running session's converted size enormous -- a real
+// 547-turn session measured at ~3.3M characters (~820k estimated tokens),
+// which silently produced a converted session no target agent's context
+// window could actually load (confirmed for real: Codex errored with "ran
+// out of room in the model's context window" on resume). There was never
+// any size cap on full-session conversion, even before tool-call fidelity
+// existed -- it just wasn't survivable to notice until output got this
+// much bigger. 200k chars (~50k tokens) leaves real headroom for a target
+// agent's own system prompt/skills/tools (observed as large as ~40-50k
+// chars on their own in a real session) while still keeping a
+// substantial, useful slice of recent conversation.
+export const CONVERSION_CHAR_BUDGET = 200_000;
+
+function turnCharCount(t: Turn): number {
+  let n = t.text.length;
+  for (const tc of t.toolCalls ?? []) n += tc.input.length + (tc.output?.length ?? 0);
+  return n;
+}
+
+/** Keeps the most recent turns that fit under a total character budget --
+ * trimming from the oldest end, since "resume" almost always means
+ * "continue from where things left off," not "replay the entire history
+ * from months ago." Attachment bytes (images/PDFs) aren't counted toward
+ * the budget -- they're usually tokenized far more efficiently than raw
+ * text per byte, and excluding them keeps this from over-trimming a
+ * conversation just because it happened to have a couple of screenshots. */
+export function trimTurnsToBudget(turns: Turn[], budget = CONVERSION_CHAR_BUDGET): { turns: Turn[]; droppedCount: number } {
+  let total = 0;
+  let cutIndex = turns.length;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    total += turnCharCount(turns[i]);
+    if (total > budget) {
+      cutIndex = i + 1;
+      break;
+    }
+    cutIndex = i;
+  }
+  return { turns: turns.slice(cutIndex), droppedCount: cutIndex };
 }
 
 export function isoNow(): string {

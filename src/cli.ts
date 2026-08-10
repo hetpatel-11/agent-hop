@@ -9,6 +9,7 @@ import { toolTag, highlightDate, color } from "./theme.js";
 import { collectSessions, searchSessions, buildRanker, ensureIndexingTriggered, TOOL_NAMES } from "./search.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { checkForUpdate } from "./update-check.js";
+import { trimTurnsToBudget } from "./util.js";
 import type { ToolName, SessionRef } from "./types.js";
 
 const program = new Command();
@@ -293,14 +294,25 @@ async function main(queryArg: string | undefined, opts: { agent?: string; resume
     const convertSpinner = p.spinner();
     convertSpinner.start(`Converting ${picked.tool} session for ${targetTool}...`);
     try {
-      const turns = await sourceAdapter.read(picked);
-      if (turns.length === 0) {
+      const allTurns = await sourceAdapter.read(picked);
+      if (allTurns.length === 0) {
         convertSpinner.stop("No readable turns in that session.");
         p.outro("Nothing to resume.");
         return;
       }
+      // A long real session's full tool-call I/O can be enormous -- large
+      // enough that the target agent's own context window can't actually
+      // load it (confirmed for real: a 547-turn session converted to ~3.3M
+      // characters, and the target errored with "ran out of room in the
+      // model's context window" on resume). Keep the most recent slice
+      // that fits instead of silently handing over something unusable.
+      const { turns, droppedCount } = trimTurnsToBudget(allTurns);
       sessionId = await targetAdapter.write(turns, projectPath);
-      convertSpinner.stop(`Converted (${turns.length} turns).`);
+      convertSpinner.stop(
+        droppedCount > 0
+          ? `Converted (${turns.length} of ${allTurns.length} turns -- oldest ${droppedCount} dropped, session was too large for ${targetTool}'s context window).`
+          : `Converted (${turns.length} turns).`
+      );
     } catch (err) {
       convertSpinner.stop("Conversion failed.");
       p.cancel(err instanceof Error ? err.message : String(err));

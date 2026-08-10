@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/screenshot.png" alt="agent-hop searching local agent sessions" width="100%">
-</p>
+https://github.com/user-attachments/assets/e80fbf5b-a899-4da2-a41f-43e1d6248d75
 
 **Search all your coding-agent chats, then resume any session in any agent.**
 
@@ -18,6 +16,8 @@ Why use it:
   local history from one command.
 - **Stop re-explaining context** — resume with the real conversation history,
   not a summary.
+- **Keep the actual work, not just the words** — shell commands, file edits,
+  MCP calls, images, and PDFs carry over too, not just the text.
 - **Switch agents without starting over** — hop a Codex chat into OpenCode,
   Claude Code into Codex, Grok into Pi, and more.
 - **Use it interactively or from scripts** — humans get a picker; agents can
@@ -36,6 +36,13 @@ Or with Bun, if you already use it:
 
 ```bash
 bun install -g agent-hop
+```
+
+If this is your first global Bun install, Bun will warn that its global bin
+folder isn't on your `PATH` yet -- add it (once) and reload your shell:
+
+```bash
+export PATH="$HOME/.bun/bin:$PATH"
 ```
 
 ## Usage
@@ -162,8 +169,25 @@ files, some behind an official export/import CLI, and some with separate
 display/replay event streams. `agent-hop` normalizes all of them to one shape:
 
 ```ts
-interface Turn { role: "user" | "assistant"; text: string }
+interface Turn {
+  role: "user" | "assistant";
+  text: string;
+  toolCalls?: ToolCallRecord[];   // shell commands, file edits, MCP calls, ...
+  attachments?: Attachment[];     // images, PDFs
+}
 ```
+
+Tool calls and attachments aren't flattened into text — every adapter writes
+them as real, native structured entries in the target format (Claude Code's
+`tool_use`/`tool_result` blocks, Codex's `function_call`/
+`function_call_output`, Pi's `toolCall`/`toolResult`, OpenCode's `ToolPart`,
+Grok's `tool_calls`/`tool_result`), the same shape that agent's own client
+produces for a call it made itself. Each of those was verified against a
+real generated session from the actual tool, not guessed from
+documentation. A long session's full tool-call I/O can be large enough to
+exceed a target agent's context window on its own — `agent-hop` keeps the
+most recent slice that fits rather than handing over something the target
+can't load.
 
 Each adapter (`src/adapters/<tool>.ts`) implements:
 

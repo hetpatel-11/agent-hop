@@ -1,6 +1,6 @@
 {
   "name": "agent-hop",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Search all your coding-agent chats, then continue any session in any agent.",
   "type": "module",
   "keywords": [
@@ -43,7 +43,6 @@
     "dev": "tsx src/cli.ts"
   },
   "files": [
-    "assets/screenshot.png",
     "dist"
   ],
   "dependencies": {

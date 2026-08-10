@@ -2,8 +2,8 @@ import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
+import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -85,22 +85,107 @@ async function listSessions(): Promise<SessionRef[]> {
   return out;
 }
 
+/** Pi declares `api: "anthropic-messages"` (see write() below) but its own
+ * real image content block is flat -- {type:"image", mimeType, data} --
+ * NOT Claude's nested {type:"image", source:{type:"base64", media_type,
+ * data}}. Wrongly assumed they matched; caught by generating a real image
+ * through the actual `pi` CLI (`pi -p @file.png "..."`) and inspecting the
+ * real session file, which returned zero images under the nested-shape
+ * assumption despite the raw file clearly having image content. */
+function extractPiAttachments(content: unknown[]): Attachment[] {
+  return content
+    .filter((b): b is Record<string, unknown> => typeof b === "object" && b !== null && (b as { type?: string }).type === "image")
+    .map((b) => (typeof b.data === "string" ? { mimeType: typeof b.mimeType === "string" ? b.mimeType : "image/png", base64: b.data } : null))
+    .filter((x): x is Attachment => x !== null);
+}
+
+/** Pi's own message shape declares `api: "anthropic-messages"`, but tool
+ * calls/results aren't nested the way Claude's are -- a toolCall is a
+ * content block inside an assistant message (`{type:"toolCall", id, name,
+ * arguments}`), while its result is an entirely separate message with its
+ * own role: `{role:"toolResult", toolCallId, toolName, content}`. Both get
+ * folded into the enclosing assistant turn, matched by id, same as the
+ * Codex/Claude adapters. */
 async function read(ref: SessionRef): Promise<Turn[]> {
   const file = ref.raw?.file as string;
   const lines = readJsonlLines(file);
   const turns: Turn[] = [];
+
+  let assistantTextParts: string[] = [];
+  let pendingToolCalls: ToolCallRecord[] = [];
+  let pendingAttachments: Attachment[] = [];
+  const callIndex = new Map<string, ToolCallRecord>();
+
+  const flushAssistant = () => {
+    const text = assistantTextParts.join("\n\n").trim();
+    if (text || pendingToolCalls.length > 0 || pendingAttachments.length > 0) {
+      turns.push({
+        role: "assistant",
+        text,
+        toolCalls: pendingToolCalls.length ? pendingToolCalls : undefined,
+        attachments: pendingAttachments.length ? pendingAttachments : undefined,
+      });
+    }
+    assistantTextParts = [];
+    pendingToolCalls = [];
+    pendingAttachments = [];
+    callIndex.clear();
+  };
+
   for (const obj of lines) {
     if (obj.type !== "message") continue;
-    const message = obj.message as { role?: string; content?: unknown } | undefined;
+    const message = obj.message as { role?: string; content?: unknown; toolCallId?: string } | undefined;
     const role = message?.role;
+
+    if (role === "toolResult") {
+      const rec = message?.toolCallId ? callIndex.get(message.toolCallId) : undefined;
+      if (rec) {
+        let out = "";
+        if (Array.isArray(message?.content)) {
+          out = (message!.content as unknown[])
+            .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+            .map((b) => b.text)
+            .join("\n");
+        } else if (typeof message?.content === "string") {
+          out = message.content;
+        }
+        rec.output = truncate(out, MAX_TOOL_OUTPUT_CHARS);
+      }
+      continue;
+    }
+
     if (role !== "user" && role !== "assistant") continue;
     if (!Array.isArray(message?.content)) continue;
-    const parts = message.content
+    const content = message.content as unknown[];
+
+    if (role === "assistant") {
+      for (const b of content) {
+        if (!b || typeof b !== "object") continue;
+        const block = b as Record<string, unknown>;
+        if (block.type === "text" && typeof block.text === "string") {
+          const t = block.text.trim();
+          if (t) assistantTextParts.push(t);
+        } else if (block.type === "toolCall") {
+          const rec: ToolCallRecord = { name: typeof block.name === "string" ? block.name : "unknown_tool", input: JSON.stringify(block.arguments ?? {}) };
+          pendingToolCalls.push(rec);
+          if (typeof block.id === "string") callIndex.set(block.id, rec);
+        }
+      }
+      pendingAttachments.push(...extractPiAttachments(content));
+      continue;
+    }
+
+    // role === "user" -- a genuine human turn, flush whatever assistant
+    // activity (text + tool calls) accumulated before it.
+    flushAssistant();
+    const parts = content
       .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
       .map((b) => b.text);
     const text = parts.join("\n").trim();
-    if (text) turns.push({ role, text });
+    const attachments = extractPiAttachments(content);
+    if (text || attachments.length) turns.push({ role: "user", text, attachments: attachments.length ? attachments : undefined });
   }
+  flushAssistant();
   return turns;
 }
 
@@ -135,9 +220,40 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   for (const turn of turns) {
     const myId = randomUUID().replace(/-/g, "").slice(0, 8);
     const ts = new Date().toISOString();
+    // Real toolCall content blocks + a separate toolResult message, not
+    // inlined text -- confirmed safe by actually forging one (with a tool
+    // name pi never registered, e.g. Codex's "exec_command") and resuming
+    // it for real: it loaded with zero schema/validation error (the one
+    // real error hit during testing was from an incomplete hand-rolled
+    // usage object, not from the tool call shape itself -- fixed by
+    // reusing this exact real assistant-message template). Pi's loader
+    // just replays whatever's in the transcript.
+    // Pi's own @file mechanism inlines non-image attachments as readable
+    // text (<file name="...">...content...</file>), extracted by pi itself
+    // -- we only have base64 bytes, not extracted text, so non-image
+    // attachments get a placeholder note instead of forged binary-as-text.
+    const nonImageNote = (turn.attachments ?? [])
+      .filter((a) => !a.mimeType.startsWith("image/"))
+      .map((a) => `[attached file: ${a.filename ?? "unnamed"} (${a.mimeType})]`)
+      .join("\n");
+    const combinedText = [turn.text, nonImageNote].filter(Boolean).join("\n\n");
+    // Real shape confirmed by generating an actual image through the pi
+    // CLI: flat {type, mimeType, data}, not Claude's nested `source` object.
+    const imageBlocks = (turn.attachments ?? []).filter((a) => a.mimeType.startsWith("image/")).map((img) => ({ type: "image", mimeType: img.mimeType, data: img.base64 }));
+    const toolCalls = turn.toolCalls ?? [];
+    const toolCallIds = toolCalls.map(() => `call-${randomUUID()}-0`);
+    const toolCallBlocks = toolCalls.map((tc, i) => {
+      let args: unknown = tc.input;
+      try {
+        args = JSON.parse(tc.input);
+      } catch {
+        // not JSON -- keep the raw string
+      }
+      return { type: "toolCall", id: toolCallIds[i], name: tc.name, arguments: args };
+    });
     const message: Record<string, unknown> = {
       role: turn.role,
-      content: [{ type: "text", text: turn.text }],
+      content: [...imageBlocks, ...(combinedText ? [{ type: "text", text: combinedText }] : []), ...toolCallBlocks],
       timestamp: Date.now(),
     };
     if (turn.role === "assistant") {
@@ -168,6 +284,28 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       })
     );
     parentId = myId;
+
+    // toolResult is its own message with a dedicated role, per Pi's own
+    // convention -- see read() above -- one per tool call, matched by id.
+    for (let i = 0; i < toolCalls.length; i++) {
+      const resultId = randomUUID().replace(/-/g, "").slice(0, 8);
+      lines.push(
+        JSON.stringify({
+          type: "message",
+          id: resultId,
+          parentId,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId: toolCallIds[i],
+            toolName: toolCalls[i].name,
+            content: [{ type: "text", text: toolCalls[i].output ?? "" }],
+            timestamp: Date.now(),
+          },
+        })
+      );
+      parentId = resultId;
+    }
   }
 
   writeFileSync(outPath, lines.join("\n") + "\n");

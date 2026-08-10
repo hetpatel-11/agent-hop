@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import type { Adapter, SessionRef, Turn } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler } from "../util.js";
+import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -103,28 +103,171 @@ async function listSessions(): Promise<SessionRef[]> {
   return out;
 }
 
+/** Claude's own API convention represents a tool call as `tool_use` inside
+ * an assistant message, and its result as `tool_result` inside a
+ * *following* message with role "user" -- that's API plumbing, not
+ * something the human actually typed. Both get folded into the enclosing
+ * assistant turn (matched by id/tool_use_id) instead of surfacing as a fake
+ * human message; only content blocks the human genuinely sent (or a real
+ * final assistant reply) become their own Turn.
+ *
+ * Separately: `@file` mentions don't appear in the message content array at
+ * all -- Claude Code logs them as an entirely distinct top-level record,
+ * `{type:"attachment", attachment:{type:"file", filename, content:{type:
+ * "text"|"pdf", file:{...}}}}`, arriving *after* the user message it
+ * belongs to (confirmed by generating real sessions with a real @file.pdf
+ * and @file.txt reference and inspecting the raw output -- not documented
+ * anywhere, found by diffing the raw file). That's why user turns are now
+ * buffered (like assistant turns already were) instead of pushed
+ * immediately: the attachment record needs to land in the same turn as the
+ * message that referenced it, and it arrives on a later line. The same
+ * top-level `type:"attachment"` record also carries unrelated session
+ * bookkeeping (hook results, skill/agent listings, deferred-tool deltas) --
+ * only `attachment.type === "file"` is a real user-turn attachment. */
 async function read(ref: SessionRef): Promise<Turn[]> {
   const file = ref.raw?.file as string;
   const lines = readJsonlLines(file);
   const turns: Turn[] = [];
+
+  let userTextParts: string[] = [];
+  let userAttachments: Attachment[] = [];
+  let assistantTextParts: string[] = [];
+  let pendingToolCalls: ToolCallRecord[] = [];
+  let pendingAttachments: Attachment[] = [];
+  const callIndex = new Map<string, ToolCallRecord>();
+  let lastRole: "user" | "assistant" | null = null;
+
+  const flushUser = () => {
+    const text = userTextParts.join("\n\n").trim();
+    if (text || userAttachments.length) turns.push({ role: "user", text, attachments: userAttachments.length ? userAttachments : undefined });
+    userTextParts = [];
+    userAttachments = [];
+  };
+  const flushAssistant = () => {
+    const text = assistantTextParts.join("\n\n").trim();
+    if (text || pendingToolCalls.length > 0 || pendingAttachments.length > 0) {
+      turns.push({
+        role: "assistant",
+        text,
+        toolCalls: pendingToolCalls.length ? pendingToolCalls : undefined,
+        attachments: pendingAttachments.length ? pendingAttachments : undefined,
+      });
+    }
+    assistantTextParts = [];
+    pendingToolCalls = [];
+    pendingAttachments = [];
+    callIndex.clear();
+  };
+  const ensureRole = (role: "user" | "assistant") => {
+    if (lastRole !== null && lastRole !== role) {
+      if (lastRole === "user") flushUser();
+      else flushAssistant();
+    }
+    lastRole = role;
+  };
+
+  // Shared shape for both `image` and `document` content blocks -- same
+  // {type, source:{type:"base64", media_type, data}} wrapper, just a
+  // different `type` and `media_type`. Confirmed `document` is real (not
+  // guessed) by generating a session with a real @file.pdf reference.
+  const extractAttachmentBlock = (b: Record<string, unknown>): Attachment | null => {
+    const src = b.source as { type?: string; media_type?: string; data?: string } | undefined;
+    if (src?.type === "base64" && typeof src.data === "string") {
+      return { mimeType: src.media_type ?? "application/octet-stream", base64: src.data };
+    }
+    return null;
+  };
+
   for (const obj of lines) {
+    if (obj.type === "attachment") {
+      const att = obj.attachment as { type?: string; filename?: string; content?: { type?: string; file?: { content?: string; base64?: string } } } | undefined;
+      if (att?.type === "file") {
+        ensureRole("user"); // @file mentions are always something the human referenced
+        const filename = att.filename ?? "unnamed";
+        if (att.content?.type === "text" && typeof att.content.file?.content === "string") {
+          // A real text file -- genuinely readable content, inline as text
+          // (consistent with how Codex/Pi/Grok already handle this) rather
+          // than needlessly base64-wrapping something that's already plain
+          // text.
+          userTextParts.push(`<file name="${filename}">\n${att.content.file.content}\n</file>`);
+        } else if (typeof att.content?.file?.base64 === "string") {
+          const mime = att.content.type === "pdf" ? "application/pdf" : "application/octet-stream";
+          userAttachments.push({ mimeType: mime, base64: att.content.file.base64, filename });
+        }
+      }
+      continue; // every other attachment.type is session bookkeeping, not user content
+    }
+
     if (obj.type !== "user" && obj.type !== "assistant") continue;
     const message = obj.message as { role?: string; content?: unknown } | undefined;
     const role = message?.role;
     if (role !== "user" && role !== "assistant") continue;
-    let text = "";
     const content = message?.content;
-    if (typeof content === "string") {
-      text = content;
-    } else if (Array.isArray(content)) {
-      text = content
-        .filter((b): b is { type: string; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-        .map((b) => b.text)
-        .join("\n");
+
+    if (role === "assistant") {
+      ensureRole("assistant");
+      if (typeof content === "string") {
+        if (content.trim()) assistantTextParts.push(content.trim());
+      } else if (Array.isArray(content)) {
+        for (const b of content) {
+          if (!b || typeof b !== "object") continue;
+          const block = b as Record<string, unknown>;
+          if (block.type === "text" && typeof block.text === "string") {
+            const t = block.text.trim();
+            if (t) assistantTextParts.push(t);
+          } else if (block.type === "tool_use") {
+            const rec: ToolCallRecord = { name: typeof block.name === "string" ? block.name : "unknown_tool", input: JSON.stringify(block.input ?? {}) };
+            pendingToolCalls.push(rec);
+            if (typeof block.id === "string") callIndex.set(block.id, rec);
+          } else if (block.type === "image" || block.type === "document") {
+            const att = extractAttachmentBlock(block);
+            if (att) pendingAttachments.push(att);
+          }
+        }
+      }
+      continue;
     }
-    text = text.trim();
-    if (text) turns.push({ role, text });
+
+    // role === "user" -- may be a genuine human message, a tool_result
+    // envelope, or (per the API) technically a mix of both. Compute the
+    // real content first so a pure tool_result envelope can be skipped
+    // *without* touching role state -- it's API plumbing mid-assistant-turn,
+    // not a real turn boundary, and must not flush the assistant's
+    // still-in-progress tool-call accumulation.
+    let hadToolResult = false;
+    const localText: string[] = [];
+    const localAttachments: Attachment[] = [];
+    if (typeof content === "string") {
+      if (content.trim()) localText.push(content.trim());
+    } else if (Array.isArray(content)) {
+      for (const b of content) {
+        if (!b || typeof b !== "object") continue;
+        const block = b as Record<string, unknown>;
+        if (block.type === "tool_result") {
+          hadToolResult = true;
+          const id = block.tool_use_id;
+          const rec = typeof id === "string" ? callIndex.get(id) : undefined;
+          if (rec) {
+            const out = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+            rec.output = truncate(out, MAX_TOOL_OUTPUT_CHARS);
+          }
+        } else if (block.type === "text" && typeof block.text === "string") {
+          const t = block.text.trim();
+          if (t) localText.push(t);
+        } else if (block.type === "image" || block.type === "document") {
+          const att = extractAttachmentBlock(block);
+          if (att) localAttachments.push(att);
+        }
+      }
+    }
+    if (hadToolResult && localText.length === 0 && localAttachments.length === 0) continue;
+
+    ensureRole("user");
+    userTextParts.push(...localText);
+    userAttachments.push(...localAttachments);
   }
+  flushUser();
+  flushAssistant();
   return turns;
 }
 
@@ -151,6 +294,25 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
   for (const turn of turns) {
     const myUuid = randomUUID();
     const ts = new Date().toISOString();
+    // Real tool_use/tool_result blocks, not inlined text -- confirmed safe
+    // by actually forging one (including a tool name Claude Code never
+    // registered, e.g. Codex's "exec_command") and resuming it for real:
+    // it loaded and the model correctly recalled the exact fake result,
+    // with zero schema/validation error. Claude Code's loader just replays
+    // whatever's in the transcript; it doesn't validate tool names against
+    // a whitelist. This is what makes a resumed tool call read as a
+    // genuine native tool card instead of markdown text glued onto a
+    // message.
+    const attachments = turn.attachments ?? [];
+    const otherNote = attachments
+      .filter((a) => !a.mimeType.startsWith("image/") && a.mimeType !== "application/pdf")
+      .map((a) => `[attached file: ${a.filename ?? "unnamed"} (${a.mimeType})]`)
+      .join("\n");
+    const combinedText = [turn.text, otherNote].filter(Boolean).join("\n\n");
+    const attachmentBlocks = attachments
+      .filter((a) => a.mimeType.startsWith("image/") || a.mimeType === "application/pdf")
+      .map((a) => ({ type: a.mimeType === "application/pdf" ? "document" : "image", source: { type: "base64", media_type: a.mimeType, data: a.base64 } }));
+
     let entry: Record<string, unknown>;
     if (turn.role === "user") {
       entry = {
@@ -158,7 +320,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         isSidechain: false,
         promptId: randomUUID(),
         type: "user",
-        message: { role: "user", content: turn.text },
+        message: { role: "user", content: attachmentBlocks.length ? [...attachmentBlocks, ...(combinedText ? [{ type: "text", text: combinedText }] : [])] : combinedText },
         uuid: myUuid,
         timestamp: ts,
         userType: "external",
@@ -167,32 +329,74 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         sessionId: newId,
         version: cliVersion,
       };
-    } else {
-      entry = {
-        parentUuid,
-        isSidechain: false,
-        message: {
-          model: "claude-sonnet-5",
-          id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text: turn.text }],
-          stop_reason: "end_turn",
-          stop_sequence: null,
-        },
-        type: "assistant",
-        uuid: myUuid,
-        timestamp: ts,
-        userType: "external",
-        entrypoint: "cli",
-        cwd: realCwd,
-        sessionId: newId,
-        version: cliVersion,
-      };
+      lines.push(JSON.stringify(entry));
+      parentUuid = myUuid;
+      lastUuid = myUuid;
+      continue;
     }
+
+    const toolCalls = turn.toolCalls ?? [];
+    const toolUseIds = toolCalls.map(() => `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`);
+    const toolUseBlocks = toolCalls.map((tc, i) => {
+      let input: unknown = tc.input;
+      try {
+        input = JSON.parse(tc.input);
+      } catch {
+        // not JSON -- keep the raw string, still a valid input value
+      }
+      return { type: "tool_use", id: toolUseIds[i], name: tc.name, input };
+    });
+    entry = {
+      parentUuid,
+      isSidechain: false,
+      message: {
+        model: "claude-sonnet-5",
+        id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "message",
+        role: "assistant",
+        content: [...attachmentBlocks, ...(combinedText ? [{ type: "text", text: combinedText }] : []), ...toolUseBlocks],
+        stop_reason: toolCalls.length ? "tool_use" : "end_turn",
+        stop_sequence: null,
+      },
+      type: "assistant",
+      uuid: myUuid,
+      timestamp: ts,
+      userType: "external",
+      entrypoint: "cli",
+      cwd: realCwd,
+      sessionId: newId,
+      version: cliVersion,
+    };
     lines.push(JSON.stringify(entry));
     parentUuid = myUuid;
     lastUuid = myUuid;
+
+    // Real tool calls need a matching tool_result reply (as its own "user"
+    // role message, per Claude's own API convention -- see read() above)
+    // immediately after, or the transcript is structurally incomplete.
+    if (toolCalls.length) {
+      const resultUuid = randomUUID();
+      const resultEntry = {
+        parentUuid,
+        isSidechain: false,
+        promptId: randomUUID(),
+        type: "user",
+        message: {
+          role: "user",
+          content: toolCalls.map((tc, i) => ({ type: "tool_result", tool_use_id: toolUseIds[i], content: tc.output ?? "" })),
+        },
+        uuid: resultUuid,
+        timestamp: new Date().toISOString(),
+        userType: "external",
+        entrypoint: "cli",
+        cwd: realCwd,
+        sessionId: newId,
+        version: cliVersion,
+      };
+      lines.push(JSON.stringify(resultEntry));
+      parentUuid = resultUuid;
+      lastUuid = resultUuid;
+    }
   }
 
   lines.unshift(JSON.stringify({ type: "last-prompt", leafUuid: lastUuid, sessionId: newId }));

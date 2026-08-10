@@ -1,10 +1,11 @@
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { Adapter, SessionRef, Turn } from "../types.js";
-import { cleanTitle } from "../util.js";
+import { fileURLToPath } from "node:url";
+import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
+import { cleanTitle, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
 
@@ -85,7 +86,24 @@ async function listSessions(): Promise<SessionRef[]> {
   });
 }
 
-function exportSession(sessionId: string): { info: Record<string, unknown>; messages: { info: Record<string, unknown>; parts: { type: string; text?: string }[] }[] } | null {
+interface OpencodePart {
+  type: string;
+  text?: string;
+  // ToolPart -- confirmed against opencode's own source (message-v2.ts),
+  // no local session with an actual tool call was available to verify
+  // empirically, so this is read defensively (missing/renamed fields just
+  // mean that tool call is skipped, not a crash).
+  tool?: string;
+  callID?: string;
+  state?: { status?: string; input?: unknown; output?: unknown };
+  // FilePart -- generic, not image-specific (confirmed by attaching a real
+  // PDF: same shape, mime just says application/pdf instead of image/*).
+  url?: string;
+  mime?: string;
+  filename?: string;
+}
+
+function exportSession(sessionId: string): { info: Record<string, unknown>; messages: { info: Record<string, unknown>; parts: OpencodePart[] }[] } | null {
   let out: string;
   try {
     out = execFileSync("opencode", ["export", sessionId], { encoding: "utf-8" });
@@ -101,6 +119,32 @@ function exportSession(sessionId: string): { info: Record<string, unknown>; mess
   }
 }
 
+/** Reads a FilePart's bytes -- OpenCode's `url` field is a data: URI for
+ * pasted attachments, but can also be a local file path/file: URL for
+ * attachments referenced on disk. Since OpenCode is local-first (this
+ * process runs on the same machine that recorded the session), a local
+ * path is just as readable as an inline blob -- try both instead of only
+ * handling the inline case. Generic across mime types -- confirmed by
+ * attaching a real PDF through the actual opencode CLI (`-f file.pdf`):
+ * identical FilePart shape, just `mime: "application/pdf"` instead of
+ * `image/*`, so there's no reason to filter to images only. */
+function readOpencodeAttachment(part: OpencodePart): Attachment | null {
+  if (!part.url || !part.mime) return null;
+  const dataMatch = /^data:[^;]+;base64,(.*)$/s.exec(part.url);
+  if (dataMatch) return { mimeType: part.mime, base64: dataMatch[1], filename: part.filename };
+  try {
+    const filePath = part.url.startsWith("file://") ? fileURLToPath(part.url) : part.url;
+    return { mimeType: part.mime, base64: readFileSync(filePath).toString("base64"), filename: part.filename };
+  } catch {
+    return null; // moved/deleted since the session was recorded -- skip, don't crash
+  }
+}
+
+/** OpenCode's tool calls (`ToolPart`) and image attachments (`FilePart`)
+ * are confirmed against opencode's own source, not empirically verified
+ * against a real local session (none in this install happened to use a
+ * tool) -- read defensively so an unexpected shape just means that part is
+ * skipped, never a thrown error. */
 async function read(ref: SessionRef): Promise<Turn[]> {
   const data = exportSession(ref.sessionId);
   if (!data) return [];
@@ -108,12 +152,30 @@ async function read(ref: SessionRef): Promise<Turn[]> {
   for (const m of data.messages) {
     const role = m.info.role as string;
     if (role !== "user" && role !== "assistant") continue;
-    const text = m.parts
-      .filter((p) => p.type === "text" && p.text)
-      .map((p) => p.text)
-      .join("\n")
-      .trim();
-    if (text) turns.push({ role, text });
+
+    const textParts = m.parts.filter((p) => p.type === "text" && p.text).map((p) => p.text as string);
+    const text = textParts.join("\n").trim();
+
+    const toolCalls: ToolCallRecord[] = m.parts
+      .filter((p) => p.type === "tool")
+      .map((p) => {
+        const input = typeof p.state?.input === "string" ? p.state.input : JSON.stringify(p.state?.input ?? {});
+        const rec: ToolCallRecord = { name: p.tool ?? "unknown_tool", input };
+        if (p.state?.output !== undefined) {
+          const out = typeof p.state.output === "string" ? p.state.output : JSON.stringify(p.state.output);
+          rec.output = truncate(out, MAX_TOOL_OUTPUT_CHARS);
+        }
+        return rec;
+      });
+
+    const attachments = m.parts
+      .filter((p) => p.type === "file")
+      .map(readOpencodeAttachment)
+      .filter((x): x is Attachment => x !== null);
+
+    if (text || toolCalls.length || attachments.length) {
+      turns.push({ role, text, toolCalls: toolCalls.length ? toolCalls : undefined, attachments: attachments.length ? attachments : undefined });
+    }
   }
   return turns;
 }
@@ -177,16 +239,48 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       info.parentID = prevMsgId ?? msgId;
       if (info.path) (info.path as Record<string, unknown>).cwd = projectPath;
     }
+    // Real ToolPart/FilePart shapes, generated and confirmed against this
+    // exact opencode install (not guessed from docs/source) via a live
+    // `opencode run` with an actual tool call and file attachment, then
+    // `opencode export` to inspect the true field-for-field shape --
+    // avoids the "guessing wrong silently drops the message" risk that
+    // applies to every other field in this schema (see the id-uniqueness
+    // comment above).
+    const toolParts: Record<string, unknown>[] = (turn.toolCalls ?? []).map((tc) => {
+      let input: unknown = tc.input;
+      try {
+        input = JSON.parse(tc.input);
+      } catch {
+        // not JSON (a plain-string argument) -- keep as-is
+      }
+      return {
+        type: "tool",
+        tool: tc.name,
+        callID: `call_${uid()}`,
+        state: { status: "completed", input, output: tc.output ?? "", title: tc.name, metadata: {}, time: { start: nowMs + i, end: nowMs + i } },
+        id: `prt_${uid()}`,
+        sessionID: newSessionId,
+        messageID: msgId,
+      };
+    });
+    // Generic across mime types -- same FilePart shape works for a PDF as
+    // for an image, confirmed against a real opencode session.
+    const fileParts: Record<string, unknown>[] = (turn.attachments ?? []).map((att) => ({
+      type: "file",
+      mime: att.mimeType,
+      url: `data:${att.mimeType};base64,${att.base64}`,
+      synthetic: true,
+      filename: att.filename ?? `attachment.${att.mimeType.split("/")[1] ?? "bin"}`,
+      id: `prt_${uid()}`,
+      sessionID: newSessionId,
+      messageID: msgId,
+    }));
     messages.push({
       info,
       parts: [
-        {
-          type: "text",
-          text: turn.text,
-          id: `prt_${uid()}`,
-          sessionID: newSessionId,
-          messageID: msgId,
-        },
+        { type: "text", text: turn.text, id: `prt_${uid()}`, sessionID: newSessionId, messageID: msgId },
+        ...toolParts,
+        ...fileParts,
       ],
     });
     prevMsgId = msgId;

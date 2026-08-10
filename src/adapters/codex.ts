@@ -38,6 +38,33 @@ export function sanitizeCodexFunctionName(name: string): string {
   return sanitized || "unknown_tool";
 }
 
+type CodexContentBlock = Record<string, unknown>;
+
+function codexImageBlocks(attachments: Attachment[]): CodexContentBlock[] {
+  return attachments
+    .filter((a) => a.mimeType.startsWith("image/"))
+    .map((img) => ({ type: "input_image", image_url: `data:${img.mimeType};base64,${img.base64}` }));
+}
+
+/** input_image is valid in user messages, but assistant messages only accept
+ * output_text/refusal. Assistant-side images are emitted as tool outputs by
+ * buildCodexAssistantImagePayloads() instead. */
+export function buildCodexMessageContent(role: Turn["role"], text: string, attachments: Attachment[]): CodexContentBlock[] {
+  const content: CodexContentBlock[] = [];
+  if (text) content.push({ type: role === "user" ? "input_text" : "output_text", text });
+  if (role === "user") content.push(...codexImageBlocks(attachments));
+  return content;
+}
+
+export function buildCodexAssistantImagePayloads(attachments: Attachment[], callId: string): Record<string, unknown>[] {
+  const images = codexImageBlocks(attachments);
+  if (images.length === 0) return [];
+  return [
+    { type: "function_call", name: "imported_image", arguments: "{}", call_id: callId },
+    { type: "function_call_output", call_id: callId, output: images },
+  ];
+}
+
 const MAX_BODY_CHARS = 40000;
 
 const ENV_PREFIXES = ["<environment_context>", "# Context from my IDE", "# AGENTS.md instructions", "<recommended_plugins>"];
@@ -271,14 +298,8 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
       .map((a) => `[attached file: ${a.filename ?? "unnamed"} (${a.mimeType})]`)
       .join("\n");
     const combinedText = [turn.text, nonImageNote].filter(Boolean).join("\n\n");
-    const content: Record<string, unknown>[] = [];
-    if (combinedText) content.push({ type: turn.role === "user" ? "input_text" : "output_text", text: combinedText });
-    // Images DO have a real portable shape (both Claude and Codex embed them
-    // as inline base64, just different wrapper fields), so these round-trip
-    // as genuine input_image blocks, not a text placeholder.
-    for (const img of (turn.attachments ?? []).filter((a) => a.mimeType.startsWith("image/"))) {
-      content.push({ type: "input_image", image_url: `data:${img.mimeType};base64,${img.base64}` });
-    }
+    const attachments = turn.attachments ?? [];
+    const content = buildCodexMessageContent(turn.role, combinedText, attachments);
     if (content.length > 0) {
       lines.push(
         JSON.stringify({
@@ -305,7 +326,17 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
         })
       );
     }
-    if (content.length === 0 && !(turn.toolCalls ?? []).length) continue;
+    // Images returned by source-agent tools belong to assistant turns, but
+    // Codex rejects input_image inside an assistant message. A native Codex
+    // function_call_output does accept image blocks, so preserve the bytes in
+    // a synthetic imported_image result instead of dropping or re-roleing it.
+    if (turn.role === "assistant") {
+      const imageCallId = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+      for (const payload of buildCodexAssistantImagePayloads(attachments, imageCallId)) {
+        lines.push(JSON.stringify({ timestamp: ts, type: "response_item", payload }));
+      }
+    }
+    if (content.length === 0 && !(turn.toolCalls ?? []).length && attachments.length === 0) continue;
     lines.push(
       JSON.stringify({
         timestamp: ts,

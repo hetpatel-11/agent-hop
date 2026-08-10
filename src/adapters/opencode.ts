@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -103,19 +103,44 @@ interface OpencodePart {
   filename?: string;
 }
 
+/** Captures `opencode export`'s stdout via a real temp file, not a piped
+ * execFileSync capture -- confirmed as a real, silent bug: for a genuinely
+ * large export (~1.9MB here), execFileSync's piped stdout capture cut off
+ * deterministically at exactly the same byte offset on every run (not a
+ * race -- reproduced 3x, identical truncation point each time), while the
+ * exact same command with shell `>` redirection to a file got the full
+ * output. The truncated JSON then failed to parse and was silently
+ * swallowed by the catch below, returning null -- meaning read() silently
+ * returned zero turns for a large real session, no error surfaced anywhere.
+ * Writing directly to a file descriptor (like shell redirection does)
+ * instead of through a pipe avoids whatever pipe-specific limit caused this. */
 function exportSession(sessionId: string): { info: Record<string, unknown>; messages: { info: Record<string, unknown>; parts: OpencodePart[] }[] } | null {
-  let out: string;
+  const tmpPath = join(tmpdir(), `agent-hop-opencode-export-${randomUUID()}.json`);
+  let fd: number | undefined;
   try {
-    out = execFileSync("opencode", ["export", sessionId], { encoding: "utf-8" });
-  } catch {
-    return null;
-  }
-  const brace = out.indexOf("{");
-  if (brace === -1) return null;
-  try {
+    fd = openSync(tmpPath, "w");
+    execFileSync("opencode", ["export", sessionId], { stdio: ["ignore", fd, "ignore"] });
+    closeSync(fd);
+    fd = undefined;
+    const out = readFileSync(tmpPath, "utf-8");
+    const brace = out.indexOf("{");
+    if (brace === -1) return null;
     return JSON.parse(out.slice(brace));
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed or never opened
+      }
+    }
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // best-effort cleanup -- not fatal if it was never created
+    }
   }
 }
 

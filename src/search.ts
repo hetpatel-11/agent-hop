@@ -331,19 +331,12 @@ function buildLexicalIndex(sessions: SessionRef[]): LexicalIndex {
   return { bm25, vocabTree, prefixIndex, sessions };
 }
 
-function lexicalScores(index: LexicalIndex, trimmedQuery: string): { queryTerms: string[]; bm25Normalized: number[] } {
+function lexicalScores(index: LexicalIndex, trimmedQuery: string): { queryTerms: string[]; matchTerms: string[]; bm25Normalized: number[] } {
   const queryTerms = tokenize(trimmedQuery);
-  // expandQueryTerms's fuzzy/prefix/compound substitutions (e.g. "uxp" ->
-  // some unrelated edit-distance-close vocab word) feed BM25 scoring only
-  // -- they must never reach buildSnippet's highlighting, or a result can
-  // show a bolded "match" for a word the user never typed and that doesn't
-  // actually appear near their real query (confirmed as a real, reported
-  // bug: searching "uxp plugin" highlighted a result with no mention of
-  // either word anywhere in it). Snippet highlighting always uses the
-  // literal queryTerms below, kept separate from this expansion.
   const weighted = expandQueryTerms(queryTerms, index.bm25, index.vocabTree, index.prefixIndex);
+  const matchTerms = [...new Set([...queryTerms, ...weighted.map((t) => t.term)])];
   const bm25Scores = index.sessions.map((_, i) => index.bm25.score(i, weighted));
-  return { queryTerms, bm25Normalized: minMaxNormalize(bm25Scores) };
+  return { queryTerms, matchTerms, bm25Normalized: minMaxNormalize(bm25Scores) };
 }
 
 /** Exact-match tier, recency multiplier, meaningful-score cutoff, and
@@ -352,7 +345,7 @@ function lexicalScores(index: LexicalIndex, trimmedQuery: string): { queryTerms:
  * `relevanceScores` they were handed. */
 function applyRankingLayers(
   sessions: SessionRef[],
-  snippetTerms: string[],
+  queryTerms: string[],
   trimmedQuery: string,
   relevanceScores: number[],
   limit: number,
@@ -405,7 +398,7 @@ function applyRankingLayers(
   // genuine emptiness propagate; the caller decides what to show for it.
   const meaningful = combined.filter((r) => r.score > meaningfulThreshold || isExactMatch(r.session));
   return meaningful.slice(0, limit).map((r) => {
-    const matchSnippet = buildSnippet(r.session.body ?? r.session.snippet, snippetTerms);
+    const matchSnippet = buildSnippet(r.session.body ?? r.session.snippet, queryTerms);
     return matchSnippet ? { ...r.session, matchSnippet } : r.session;
   });
 }
@@ -460,15 +453,15 @@ export function buildRanker(sessions: SessionRef[]): Ranker {
     rank(query: string, limit = 15): SessionRef[] {
       const trimmed = query.trim();
       if (!trimmed) return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
-      const { queryTerms, bm25Normalized } = lexicalScores(index, trimmed);
-      return applyRankingLayers(sessions, queryTerms, trimmed, bm25Normalized, limit, 0.1);
+      const { matchTerms, bm25Normalized } = lexicalScores(index, trimmed);
+      return applyRankingLayers(sessions, matchTerms, trimmed, bm25Normalized, limit, 0.1);
     },
 
     async refineWithSemantic(query: string, limit = 15): Promise<SessionRef[]> {
       const trimmed = query.trim();
       if (!trimmed) return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
 
-      const { queryTerms, bm25Normalized } = lexicalScores(index, trimmed);
+      const { matchTerms, bm25Normalized } = lexicalScores(index, trimmed);
 
       let semanticNormalized = new Array(sessions.length).fill(0);
       try {
@@ -483,7 +476,7 @@ export function buildRanker(sessions: SessionRef[]): Ranker {
       }
 
       const relevance = sessions.map((_, i) => BM25_WEIGHT * bm25Normalized[i] + SEMANTIC_WEIGHT * semanticNormalized[i]);
-      return applyRankingLayers(sessions, queryTerms, trimmed, relevance, limit, 0.15);
+      return applyRankingLayers(sessions, matchTerms, trimmed, relevance, limit, 0.15);
     },
   };
 }

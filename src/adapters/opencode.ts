@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
-import { cleanTitle, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
+import { cleanTitle, truncate, MAX_TOOL_OUTPUT_CHARS, toToolInputObject } from "../util.js";
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
 
@@ -247,12 +247,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
     // applies to every other field in this schema (see the id-uniqueness
     // comment above).
     const toolParts: Record<string, unknown>[] = (turn.toolCalls ?? []).map((tc) => {
-      let input: unknown = tc.input;
-      try {
-        input = JSON.parse(tc.input);
-      } catch {
-        // not JSON (a plain-string argument) -- keep as-is
-      }
+      const input = toToolInputObject(tc.input);
       return {
         type: "tool",
         tool: tc.name,

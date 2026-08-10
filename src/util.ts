@@ -227,6 +227,26 @@ export function sanitizeToolName(name: string): string {
   return sanitized || "unknown_tool";
 }
 
+/** Claude, OpenCode, and Pi all require a tool call's structured input to be
+ * a JSON *object*, not just valid JSON -- confirmed for real: a resumed
+ * session failed with "400 ... tool_use.input: Input should be an object"
+ * because a source tool call's raw input string parsed to (or, on parse
+ * failure, was kept as) a non-object value -- a bare string, array, number,
+ * or the raw unparsed text itself. Wraps any non-object result so the
+ * output is always a legal object, without losing the original data. */
+export function toToolInputObject(input: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    return { value: input };
+  }
+  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
+  }
+  return { value: parsed };
+}
+
 /** Renders tool calls as a plain-text block -- the shared fallback shape for
  * cross-agent conversion (native write() paths) and for --print's output,
  * since no structured tool_use/tool_result schema is portable across all

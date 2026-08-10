@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, sanitizeToolName } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, sanitizeToolName, toToolInputObject } from "../util.js";
 
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -248,15 +248,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
     const imageBlocks = (turn.attachments ?? []).filter((a) => a.mimeType.startsWith("image/")).map((img) => ({ type: "image", mimeType: img.mimeType, data: img.base64 }));
     const toolCalls = turn.toolCalls ?? [];
     const toolCallIds = toolCalls.map(() => `call-${randomUUID()}-0`);
-    const toolCallBlocks = toolCalls.map((tc, i) => {
-      let args: unknown = tc.input;
-      try {
-        args = JSON.parse(tc.input);
-      } catch {
-        // not JSON -- keep the raw string
-      }
-      return { type: "toolCall", id: toolCallIds[i], name: sanitizeToolName(tc.name), arguments: args };
-    });
+    const toolCallBlocks = toolCalls.map((tc, i) => ({ type: "toolCall", id: toolCallIds[i], name: sanitizeToolName(tc.name), arguments: toToolInputObject(tc.input) }));
     // Pi declares `api: "anthropic-messages"` (see below) -- the same
     // backing API as claude.ts, which was confirmed for real to reject
     // image blocks on assistant messages ("'image' blocks are not permitted

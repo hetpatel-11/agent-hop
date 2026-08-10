@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
-import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS } from "../util.js";
+import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, toToolInputObject } from "../util.js";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -358,15 +358,7 @@ async function write(turns: Turn[], projectPath: string): Promise<string> {
 
     const toolCalls = turn.toolCalls ?? [];
     const toolUseIds = toolCalls.map(() => `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`);
-    const toolUseBlocks = toolCalls.map((tc, i) => {
-      let input: unknown = tc.input;
-      try {
-        input = JSON.parse(tc.input);
-      } catch {
-        // not JSON -- keep the raw string, still a valid input value
-      }
-      return { type: "tool_use", id: toolUseIds[i], name: tc.name, input };
-    });
+    const toolUseBlocks = toolCalls.map((tc, i) => ({ type: "tool_use", id: toolUseIds[i], name: tc.name, input: toToolInputObject(tc.input) }));
     // 'image'/'document' blocks are only permitted in user turns -- confirmed
     // for real: a resumed session with an attachment block on an assistant
     // message fails with "API Error: 400 ... 'image' blocks are not

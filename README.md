@@ -18,6 +18,11 @@ Why use it:
   local history from one command.
 - **Stop re-explaining context** — resume with the real conversation history,
   not a summary.
+- **The full history actually reaches the model** — not a truncated preview.
+  Verified across all 5 agents: a large tool-call output gets capped well
+  below the model's real context budget and needs a follow-up read to see
+  the rest; native session resume never hits that limit at all, no matter
+  how large the history is.
 - **Keep the actual work, not just the words** — tool calls (shell commands,
   file edits, MCP calls) and file attachments (images, PDFs) carry over too,
   not just the text.
@@ -198,6 +203,24 @@ documentation. A long session's full tool-call I/O can be large enough to
 exceed a target agent's context window on its own — `agent-hop` keeps the
 most recent slice that fits rather than handing over something the target
 can't load.
+
+**Why this is meaningfully different from copy-pasting a transcript**, not
+just more convenient: every one of the 5 supported CLIs caps how much of a
+single *tool call's* output it inlines into context, well below the
+model's real context window (confirmed directly on all 5 — a large `cat`
+or similar tool output gets truncated with a note like "output truncated,
+see `<path>`", requiring an explicit follow-up read to see the rest). A
+transcript delivered any way that goes through that pipeline — copy-paste
+into a prompt fed through a tool, a skill's tool-result output, etc. — can
+hit that same cap. Native session resume never goes through it at all: the
+history is written directly into the target's own session file *before*
+that agent's process starts, so it's loaded as genuine starting history,
+not a tool result. Verified for real on all 5 agents: a marker phrase
+buried in a single 200KB+ historical turn was recalled correctly on the
+very first message after resume, with the target agent explicitly
+confirming no tool call was needed to find it — the exact same content
+got truncated and required a follow-up read when delivered as a live tool
+output instead.
 
 Each adapter (`src/adapters/<tool>.ts`) implements:
 

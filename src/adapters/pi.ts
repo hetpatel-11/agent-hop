@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
 import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, sanitizeToolName, toToolInputObject } from "../util.js";
 
-const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
+const SESSIONS_DIR = process.env.PI_CODING_AGENT_DIR !== undefined ? join(process.env.PI_CODING_AGENT_DIR, "sessions") : join(homedir(), ".pi", "agent", "sessions");
 
 function encodeDir(cwd: string): string {
   let real = cwd;
@@ -14,8 +14,7 @@ function encodeDir(cwd: string): string {
   } catch {
     // ignore
   }
-  const components = real.split("/").filter(Boolean);
-  return "--" + components.join("-") + "--";
+  return `--${real.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
 const MAX_BODY_CHARS = 40000;

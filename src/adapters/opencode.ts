@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
 import { cleanTitle, truncate, MAX_TOOL_OUTPUT_CHARS, toToolInputObject } from "../util.js";
+import { resolveExecutable } from "../executable.js";
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
 
@@ -23,13 +24,13 @@ function opencodeCliVersion(): string {
   }
 }
 
+// Was hardcoded to `which`, which doesn't exist on Windows (it's `where`) --
+// every check silently failed there, making opencode look uninstalled even
+// when it was. resolveExecutable() already handles this split correctly
+// (see executable.ts) and is used by every other adapter's own install
+// check; this one just hadn't been switched over.
 function hasOpencode(): boolean {
-  try {
-    execFileSync("which", ["opencode"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  return resolveExecutable("opencode") !== null;
 }
 
 const MAX_BODY_CHARS = 40000;

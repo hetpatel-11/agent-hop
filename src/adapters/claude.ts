@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -87,7 +87,13 @@ async function listSessions(): Promise<SessionRef[]> {
       }
     }
     if (!cwd) continue;
-    const sessionId = file.split("/").pop()!.replace(/\.jsonl$/, "");
+    // `file` comes from findFiles(), which joins path components with
+    // node:path's join() -- backslash-separated on Windows. Splitting on a
+    // literal "/" there never matches, so .pop() would return the entire
+    // path instead of just the filename, corrupting sessionId outright.
+    // basename() is the correct, platform-aware way to get just the
+    // filename regardless of separator style.
+    const sessionId = basename(file).replace(/\.jsonl$/, "");
     const title = cleanTitle(titleText || firstUserText);
     out.push({
       tool: "claude",

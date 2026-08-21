@@ -1,7 +1,7 @@
 import * as ort from "onnxruntime-web";
 import { Tokenizer } from "@huggingface/tokenizers";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
 
 const MODEL_DIR = join(homedir(), ".agent-hop", "model");
@@ -22,7 +22,7 @@ let session: ort.InferenceSession | undefined;
 let tokenizer: Tokenizer | undefined;
 
 async function downloadFile(url: string, dest: string, onProgress?: (msg: string) => void): Promise<void> {
-  onProgress?.(`Downloading ${dest.split("/").pop()}...`);
+  onProgress?.(`Downloading ${basename(dest)}...`);
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());

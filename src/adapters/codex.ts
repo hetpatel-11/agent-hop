@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -144,7 +144,7 @@ async function listSessions(): Promise<SessionRef[]> {
       }
     }
     if (!sessionId || !cwd) continue;
-    const title = cleanTitle(titleText || firstUserText || firstAssistantText || `(${cwd.split("/").pop()}, no readable content)`);
+    const title = cleanTitle(titleText || firstUserText || firstAssistantText || `(${basename(cwd)}, no readable content)`);
     out.push({
       tool: "codex",
       sessionId,

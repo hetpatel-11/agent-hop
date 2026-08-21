@@ -5,6 +5,7 @@ import figlet from "figlet";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { basename } from "node:path";
 import { toolTag, highlightDate, color } from "./theme.js";
 import { collectSessions, searchSessions, buildRanker, ensureIndexingTriggered, TOOL_NAMES } from "./search.js";
 import { ADAPTERS } from "./adapters/index.js";
@@ -415,7 +416,10 @@ function oneLine(s: string): string {
 
 function sessionOption(r: SessionRef): { value: SessionRef; label: string; hint: string } {
   const date = highlightDate(new Date(r.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }));
-  const folder = r.projectPath.split("/").filter(Boolean).pop() ?? r.projectPath;
+  // basename(), not a hand-rolled split("/") -- projectPath is backslash-
+  // separated on Windows, where a literal "/" split never matches and would
+  // just show the full path instead of the folder name here.
+  const folder = basename(r.projectPath) || r.projectPath;
   // Prefer the matched-content snippet (why this result showed up). When
   // there's no literal query match to excerpt (browsing unfiltered, or a
   // semantic-only match), fall back to real conversation body text -- NOT

@@ -5,7 +5,14 @@ import { randomUUID } from "node:crypto";
 import type { Adapter, SessionRef, Turn, ToolCallRecord, Attachment } from "../types.js";
 import { readJsonlLines, readJsonlLinesLazy, readJsonlTailLines, findFiles, mtimeMs, MIN_TITLE_CHARS, cleanTitle, BodySampler, truncate, MAX_TOOL_OUTPUT_CHARS, sanitizeToolName, toToolInputObject } from "../util.js";
 
-const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
+// PI_CODING_AGENT_DIR (confirmed real: Pi itself exports/reads it, pointing
+// at the ~/.pi/agent leaf directory, not just ~/.pi) lets a user relocate
+// their whole agent directory -- respecting it here means we still find
+// their real sessions instead of only ever looking in the default location.
+// A falsy check, not `!== undefined`: an empty string would resolve to the
+// relative path "sessions", silently redirecting reads/writes to whatever
+// the current working directory happens to be.
+const SESSIONS_DIR = process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, "sessions") : join(homedir(), ".pi", "agent", "sessions");
 
 function encodeDir(cwd: string): string {
   let real = cwd;
@@ -14,8 +21,15 @@ function encodeDir(cwd: string): string {
   } catch {
     // ignore
   }
-  const components = real.split("/").filter(Boolean);
-  return "--" + components.join("-") + "--";
+  // Splitting on a literal "/" left a Windows path (e.g. C:\Users\test\src)
+  // as one untouched component, including the ":" and "\" -- both illegal
+  // in a Windows directory name, which is exactly the reported
+  // `mkdir 'C:\Users\test\.pi\agent\sessions\--C:\Users\test\src\demo--'`
+  // ENOENT. Strip one leading separator (either style), then flatten every
+  // remaining "/", "\", and ":" to "-" so the result is a single safe
+  // component on both platforms.
+  const flattened = real.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
+  return `--${flattened}--`;
 }
 
 const MAX_BODY_CHARS = 40000;

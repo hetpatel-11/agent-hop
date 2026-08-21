@@ -19,20 +19,6 @@ struct BarAssets {
     transmitted: Mutex<HashSet<ToolName>>,
 }
 
-const ALT_UP_LEGACY: &[u8] = b"\x1b[1;3A";
-const ALT_DOWN_LEGACY: &[u8] = b"\x1b[1;3B";
-const ALT_UP_KITTY: &[u8] = b"\x1b[57419;3u";
-const ALT_DOWN_KITTY: &[u8] = b"\x1b[57420;3u";
-// Ctrl+R -- opens the search-and-resume overlay from inside a running
-// agent. Legacy terminals send it as the single control byte 0x12; Kitty-
-// protocol-aware terminals may send the disambiguated CSI-u form instead.
-const CTRL_R_LEGACY: &[u8] = b"\x12";
-const CTRL_R_KITTY: &[u8] = b"\x1b[114;5u";
-
-fn all_triggers() -> [&'static [u8]; 6] {
-    [ALT_UP_LEGACY, ALT_DOWN_LEGACY, ALT_UP_KITTY, ALT_DOWN_KITTY, CTRL_R_LEGACY, CTRL_R_KITTY]
-}
-
 enum HopDirection {
     Next,
     Prev,
@@ -360,12 +346,95 @@ enum InputSink {
     Idle,
 }
 
+enum ParsedTrigger {
+    AltUp,
+    AltDown,
+    CtrlR,
+}
+
+/// Parses a *complete* CSI sequence (`ESC [ ... <final byte 0x40-0x7e>`)
+/// generically -- extracting the numeric modifier parameter and checking
+/// the relevant bit, rather than requiring an exact byte-for-byte match
+/// against one specific encoding.
+///
+/// This matters a lot: which exact bytes a terminal sends for e.g.
+/// Alt+Down depends on which Kitty keyboard-protocol enhancement flags
+/// the *currently active* application has pushed. Different agents can
+/// (and do) push different flag sets, so an encoding that worked while
+/// Claude was running is not guaranteed to still be what the terminal
+/// sends once a different agent -- say, Codex -- becomes the active
+/// child. Hardcoding exact constants for "the" Kitty encoding was the
+/// real, confirmed root cause of "hopping works once but never again":
+/// it only ever matched whatever encoding the *first* agent happened to
+/// negotiate.
+fn parse_csi_trigger(seq: &[u8]) -> Option<ParsedTrigger> {
+    if seq.len() < 3 || seq[0] != 0x1b || seq[1] != b'[' {
+        return None;
+    }
+    let final_byte = *seq.last()?;
+    let body = std::str::from_utf8(&seq[2..seq.len() - 1]).ok()?;
+    let parts: Vec<&str> = body.split(';').collect();
+
+    match final_byte {
+        b'A' | b'B' => {
+            // Legacy xterm modifyOtherKeys form: "1;<modifier>". modifier
+            // = 1 + shift(1) + alt(2) + ctrl(4).
+            if parts.len() == 2 && parts[0] == "1" {
+                let modifier: u32 = parts[1].parse().ok()?;
+                if modifier.wrapping_sub(1) & 2 != 0 {
+                    return Some(if final_byte == b'A' { ParsedTrigger::AltUp } else { ParsedTrigger::AltDown });
+                }
+            }
+            None
+        }
+        b'u' => {
+            // Kitty CSI-u form: "<codepoint>" or "<codepoint>;<modifier>"
+            // (the modifier field is omitted entirely when it would be 1,
+            // i.e. no modifiers held).
+            let code: u32 = parts.first()?.parse().ok()?;
+            let modifier: u32 = if parts.len() >= 2 { parts[1].parse().unwrap_or(1) } else { 1 };
+            let bits = modifier.wrapping_sub(1);
+            if code == 57419 && bits & 2 != 0 {
+                return Some(ParsedTrigger::AltUp);
+            }
+            if code == 57420 && bits & 2 != 0 {
+                return Some(ParsedTrigger::AltDown);
+            }
+            if code == 114 && bits & 4 != 0 {
+                return Some(ParsedTrigger::CtrlR);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Index of a CSI sequence's final byte (0x40-0x7e), if the sequence
+/// starting at `buf[0]` (`ESC [ ...`) is complete yet.
+fn find_csi_final_byte(buf: &[u8]) -> Option<usize> {
+    (2..buf.len()).find(|&i| (0x40..=0x7e).contains(&buf[i]))
+}
+
+fn forward(sink: &Arc<Mutex<InputSink>>, bytes: &[u8]) {
+    match &mut *sink.lock().unwrap() {
+        InputSink::Forward(w) => {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
+        InputSink::Capture(s) => {
+            let _ = s.send(bytes.to_vec());
+        }
+        InputSink::Idle => {}
+    }
+}
+
 /// One persistent stdin-reading thread for the whole program lifetime.
 /// Detects Alt+Up/Alt+Down and Ctrl+R (legacy CSI and Kitty CSI-u
-/// encodings) and signals the corresponding event; forwards everything
-/// else to whatever `InputSink` is currently active. A single long-lived
-/// reader avoids the correctness bug of two threads racing to read the
-/// same stdin fd across hops.
+/// encodings, decoded generically -- see `parse_csi_trigger`) and signals
+/// the corresponding event; forwards everything else to whatever
+/// `InputSink` is currently active. A single long-lived reader avoids the
+/// correctness bug of two threads racing to read the same stdin fd
+/// across hops.
 fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
@@ -376,24 +445,26 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     pending.extend_from_slice(&buf[..n]);
-                    loop {
-                        if pending == ALT_UP_LEGACY || pending == ALT_UP_KITTY {
-                            let _ = tx.send(RunEvent::Hop(HopDirection::Prev));
-                            pending.clear();
+                    'inner: loop {
+                        if pending.is_empty() {
                             break;
                         }
-                        if pending == ALT_DOWN_LEGACY || pending == ALT_DOWN_KITTY {
-                            let _ = tx.send(RunEvent::Hop(HopDirection::Next));
-                            pending.clear();
-                            break;
-                        }
-                        if pending == CTRL_R_LEGACY || pending == CTRL_R_KITTY {
+                        // Ctrl+R, legacy single control-byte form.
+                        if pending[0] == 0x12 {
                             let _ = tx.send(RunEvent::SearchResume);
-                            pending.clear();
-                            break;
+                            pending.remove(0);
+                            continue;
                         }
-                        if is_prefix_of_any(&pending) {
-                            break; // wait for more bytes
+                        if pending[0] != 0x1b {
+                            // Run of plain bytes -- forward as one chunk
+                            // instead of byte-by-byte.
+                            let end = pending.iter().position(|&b| b == 0x1b || b == 0x12).unwrap_or(pending.len());
+                            let chunk: Vec<u8> = pending.drain(..end).collect();
+                            forward(&sink, &chunk);
+                            continue;
+                        }
+                        if pending.len() == 1 {
+                            break; // lone ESC -- wait to see what follows
                         }
                         // A Kitty graphics protocol response (`ESC _G
                         // ... ESC \`) -- the terminal replying to a
@@ -413,34 +484,37 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
                             }
                             break; // wait for the ST terminator
                         }
-                        // Not a trigger and not a prefix of one -- hand off
-                        // to whichever sink is currently active.
-                        match &mut *sink.lock().unwrap() {
-                            InputSink::Forward(w) => {
-                                let _ = w.write_all(&pending);
-                                let _ = w.flush();
+                        if pending[1] == b'[' {
+                            match find_csi_final_byte(&pending) {
+                                Some(final_idx) => {
+                                    let seq: Vec<u8> = pending.drain(..=final_idx).collect();
+                                    match parse_csi_trigger(&seq) {
+                                        Some(ParsedTrigger::AltUp) => {
+                                            let _ = tx.send(RunEvent::Hop(HopDirection::Prev));
+                                        }
+                                        Some(ParsedTrigger::AltDown) => {
+                                            let _ = tx.send(RunEvent::Hop(HopDirection::Next));
+                                        }
+                                        Some(ParsedTrigger::CtrlR) => {
+                                            let _ = tx.send(RunEvent::SearchResume);
+                                        }
+                                        None => forward(&sink, &seq),
+                                    }
+                                    continue;
+                                }
+                                None => break 'inner, // wait for more bytes to complete the CSI sequence
                             }
-                            InputSink::Capture(s) => {
-                                let _ = s.send(pending.clone());
-                            }
-                            InputSink::Idle => {}
                         }
-                        pending.clear();
-                        break;
+                        // Some other short (Fe/Fp-class) escape, e.g.
+                        // DECSC/DECRC (`ESC 7`/`ESC 8`) -- not one of
+                        // ours, forward the two bytes whole.
+                        let seq: Vec<u8> = pending.drain(..2).collect();
+                        forward(&sink, &seq);
                     }
                 }
             }
         }
     });
-}
-
-fn is_prefix_of_any(buf: &[u8]) -> bool {
-    for seq in all_triggers() {
-        if seq.starts_with(buf) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Finds the end (exclusive) of a `ESC \` (String Terminator) sequence in
@@ -590,5 +664,56 @@ mod kitty_response_filter_tests {
         let buf = b"\x1b_Gi=1;OK\x1b\\a";
         let end = find_st_terminator(buf).unwrap();
         assert_eq!(&buf[end..], b"a");
+    }
+}
+
+#[cfg(test)]
+mod csi_trigger_parser_tests {
+    use super::*;
+
+    #[test]
+    fn kitty_csi_u_alt_arrows_with_modifier() {
+        assert!(matches!(parse_csi_trigger(b"\x1b[57419;3u"), Some(ParsedTrigger::AltUp)));
+        assert!(matches!(parse_csi_trigger(b"\x1b[57420;3u"), Some(ParsedTrigger::AltDown)));
+    }
+
+    #[test]
+    fn legacy_xterm_alt_arrows() {
+        assert!(matches!(parse_csi_trigger(b"\x1b[1;3A"), Some(ParsedTrigger::AltUp)));
+        assert!(matches!(parse_csi_trigger(b"\x1b[1;3B"), Some(ParsedTrigger::AltDown)));
+    }
+
+    #[test]
+    fn ctrl_r_kitty_csi_u() {
+        assert!(matches!(parse_csi_trigger(b"\x1b[114;5u"), Some(ParsedTrigger::CtrlR)));
+    }
+
+    #[test]
+    fn modifier_combined_with_other_bits_still_detected() {
+        // shift+alt+arrow (modifier = 1+1+2 = 4) still has the alt bit set
+        assert!(matches!(parse_csi_trigger(b"\x1b[57420;4u"), Some(ParsedTrigger::AltDown)));
+        // ctrl+alt+arrow (modifier = 1+2+4 = 7) also still has the alt bit set
+        assert!(matches!(parse_csi_trigger(b"\x1b[1;7B"), Some(ParsedTrigger::AltDown)));
+    }
+
+    #[test]
+    fn plain_arrow_without_alt_is_not_a_trigger() {
+        // modifier absent entirely (bare arrow, no modifiers held)
+        assert!(parse_csi_trigger(b"\x1b[57420u").is_none());
+        // modifier = 1 (no modifiers)
+        assert!(parse_csi_trigger(b"\x1b[1;1B").is_none());
+    }
+
+    #[test]
+    fn unrelated_csi_sequences_are_not_triggers() {
+        assert!(parse_csi_trigger(b"\x1b[2K").is_none()); // erase line
+        assert!(parse_csi_trigger(b"\x1b[?2004h").is_none()); // bracketed paste enable
+        assert!(parse_csi_trigger(b"\x1b[10;20H").is_none()); // cursor position
+    }
+
+    #[test]
+    fn find_csi_final_byte_detects_completion() {
+        assert_eq!(find_csi_final_byte(b"\x1b[1;3B"), Some(5));
+        assert_eq!(find_csi_final_byte(b"\x1b[1;3"), None); // no final byte yet
     }
 }

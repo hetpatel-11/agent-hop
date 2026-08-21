@@ -213,16 +213,28 @@ fn run_one(
     std::thread::spawn(move || {
         let mut out = stdout();
         let mut buf = [0u8; 8192];
+        let mut esc_state = EscState::None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    esc_state = scan_escape_state(esc_state, &buf[..n]);
                     // While the search overlay owns the screen, still drain
                     // the child's output (so its pty buffer never fills and
                     // blocks it) but don't paint over the overlay with it.
                     if !suppress_thread.load(Ordering::SeqCst) {
                         let _ = out.write_all(&buf[..n]);
-                        let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
+                        // Splicing our own escape sequences in right after a
+                        // chunk that ends mid-sequence corrupts the child's
+                        // sequence -- the terminal aborts parsing it and the
+                        // orphaned tail bytes print as literal garbage (this
+                        // was a real, confirmed bug: stray letters/fragments
+                        // showing up on screen). Skip this redraw when we're
+                        // still inside an incomplete sequence; the next
+                        // chunk that completes it will trigger a clean one.
+                        if esc_state == EscState::None {
+                            let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
+                        }
                         let _ = out.flush();
                     }
                 }
@@ -411,4 +423,121 @@ fn is_prefix_of_any(buf: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Tracks whether a byte stream is currently in the middle of an ANSI
+/// escape sequence -- not a full terminal emulator, just enough of a
+/// state machine to know "is it safe to inject bytes of our own right
+/// now." Persisted across chunks (a real sequence can be split across
+/// multiple pty reads), since judging completeness from a single chunk in
+/// isolation would misparse a sequence that started in a previous chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscState {
+    /// Not inside any escape sequence -- plain text, safe to interject.
+    None,
+    /// Just saw ESC, haven't seen the byte that decides what kind yet.
+    Esc,
+    /// CSI (`ESC [ ... <final byte 0x40-0x7e>`), e.g. cursor moves, SGR,
+    /// mode toggles.
+    Csi,
+    /// OSC (`ESC ] ... BEL` or `... ST`), e.g. window title.
+    Osc,
+    /// APC/DCS/PM/SOS (`ESC _/P/^/X ... ST`), e.g. Kitty graphics.
+    ApcDcs,
+}
+
+fn scan_escape_state(mut state: EscState, buf: &[u8]) -> EscState {
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        state = match state {
+            EscState::None => {
+                if b == 0x1b {
+                    EscState::Esc
+                } else {
+                    EscState::None
+                }
+            }
+            EscState::Esc => match b {
+                b'[' => EscState::Csi,
+                b']' => EscState::Osc,
+                b'_' | b'P' | b'^' | b'X' => EscState::ApcDcs,
+                // Any other byte completes a short (Fe/Fp-class) sequence
+                // like DECSC/DECRC (`ESC 7` / `ESC 8`) immediately.
+                _ => EscState::None,
+            },
+            EscState::Csi => {
+                if (0x40..=0x7e).contains(&b) {
+                    EscState::None
+                } else {
+                    EscState::Csi
+                }
+            }
+            EscState::Osc => {
+                if b == 0x07 {
+                    EscState::None
+                } else if b == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+                    i += 1;
+                    EscState::None
+                } else {
+                    EscState::Osc
+                }
+            }
+            EscState::ApcDcs => {
+                if b == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+                    i += 1;
+                    EscState::None
+                } else {
+                    EscState::ApcDcs
+                }
+            }
+        };
+        i += 1;
+    }
+    state
+}
+
+#[cfg(test)]
+mod escape_state_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_stays_none() {
+        assert_eq!(scan_escape_state(EscState::None, b"hello world"), EscState::None);
+    }
+
+    #[test]
+    fn complete_csi_sequence_returns_to_none() {
+        // cursor move, e.g. ESC [ 1 ; 2 H
+        assert_eq!(scan_escape_state(EscState::None, b"\x1b[1;2H"), EscState::None);
+    }
+
+    #[test]
+    fn split_csi_sequence_is_detected_as_incomplete() {
+        // "\x1b[?2004" with the terminating "l" not yet arrived
+        let state = scan_escape_state(EscState::None, b"text\x1b[?2004");
+        assert_eq!(state, EscState::Csi);
+        // completing it in a later chunk brings it back to None
+        assert_eq!(scan_escape_state(state, b"l"), EscState::None);
+    }
+
+    #[test]
+    fn short_fe_sequence_completes_immediately() {
+        // DECSC / DECRC -- exactly the sequences that were leaking as
+        // literal "7"/"8" characters when spliced mid-stream.
+        assert_eq!(scan_escape_state(EscState::None, b"\x1b7"), EscState::None);
+        assert_eq!(scan_escape_state(EscState::None, b"\x1b8"), EscState::None);
+    }
+
+    #[test]
+    fn split_kitty_graphics_apc_sequence_is_detected_as_incomplete() {
+        let state = scan_escape_state(EscState::None, b"\x1b_Ga=T,f=100;AAAA");
+        assert_eq!(state, EscState::ApcDcs);
+        assert_eq!(scan_escape_state(state, b"BBBB\x1b\\"), EscState::None);
+    }
+
+    #[test]
+    fn osc_sequence_terminated_by_bel() {
+        assert_eq!(scan_escape_state(EscState::None, b"\x1b]0;title\x07"), EscState::None);
+    }
 }

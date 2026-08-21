@@ -94,3 +94,16 @@ pub fn which(bin: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_finds_installed_agents() {
+        for tool in ToolName::ALL {
+            let found = which(tool.binary());
+            assert!(found.is_some(), "expected {} on PATH for this smoke test", tool.slug());
+        }
+    }
+}

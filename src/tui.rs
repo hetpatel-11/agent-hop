@@ -105,6 +105,12 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
         }
     };
 
+    // Reset the scroll region back to the full screen -- otherwise the
+    // user's real shell would stay confined to rows 1..rows-1 after ah
+    // exits, which would look like the terminal is permanently missing its
+    // last row until something else resets it.
+    write!(stdout(), "\x1b[r")?;
+    stdout().flush()?;
     terminal::disable_raw_mode()?;
     result
 }
@@ -189,6 +195,25 @@ fn run_one(
 
     let writer = pair.master.take_writer()?;
     *sink.lock().unwrap() = InputSink::Forward(writer);
+
+    // Confine the real terminal's own scrolling to rows 1..=rows-1 (DECSTBM),
+    // leaving the last row as a fixed margin the terminal itself will never
+    // scroll. Without this, a child that scrolls its own content (many CLIs
+    // print startup banners inline rather than staying in the alternate
+    // screen buffer) scrolls the *entire physical terminal* -- dragging our
+    // previously-drawn status line up into scrollback while a fresh copy
+    // gets redrawn at the bottom every time, which is exactly what produced
+    // repeated stacked "agent-hop ..." lines. This is the same primitive
+    // tmux/screen use for their own status lines -- not something a
+    // rendering framework like ratatui would provide either, since it's a
+    // terminal-level scrolling behavior, not something rendered content
+    // controls.
+    write!(stdout(), "\x1b[1;{}r", rows.saturating_sub(1))?;
+    // DECSTBM moves the cursor to the scrolling region's home position as a
+    // side effect -- clear first so nothing stale from a previous agent's
+    // screen lingers until this one's first redraw arrives.
+    execute!(stdout(), terminal::Clear(terminal::ClearType::All))?;
+    stdout().flush()?;
 
     let suppress = Arc::new(AtomicBool::new(false));
 

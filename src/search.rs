@@ -522,10 +522,30 @@ pub async fn search_sessions(sessions: Vec<SessionRef>, query: &str, opts: Searc
     SearchResult { results, indexing_in_background: pending }
 }
 
-/// Standalone `ah resume` -- search + resume outside the TUI. Also used as
-/// an in-TUI action once the shell exists.
+/// Standalone `ah resume` -- search outside the TUI (crossterm owns stdin
+/// directly here, no relay thread exists yet), then jump straight into the
+/// TUI already resumed at whatever session was picked.
 pub async fn run_standalone_resume() -> anyhow::Result<()> {
-    todo!("wire into picker/TUI once the resume action UI is built")
+    let sessions = collect_sessions(&ToolName::ALL);
+    if sessions.is_empty() {
+        println!("No sessions found yet.");
+        return Ok(());
+    }
+
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+    let mut keys = crate::resume::CrosstermKeys;
+    let mut out = std::io::stdout();
+    let selected = crate::resume::run_resume_ui(sessions, &mut keys, &mut out);
+    crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+    crossterm::terminal::disable_raw_mode()?;
+
+    let Some(session_ref) = selected? else {
+        println!("Cancelled.");
+        return Ok(());
+    };
+
+    crate::tui::run(session_ref.tool, Some((session_ref.session_id, session_ref.project_path))).await
 }
 
 #[cfg(test)]

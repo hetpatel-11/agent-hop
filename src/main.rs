@@ -9,6 +9,7 @@ mod embed;
 mod fuzzy;
 mod theme;
 mod vector_index;
+mod resume;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
@@ -69,5 +70,7 @@ async fn main() -> anyhow::Result<()> {
         None => picker::pick_agent().await?,
     };
 
-    tui::run(agent).await
+    tui::run(agent, None).await
 }
+
+

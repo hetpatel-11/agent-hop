@@ -91,6 +91,27 @@ pub fn adapter_for(tool: ToolName) -> Box<dyn Adapter> {
     }
 }
 
+fn canonical_or_self(path: &str) -> String {
+    std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| path.to_string())
+}
+
+/// Finds the most-recently-updated session a given tool has for a given
+/// project path -- this is what makes hopping mid-conversation possible:
+/// after killing the just-active agent, this is how we find *which*
+/// session it was just writing to, so it can be read and translated into
+/// the next tool's format. Paths are canonicalized on both sides before
+/// comparing since adapters store cwd in whatever form they wrote it
+/// (usually already canonical, but not guaranteed identical string
+/// representations across platforms).
+pub fn find_latest_session_for_path(tool: ToolName, project_path: &str) -> Option<SessionRef> {
+    let target = canonical_or_self(project_path);
+    let sessions = adapter_for(tool).list_sessions().ok()?;
+    sessions
+        .into_iter()
+        .filter(|s| canonical_or_self(&s.project_path) == target)
+        .max_by_key(|s| s.updated_at)
+}
+
 #[cfg(test)]
 mod roundtrip_tests {
     use super::*;
@@ -179,6 +200,59 @@ mod roundtrip_tests {
         let dir = std::env::temp_dir().join(format!("agent-hop-test-pi-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_roundtrips(&PiAdapter, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This is the exact sequence `tui.rs`'s `translate_session` runs on
+    /// every hop: write a session as one tool, find it by project path,
+    /// read it back, write it into a *different* tool's format, then read
+    /// that back too -- proving a live conversation genuinely survives a
+    /// cross-agent hop, not just a same-tool round-trip.
+    #[test]
+    fn cross_agent_hop_translation_preserves_content() {
+        let dir = std::env::temp_dir().join(format!("agent-hop-test-hop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project_path = dir.to_string_lossy().to_string();
+        let marker = "xyzzy-hop-translation-marker";
+
+        let turns = vec![
+            Turn { role: Role::User, text: format!("say the phrase '{marker}' and nothing else"), tool_calls: None, attachments: None },
+            Turn { role: Role::Assistant, text: marker.to_string(), tool_calls: None, attachments: None },
+        ];
+
+        // Simulates "claude was just live and wrote this" without actually
+        // spawning a real claude process (recursion inside an already-live
+        // Claude Code session interferes with a real spawned instance's
+        // own session bookkeeping -- this isolates the translation logic
+        // itself from that unrelated testing artifact).
+        let claude_id = ClaudeAdapter.write(&turns, &project_path).expect("claude write should succeed");
+
+        let found = find_latest_session_for_path(ToolName::Claude, &project_path).expect("should find the just-written claude session by project path");
+        assert_eq!(found.session_id, claude_id);
+
+        let read_back = ClaudeAdapter.read(&found).expect("claude read should succeed");
+        assert_eq!(read_back.len(), 2);
+        assert!(read_back[1].text.contains(marker));
+
+        let codex_id = CodexAdapter.write(&read_back, &project_path).expect("codex write should succeed");
+        let codex_ref = find_latest_session_for_path(ToolName::Codex, &project_path).expect("should find the newly-written codex session");
+        assert_eq!(codex_ref.session_id, codex_id);
+
+        let codex_turns = CodexAdapter.read(&codex_ref).expect("codex read should succeed");
+        assert_eq!(codex_turns.len(), 2);
+        assert!(codex_turns[1].text.contains(marker), "marker phrase should survive claude -> codex translation, got: {:?}", codex_turns[1].text);
+
+        // Cleanup: remove both written sessions so this test leaves no
+        // litter in real ~/.claude or ~/.codex session storage.
+        if let Some(file) = found.raw.as_ref().and_then(|r| r.get("file")).and_then(|v| v.as_str()) {
+            let _ = std::fs::remove_file(file);
+            if let Some(parent) = std::path::Path::new(file).parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        if let Some(file) = codex_ref.raw.as_ref().and_then(|r| r.get("file")).and_then(|v| v.as_str()) {
+            let _ = std::fs::remove_file(file);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

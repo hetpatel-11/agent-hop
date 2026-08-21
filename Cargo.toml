@@ -20,3 +20,4 @@ anyhow = "1"
 dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

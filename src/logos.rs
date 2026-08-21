@@ -57,24 +57,39 @@ pub async fn ensure_logo(tool: ToolName) -> anyhow::Result<std::path::PathBuf> {
         .json()
         .await?;
 
+    // Kitty's graphics protocol needs raster data (PNG/JPEG), not SVG --
+    // some brands' first "icon" entry is a vector wordmark, so prefer a
+    // raster icon explicitly rather than just taking the first icon match.
+    let is_raster = |url: &str| {
+        let lower = url.to_ascii_lowercase();
+        lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+    };
     let icon = res
         .brand
         .logos
         .iter()
-        .find(|l| l.kind == "icon")
+        .find(|l| l.kind == "icon" && is_raster(&l.url))
+        .or_else(|| res.brand.logos.iter().find(|l| is_raster(&l.url)))
+        .or_else(|| res.brand.logos.iter().find(|l| l.kind == "icon"))
         .or_else(|| res.brand.logos.first())
         .ok_or_else(|| anyhow::anyhow!("no logo returned for {}", tool.slug()))?;
 
     let bytes = client.get(&icon.url).send().await?.bytes().await?;
-    std::fs::write(&path, &bytes)?;
+    // Kitty's f=100 format code means real PNG specifically -- some brands'
+    // "raster icon" is actually a JPEG served with no reliable content-type,
+    // so decode+re-encode to guarantee the cached file is genuinely PNG
+    // regardless of what format the CDN actually served.
+    let decoded = image::load_from_memory(&bytes)?;
+    decoded.save_with_format(&path, image::ImageFormat::Png)?;
     Ok(path)
 }
 
 /// Renders a PNG at `path` inline via the Kitty graphics protocol
-/// (transmit + display, chunked base64). Caller is responsible for having
-/// already confirmed terminal support -- unsupported terminals should use
-/// `text_badge` instead.
-pub fn render_kitty(path: &std::path::Path, out: &mut impl Write) -> anyhow::Result<()> {
+/// (transmit + display, chunked base64), placed to occupy exactly `cols`
+/// terminal columns by 1 row so it fits inline in the toggle bar. Caller is
+/// responsible for having already confirmed terminal support --
+/// unsupported terminals should use `text_badge` instead.
+pub fn render_kitty(path: &std::path::Path, cols: u16, out: &mut impl Write) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     const CHUNK: usize = 4096;
@@ -86,7 +101,7 @@ pub fn render_kitty(path: &std::path::Path, out: &mut impl Write) -> anyhow::Res
         let part: String = chars[i..end].iter().collect();
         let more = if end < chars.len() { 1 } else { 0 };
         if first {
-            write!(out, "\x1b_Ga=T,f=100,m={more};{part}\x1b\\")?;
+            write!(out, "\x1b_Ga=T,f=100,c={cols},r=1,m={more};{part}\x1b\\")?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};{part}\x1b\\")?;
@@ -100,4 +115,36 @@ pub fn render_kitty(path: &std::path::Path, out: &mut impl Write) -> anyhow::Res
 /// graphics support.
 pub fn text_badge(tool: ToolName) -> String {
     format!(" {} ", tool.slug())
+}
+
+/// Heuristic Kitty-graphics-protocol capability check. A live in-band query
+/// (`CSI _Gi=1,a=q` + read the response) would be more precise but requires
+/// synchronizing with the raw stdin relay thread before it starts reading;
+/// env-based detection is what most Kitty-protocol-aware tools reach for
+/// first and is enough for v1 -- covers Kitty itself, Ghostty (confirmed
+/// working live), and WezTerm.
+pub fn supports_kitty_graphics() -> bool {
+    std::env::var("KITTY_WINDOW_ID").is_ok()
+        || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok()
+        || std::env::var("TERM_PROGRAM").map(|v| v == "ghostty" || v == "WezTerm").unwrap_or(false)
+        || std::env::var("TERM").map(|v| v == "xterm-kitty").unwrap_or(false)
+}
+
+/// Prefetches every agent's logo up front (before entering raw mode) so
+/// per-hop toggle-bar redraws never block on network I/O. Failures are
+/// tolerated per-tool -- a tool with no fetchable logo just falls back to
+/// its text badge rather than failing the whole run.
+pub async fn ensure_all_logos() -> std::collections::HashMap<&'static str, std::path::PathBuf> {
+    let mut map = std::collections::HashMap::new();
+    for tool in ToolName::ALL {
+        match ensure_logo(tool).await {
+            Ok(path) => {
+                map.insert(tool.slug(), path);
+            }
+            Err(e) => {
+                eprintln!("agent-hop: couldn't fetch logo for {} ({e}), using text badge", tool.slug());
+            }
+        }
+    }
+    map
 }

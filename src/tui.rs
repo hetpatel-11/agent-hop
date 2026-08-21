@@ -1,9 +1,17 @@
 use crate::agents::ToolName;
+use crate::logos;
 use crossterm::{cursor, execute, queue, style::Print, terminal};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{stdout, Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+struct BarAssets {
+    logos: HashMap<&'static str, PathBuf>,
+    use_graphics: bool,
+}
 
 const ALT_UP_LEGACY: &[u8] = b"\x1b[1;3A";
 const ALT_DOWN_LEGACY: &[u8] = b"\x1b[1;3B";
@@ -24,6 +32,13 @@ enum RunEvent {
 /// persistent toggle strip (bottom row, owned by us, agent never draws into
 /// it) for switching between installed agents via Alt+Up/Down.
 pub async fn run(initial: ToolName) -> anyhow::Result<()> {
+    // Prefetch before entering raw mode so any network hiccup prints
+    // normally instead of getting mangled by an active pty relay.
+    let assets = Arc::new(BarAssets {
+        logos: logos::ensure_all_logos().await,
+        use_graphics: logos::supports_kitty_graphics(),
+    });
+
     let current_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::channel::<RunEvent>();
     let generation = Arc::new(AtomicU64::new(0));
@@ -36,7 +51,7 @@ pub async fn run(initial: ToolName) -> anyhow::Result<()> {
 
     let result: anyhow::Result<()> = loop {
         let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        match run_one(current, &current_writer, &tx, &rx, generation_id) {
+        match run_one(current, &current_writer, &tx, &rx, generation_id, &assets) {
             Ok(Some(HopDirection::Next)) => current = next_installed(current, 1),
             Ok(Some(HopDirection::Prev)) => current = next_installed(current, -1),
             Ok(None) => break Ok(()),
@@ -68,6 +83,7 @@ fn run_one(
     tx: &mpsc::Sender<RunEvent>,
     rx: &mpsc::Receiver<RunEvent>,
     generation_id: u64,
+    assets: &Arc<BarAssets>,
 ) -> anyhow::Result<Option<HopDirection>> {
     let pty_system = native_pty_system();
     let (cols, rows) = terminal::size()?;
@@ -87,6 +103,7 @@ fn run_one(
 
     let mut reader = pair.master.try_clone_reader()?;
     let tx_out = tx.clone();
+    let assets_thread = assets.clone();
     std::thread::spawn(move || {
         let mut out = stdout();
         let mut buf = [0u8; 8192];
@@ -95,7 +112,7 @@ fn run_one(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let _ = out.write_all(&buf[..n]);
-                    let _ = draw_toggle_bar(&mut out, tool);
+                    let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
                     let _ = out.flush();
                 }
             }
@@ -103,7 +120,7 @@ fn run_one(
         let _ = tx_out.send(RunEvent::ChildExited(generation_id));
     });
 
-    draw_toggle_bar(&mut stdout(), tool)?;
+    draw_toggle_bar(&mut stdout(), tool, assets)?;
     stdout().flush()?;
 
     let hop = loop {
@@ -125,14 +142,28 @@ fn run_one(
     Ok(hop)
 }
 
-fn draw_toggle_bar(out: &mut impl Write, tool: ToolName) -> anyhow::Result<()> {
+const LOGO_COLS: u16 = 2;
+
+fn draw_toggle_bar(out: &mut impl Write, tool: ToolName, assets: &BarAssets) -> anyhow::Result<()> {
     let (_, rows) = terminal::size()?;
     queue!(out, cursor::SavePosition)?;
     queue!(out, cursor::MoveTo(0, rows.saturating_sub(1)))?;
     queue!(out, terminal::Clear(terminal::ClearType::CurrentLine))?;
+
+    let logo_path = assets.logos.get(tool.slug());
+    if assets.use_graphics {
+        if let Some(path) = logo_path {
+            logos::render_kitty(path, LOGO_COLS, out)?;
+        } else {
+            queue!(out, Print(logos::text_badge(tool)))?;
+        }
+    } else {
+        queue!(out, Print(logos::text_badge(tool)))?;
+    }
+
     queue!(
         out,
-        Print(format!("agent-hop \u{25cf} {} | Alt+\u{2191}/\u{2193} to switch agent", tool.slug()))
+        Print(format!(" agent-hop \u{25cf} {} | Alt+\u{2191}/\u{2193} to switch agent", tool.slug()))
     )?;
     queue!(out, cursor::RestorePosition)?;
     Ok(())

@@ -259,7 +259,7 @@ fn run_one(
                         // into the middle of one.
                         let diff = current_screen.contents_diff(&prev_screen);
                         let _ = out.write_all(&diff);
-                        let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
+                        let _ = draw_toggle_bar(&mut out, tool, &assets_thread, current_dims.1);
                         let _ = out.flush();
                         prev_screen = current_screen;
                     }
@@ -269,7 +269,7 @@ fn run_one(
         let _ = tx_out.send(RunEvent::ChildExited(generation_id));
     });
 
-    draw_toggle_bar(&mut stdout(), tool, assets)?;
+    draw_toggle_bar(&mut stdout(), tool, assets, rows)?;
     stdout().flush()?;
 
     let outcome = loop {
@@ -343,8 +343,15 @@ fn run_search_overlay(sink: &Arc<Mutex<InputSink>>, suppress: &Arc<AtomicBool>) 
 
 const LOGO_COLS: u16 = 2;
 
-fn draw_toggle_bar(out: &mut impl Write, tool: ToolName, assets: &BarAssets) -> anyhow::Result<()> {
-    let (_, rows) = terminal::size()?;
+/// `rows` is passed in rather than queried here with its own `terminal::size()`
+/// call -- there was a real, confirmed bug where this independently-queried
+/// value could momentarily disagree with whatever the vt100 model and the
+/// pty were actually sized to (most easily hit right as a resize was in
+/// flight), and that disagreement alone was enough to move the cursor to a
+/// row that forced a real terminal scroll, reproducing the exact repeated-
+/// line stacking this whole rework was meant to fix. There must be exactly
+/// one source of truth for "how big is the screen right now."
+fn draw_toggle_bar(out: &mut impl Write, tool: ToolName, assets: &BarAssets, rows: u16) -> anyhow::Result<()> {
     queue!(out, cursor::SavePosition)?;
     queue!(out, cursor::MoveTo(0, rows.saturating_sub(1)))?;
     queue!(out, terminal::Clear(terminal::ClearType::CurrentLine))?;

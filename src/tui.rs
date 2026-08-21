@@ -10,6 +10,44 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+/// Forensic capture mode, opt-in via `AH_DEBUG_LOG=/path/to/file`. Every
+/// bug in this rendering pipeline so far has been diagnosed by inspecting
+/// exact real bytes -- and every synthetic reproduction I can build in a
+/// sandbox (a scripted pty plus either raw byte inspection or the `pyte`
+/// Python library) is a different program from a real terminal like
+/// Ghostty: it doesn't answer terminal capability queries the way Ghostty
+/// does, doesn't do real Kitty graphics/keyboard-protocol negotiation, and
+/// isn't guaranteed to match Ghostty's exact VT parsing on edge cases.
+/// That gap is *why* fixes that pass every synthetic test can still miss
+/// the real bug. This logs every byte in every direction -- what the
+/// child actually sent, what we actually wrote to the real terminal, and
+/// crucially what the real terminal sent back to us on stdin (responses,
+/// resize-related signals reflected in input, anything) -- so a real
+/// session's exact behavior can be inspected directly instead of guessed
+/// at through an imperfect stand-in.
+fn debug_log_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("AH_DEBUG_LOG").map(std::path::PathBuf::from)
+}
+
+fn debug_log(tag: &str, data: &[u8]) {
+    let Some(path) = debug_log_path() else { return };
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let escaped: String = data
+        .iter()
+        .map(|&b| {
+            if b == b'\\' {
+                "\\\\".to_string()
+            } else if (0x20..0x7f).contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("\\x{b:02x}")
+            }
+        })
+        .collect();
+    let _ = writeln!(f, "[{ts}] {tag} ({} bytes): {escaped}", data.len());
+}
+
 struct BarAssets {
     logos: HashMap<&'static str, PathBuf>,
     use_graphics: bool,
@@ -232,8 +270,10 @@ fn run_one(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    debug_log("CHILD_RAW", &buf[..n]);
                     let current_dims = *dims_thread.lock().unwrap();
                     if current_dims != applied_dims {
+                        debug_log("RESIZE_APPLIED_TO_MODEL", format!("{applied_dims:?} -> {current_dims:?}").as_bytes());
                         applied_dims = current_dims;
                         let new_child_rows = current_dims.1.saturating_sub(1);
                         parser.set_size(new_child_rows, current_dims.0);
@@ -258,7 +298,9 @@ fn run_one(
                         // complete, self-contained update, never spliced
                         // into the middle of one.
                         let diff = current_screen.contents_diff(&prev_screen);
+                        debug_log("DIFF_OUT", &diff);
                         let _ = out.write_all(&diff);
+                        debug_log("TOGGLE_BAR_ROWS_PARAM", format!("{}", current_dims.1).as_bytes());
                         let _ = draw_toggle_bar(&mut out, tool, &assets_thread, current_dims.1);
                         let _ = out.flush();
                         prev_screen = current_screen;
@@ -502,6 +544,7 @@ fn spawn_resize_poller(tx: mpsc::Sender<RunEvent>) {
             std::thread::sleep(std::time::Duration::from_millis(250));
             match terminal::size() {
                 Ok(current) if current != last => {
+                    debug_log("RESIZE_POLLER_DETECTED", format!("{last:?} -> {current:?}").as_bytes());
                     last = current;
                     if tx.send(RunEvent::Resized(current.0, current.1)).is_err() {
                         break; // receiver gone -- program is shutting down
@@ -530,6 +573,13 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    // The most important log line in the whole capture:
+                    // this is every byte the *real* terminal ever sends us
+                    // -- actual keystrokes, but also anything Ghostty sends
+                    // back on its own (query responses, etc.) that no
+                    // synthetic pty test can produce, since nothing answers
+                    // those queries in a scripted test.
+                    debug_log("STDIN_RAW", &buf[..n]);
                     pending.extend_from_slice(&buf[..n]);
                     'inner: loop {
                         if pending.is_empty() {
@@ -565,6 +615,7 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
                         // garbage text -- a real, confirmed bug.
                         if pending.starts_with(b"\x1b_G") {
                             if let Some(end) = find_st_terminator(&pending) {
+                                debug_log("KITTY_RESPONSE_DROPPED", &pending[..end]);
                                 pending.drain(..end);
                                 continue;
                             }
@@ -576,12 +627,15 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
                                     let seq: Vec<u8> = pending.drain(..=final_idx).collect();
                                     match parse_csi_trigger(&seq) {
                                         Some(ParsedTrigger::AltUp) => {
+                                            debug_log("TRIGGER_ALT_UP", &seq);
                                             let _ = tx.send(RunEvent::Hop(HopDirection::Prev));
                                         }
                                         Some(ParsedTrigger::AltDown) => {
+                                            debug_log("TRIGGER_ALT_DOWN", &seq);
                                             let _ = tx.send(RunEvent::Hop(HopDirection::Next));
                                         }
                                         Some(ParsedTrigger::CtrlR) => {
+                                            debug_log("TRIGGER_CTRL_R", &seq);
                                             let _ = tx.send(RunEvent::SearchResume);
                                         }
                                         None => forward(&sink, &seq),

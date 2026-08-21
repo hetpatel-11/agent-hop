@@ -84,12 +84,33 @@ pub async fn ensure_logo(tool: ToolName) -> anyhow::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// Renders a PNG at `path` inline via the Kitty graphics protocol
-/// (transmit + display, chunked base64), placed to occupy exactly `cols`
-/// terminal columns by 1 row so it fits inline in the toggle bar. Caller is
-/// responsible for having already confirmed terminal support --
-/// unsupported terminals should use `text_badge` instead.
-pub fn render_kitty(path: &std::path::Path, cols: u16, out: &mut impl Write) -> anyhow::Result<()> {
+/// Stable per-tool Kitty image id -- lets a redraw reference an
+/// already-transmitted image cheaply instead of re-sending its pixel data.
+pub fn image_id_for(tool: ToolName) -> u32 {
+    match tool {
+        ToolName::Claude => 1,
+        ToolName::Codex => 2,
+        ToolName::OpenCode => 3,
+        ToolName::Pi => 4,
+        ToolName::Grok => 5,
+    }
+}
+
+/// Transmits a PNG via the Kitty graphics protocol under a stable image id
+/// (chunked base64) WITHOUT displaying it yet -- call once per tool per
+/// process lifetime. Caller is responsible for having already confirmed
+/// terminal support -- unsupported terminals should use `text_badge`
+/// instead.
+///
+/// Splitting transmit from display matters a lot here: the toggle bar
+/// redraws after *every* chunk of child output (streaming responses can
+/// produce dozens of chunks a second), and re-sending the full base64
+/// payload on each of those redraws was a real, confirmed bug -- it
+/// flooded the escape-sequence stream with the entire image repeatedly and
+/// visibly corrupted the screen (looked like garbled/repeating content).
+/// Kitty lets you transmit pixel data once under an id, then reference it
+/// with a cheap `put` command afterward.
+pub fn transmit_kitty(path: &std::path::Path, image_id: u32, out: &mut impl Write) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     const CHUNK: usize = 4096;
@@ -101,13 +122,23 @@ pub fn render_kitty(path: &std::path::Path, cols: u16, out: &mut impl Write) -> 
         let part: String = chars[i..end].iter().collect();
         let more = if end < chars.len() { 1 } else { 0 };
         if first {
-            write!(out, "\x1b_Ga=T,f=100,c={cols},r=1,m={more};{part}\x1b\\")?;
+            write!(out, "\x1b_Ga=t,f=100,i={image_id},m={more};{part}\x1b\\")?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};{part}\x1b\\")?;
         }
         i = end;
     }
+    Ok(())
+}
+
+/// Displays an already-transmitted image (see `transmit_kitty`) at the
+/// current cursor position, sized to `cols` columns by 1 row. Cheap -- no
+/// pixel payload, just a placement reference by id. Needed on every redraw
+/// because clearing the row's text (which the toggle bar does before every
+/// redraw) also deletes any image placement occupying those cells.
+pub fn put_kitty(image_id: u32, cols: u16, out: &mut impl Write) -> anyhow::Result<()> {
+    write!(out, "\x1b_Ga=p,i={image_id},c={cols},r=1\x1b\\")?;
     Ok(())
 }
 

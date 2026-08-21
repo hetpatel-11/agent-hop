@@ -2,7 +2,7 @@ use crate::agents::ToolName;
 use crate::logos;
 use crossterm::{cursor, execute, queue, style::Print, terminal};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{stdout, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +11,10 @@ use std::sync::{mpsc, Arc, Mutex};
 struct BarAssets {
     logos: HashMap<&'static str, PathBuf>,
     use_graphics: bool,
+    // Which tools' images have already been transmitted to the terminal
+    // this process lifetime -- see logos::transmit_kitty's doc comment for
+    // why re-sending pixel data on every redraw was a real, confirmed bug.
+    transmitted: Mutex<HashSet<ToolName>>,
 }
 
 const ALT_UP_LEGACY: &[u8] = b"\x1b[1;3A";
@@ -37,6 +41,7 @@ pub async fn run(initial: ToolName) -> anyhow::Result<()> {
     let assets = Arc::new(BarAssets {
         logos: logos::ensure_all_logos().await,
         use_graphics: logos::supports_kitty_graphics(),
+        transmitted: Mutex::new(HashSet::new()),
     });
 
     let current_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
@@ -153,7 +158,23 @@ fn draw_toggle_bar(out: &mut impl Write, tool: ToolName, assets: &BarAssets) -> 
     let logo_path = assets.logos.get(tool.slug());
     if assets.use_graphics {
         if let Some(path) = logo_path {
-            logos::render_kitty(path, LOGO_COLS, out)?;
+            let image_id = logos::image_id_for(tool);
+            // Transmit the pixel data once per tool per process lifetime;
+            // every other redraw just references it by id. Re-sending the
+            // full base64 payload after every single output chunk was a
+            // real, confirmed bug (found by capturing and inspecting raw
+            // session bytes) -- it flooded the escape sequence stream and
+            // visibly corrupted the screen.
+            let already_sent = {
+                let mut sent = assets.transmitted.lock().unwrap();
+                let was_sent = sent.contains(&tool);
+                sent.insert(tool);
+                was_sent
+            };
+            if !already_sent {
+                logos::transmit_kitty(path, image_id, out)?;
+            }
+            logos::put_kitty(image_id, LOGO_COLS, out)?;
         } else {
             queue!(out, Print(logos::text_badge(tool)))?;
         }

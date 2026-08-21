@@ -395,6 +395,24 @@ fn spawn_stdin_relay(sink: Arc<Mutex<InputSink>>, tx: mpsc::Sender<RunEvent>) {
                         if is_prefix_of_any(&pending) {
                             break; // wait for more bytes
                         }
+                        // A Kitty graphics protocol response (`ESC _G
+                        // ... ESC \`) -- the terminal replying to a
+                        // transmit/put command we sent. This arrives on
+                        // *our* real stdin (we're the process actually
+                        // attached to the real terminal), never as
+                        // genuine keyboard input. `q=2` on our own Kitty
+                        // commands should suppress these at the source
+                        // (see logos.rs), but this is a defensive second
+                        // layer: forwarding one into the child agent
+                        // makes it echo the raw sequence back as visible
+                        // garbage text -- a real, confirmed bug.
+                        if pending.starts_with(b"\x1b_G") {
+                            if let Some(end) = find_st_terminator(&pending) {
+                                pending.drain(..end);
+                                continue;
+                            }
+                            break; // wait for the ST terminator
+                        }
                         // Not a trigger and not a prefix of one -- hand off
                         // to whichever sink is currently active.
                         match &mut *sink.lock().unwrap() {
@@ -423,6 +441,20 @@ fn is_prefix_of_any(buf: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Finds the end (exclusive) of a `ESC \` (String Terminator) sequence in
+/// `buf`, if it's complete yet. Used to know how many bytes of a Kitty
+/// graphics protocol response to discard.
+fn find_st_terminator(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'\\' {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Tracks whether a byte stream is currently in the middle of an ANSI
@@ -539,5 +571,24 @@ mod escape_state_tests {
     #[test]
     fn osc_sequence_terminated_by_bel() {
         assert_eq!(scan_escape_state(EscState::None, b"\x1b]0;title\x07"), EscState::None);
+    }
+}
+
+#[cfg(test)]
+mod kitty_response_filter_tests {
+    use super::*;
+
+    #[test]
+    fn find_st_terminator_locates_end() {
+        assert_eq!(find_st_terminator(b"\x1b_Gi=1;OK\x1b\\"), Some(11));
+        assert_eq!(find_st_terminator(b"\x1b_Gi=1;OK"), None); // not terminated yet
+    }
+
+    #[test]
+    fn find_st_terminator_with_trailing_bytes_after() {
+        // e.g. the response arrived in the same read as a real keystroke
+        let buf = b"\x1b_Gi=1;OK\x1b\\a";
+        let end = find_st_terminator(buf).unwrap();
+        assert_eq!(&buf[end..], b"a");
     }
 }

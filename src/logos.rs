@@ -122,7 +122,16 @@ pub fn transmit_kitty(path: &std::path::Path, image_id: u32, out: &mut impl Writ
         let part: String = chars[i..end].iter().collect();
         let more = if end < chars.len() { 1 } else { 0 };
         if first {
-            write!(out, "\x1b_Ga=t,f=100,i={image_id},m={more};{part}\x1b\\")?;
+            // q=2 -- suppress the terminal's response entirely (including
+            // errors). Without it, the terminal replies on its own with
+            // `ESC _G i=<id>;OK ESC \` -- that response arrives on *our*
+            // real stdin (we're the process actually attached to the real
+            // terminal), and our stdin relay had no way to distinguish it
+            // from a real keystroke, so it got forwarded straight into the
+            // child agent, which echoed it back as visible garbage text.
+            // Confirmed as a real, reproduced bug from a live terminal
+            // capture, not theorized.
+            write!(out, "\x1b_Ga=t,f=100,i={image_id},q=2,m={more};{part}\x1b\\")?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};{part}\x1b\\")?;
@@ -138,7 +147,10 @@ pub fn transmit_kitty(path: &std::path::Path, image_id: u32, out: &mut impl Writ
 /// because clearing the row's text (which the toggle bar does before every
 /// redraw) also deletes any image placement occupying those cells.
 pub fn put_kitty(image_id: u32, cols: u16, out: &mut impl Write) -> anyhow::Result<()> {
-    write!(out, "\x1b_Ga=p,i={image_id},c={cols},r=1\x1b\\")?;
+    // q=2 -- see the comment in transmit_kitty for why this is required,
+    // not optional: without it the terminal's own response ends up
+    // forwarded into the child agent as if it were typed input.
+    write!(out, "\x1b_Ga=p,i={image_id},c={cols},r=1,q=2\x1b\\")?;
     Ok(())
 }
 

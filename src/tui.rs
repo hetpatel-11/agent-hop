@@ -28,6 +28,10 @@ enum RunEvent {
     ChildExited(u64),
     Hop(HopDirection),
     SearchResume,
+    /// The real terminal was resized (new cols, new rows). Not tied to any
+    /// particular generation -- always relevant regardless of which agent
+    /// is currently running.
+    Resized(u16, u16),
 }
 
 /// What to do with the pty we're about to spawn: launch the agent fresh,
@@ -68,6 +72,7 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
     let generation = Arc::new(AtomicU64::new(0));
 
     spawn_stdin_relay(sink.clone(), tx.clone());
+    spawn_resize_poller(tx.clone());
 
     let mut current = initial;
     let (mut project_path, mut launch) = match initial_launch {
@@ -191,12 +196,20 @@ fn run_one(
     *sink.lock().unwrap() = InputSink::Forward(writer);
 
     let suppress = Arc::new(AtomicBool::new(false));
+    // Shared "what does the real terminal look like right now" -- updated
+    // by the main loop below when a resize is detected, read by the reader
+    // thread so its vt100 model and the pty stay in sync with reality. See
+    // spawn_resize_poller's doc comment for why this exists at all: without
+    // it, resizing your terminal window mid-session (an entirely ordinary
+    // thing to do) desyncs the child's content model from where our status
+    // row thinks the bottom of the screen is, and the two start colliding.
+    let dims: Arc<Mutex<(u16, u16)>> = Arc::new(Mutex::new((cols, rows)));
 
     let mut reader = pair.master.try_clone_reader()?;
     let tx_out = tx.clone();
     let assets_thread = assets.clone();
     let suppress_thread = suppress.clone();
-    let child_rows = rows.saturating_sub(1);
+    let dims_thread = dims.clone();
     std::thread::spawn(move || {
         let mut out = stdout();
         let mut buf = [0u8; 8192];
@@ -211,13 +224,25 @@ fn run_one(
         // multiple reads correctly (it's a real incremental VT parser),
         // so there's no need for our own "wait for a complete sequence"
         // bookkeeping either.
-        let mut parser = vt100::Parser::new(child_rows, cols, 0);
+        let mut applied_dims = (cols, rows);
+        let mut parser = vt100::Parser::new(rows.saturating_sub(1), cols, 0);
         let mut prev_screen = parser.screen().clone();
         execute!(out, terminal::Clear(terminal::ClearType::All)).ok();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let current_dims = *dims_thread.lock().unwrap();
+                    if current_dims != applied_dims {
+                        applied_dims = current_dims;
+                        let new_child_rows = current_dims.1.saturating_sub(1);
+                        parser.set_size(new_child_rows, current_dims.0);
+                        // The old prev_screen is the wrong size to diff
+                        // against now -- force a full redraw at the new
+                        // size instead of an invalid partial one.
+                        prev_screen = vt100::Parser::new(new_child_rows, current_dims.0, 0).screen().clone();
+                        execute!(out, terminal::Clear(terminal::ClearType::All)).ok();
+                    }
                     parser.process(&buf[..n]);
                     // While the search overlay owns the screen, still drain
                     // the child's output (so its pty buffer never fills and
@@ -252,6 +277,16 @@ fn run_one(
             Ok(RunEvent::ChildExited(g)) if g == generation_id => break RunOutcome::Exited,
             Ok(RunEvent::ChildExited(_)) => continue, // stale event from a prior killed child
             Ok(RunEvent::Hop(dir)) => break RunOutcome::Hop(dir),
+            Ok(RunEvent::Resized(new_cols, new_rows)) => {
+                let _ = pair.master.resize(PtySize {
+                    rows: new_rows.saturating_sub(1),
+                    cols: new_cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+                *dims.lock().unwrap() = (new_cols, new_rows);
+                continue;
+            }
             Ok(RunEvent::SearchResume) => {
                 match run_search_overlay(sink, &suppress) {
                     Some(selected) => {
@@ -441,6 +476,35 @@ fn forward(sink: &Arc<Mutex<InputSink>>, bytes: &[u8]) {
         }
         InputSink::Idle => {}
     }
+}
+
+/// Polls the real terminal's size and reports changes as `RunEvent::Resized`.
+/// A real terminal resize (SIGWINCH) doesn't otherwise reach us anywhere in
+/// this design -- the pty and the vt100 model are both sized once at spawn
+/// time and never revisited, so an entirely ordinary thing (the user
+/// resizing their terminal window mid-session) silently desyncs our status
+/// row's position from where the child's own (still old-sized) content
+/// model believes its last row is, producing exactly the interleaved/
+/// overlapping corruption this was built to fix. Polling instead of a real
+/// SIGWINCH handler because it's portable (Windows has no SIGWINCH) and
+/// the ~250ms latency is imperceptible for a terminal resize.
+fn spawn_resize_poller(tx: mpsc::Sender<RunEvent>) {
+    std::thread::spawn(move || {
+        let mut last = terminal::size().unwrap_or((80, 24));
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match terminal::size() {
+                Ok(current) if current != last => {
+                    last = current;
+                    if tx.send(RunEvent::Resized(current.0, current.1)).is_err() {
+                        break; // receiver gone -- program is shutting down
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// One persistent stdin-reading thread for the whole program lifetime.

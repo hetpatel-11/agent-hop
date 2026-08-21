@@ -1,8 +1,7 @@
 {
   "name": "agent-hop",
-  "version": "0.0.6",
+  "version": "0.1.0",
   "description": "Search all your coding-agent chats, then continue any session in any agent.",
-  "type": "module",
   "keywords": [
     "ai-agents",
     "coding-agents",
@@ -21,13 +20,13 @@
     "cross-agent",
     "developer-tools",
     "local-first",
-    "typescript",
+    "rust",
     "productivity",
     "ai-coding"
   ],
   "bin": {
-    "agent-hop": "dist/cli.js",
-    "ah": "dist/cli.js"
+    "agent-hop": "bin/ah.js",
+    "ah": "bin/ah.js"
   },
   "license": "MIT",
   "repository": {
@@ -39,24 +38,16 @@
     "url": "https://github.com/hetpatel-11/agent-hop/issues"
   },
   "scripts": {
-    "build": "tsc -p . && chmod +x dist/cli.js",
-    "dev": "tsx src/cli.ts",
-    "test": "node --import tsx --test test/*.test.ts"
+    "build": "cargo build --release"
   },
   "files": [
-    "dist"
+    "bin"
   ],
-  "dependencies": {
-    "@clack/prompts": "^1.7.0",
-    "@huggingface/tokenizers": "^0.1.3",
-    "commander": "^14.0.1",
-    "figlet": "^1.11.4",
-    "onnxruntime-web": "^1.27.0"
-  },
-  "devDependencies": {
-    "@types/figlet": "^1.7.0",
-    "@types/node": "^24.7.2",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+  "optionalDependencies": {
+    "agent-hop-darwin-arm64": "0.1.0",
+    "agent-hop-darwin-x64": "0.1.0",
+    "agent-hop-linux-x64": "0.1.0",
+    "agent-hop-linux-arm64": "0.1.0",
+    "agent-hop-win32-x64": "0.1.0"
   }
 }

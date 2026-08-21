@@ -1,0 +1,9 @@
+{
+  "name": "agent-hop-linux-arm64",
+  "version": "0.1.0",
+  "description": "agent-hop native binary for Linux (arm64). Not meant to be installed directly -- installed automatically as an optionalDependency of the `agent-hop` package.",
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin/ah"]
+}

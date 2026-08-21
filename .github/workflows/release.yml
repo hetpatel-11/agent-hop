@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            npm-dir: darwin-arm64
+            bin-name: ah
+          - target: x86_64-apple-darwin
+            os: macos-13
+            npm-dir: darwin-x64
+            bin-name: ah
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            npm-dir: linux-x64
+            bin-name: ah
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            npm-dir: linux-arm64
+            bin-name: ah
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            npm-dir: win32-x64
+            bin-name: ah.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary into npm platform package
+        shell: bash
+        run: |
+          mkdir -p npm/${{ matrix.npm-dir }}/bin
+          cp target/${{ matrix.target }}/release/${{ matrix.bin-name }} npm/${{ matrix.npm-dir }}/bin/${{ matrix.bin-name }}
+          chmod +x npm/${{ matrix.npm-dir }}/bin/${{ matrix.bin-name }} || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.npm-dir }}
+          path: npm/${{ matrix.npm-dir }}/bin/${{ matrix.bin-name }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+
+      - name: Assemble platform packages
+        run: |
+          for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            mkdir -p npm/$dir/bin
+            cp staged/npm-$dir/* npm/$dir/bin/
+          done
+          chmod +x npm/darwin-arm64/bin/ah npm/darwin-x64/bin/ah npm/linux-x64/bin/ah npm/linux-arm64/bin/ah
+
+      - name: Publish platform packages
+        run: |
+          for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            npm publish ./npm/$dir --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main shim package
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

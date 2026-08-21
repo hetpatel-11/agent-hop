@@ -4,6 +4,7 @@ mod picker;
 mod tui;
 mod search;
 mod adapters;
+mod util;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};

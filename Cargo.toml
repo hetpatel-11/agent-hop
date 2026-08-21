@@ -21,3 +21,5 @@ dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["clock"] }

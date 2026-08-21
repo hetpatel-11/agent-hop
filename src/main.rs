@@ -5,6 +5,10 @@ mod tui;
 mod search;
 mod adapters;
 mod util;
+mod embed;
+mod fuzzy;
+mod theme;
+mod vector_index;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
@@ -30,6 +34,12 @@ enum Commands {
     Grok,
     /// Search and resume a past session (standalone, outside the TUI)
     Resume,
+    /// Hidden: runs the semantic-index build in-process. Never invoked
+    /// directly by a user -- search.rs spawns this detached from the
+    /// interactive CLI whenever there's unindexed content, so indexing
+    /// survives after the parent process exits.
+    #[command(hide = true, name = "__background-index")]
+    BackgroundIndex,
 }
 
 #[tokio::main]
@@ -44,6 +54,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Grok) => Some(ToolName::Grok),
         Some(Commands::Resume) => {
             search::run_standalone_resume().await?;
+            return Ok(());
+        }
+        Some(Commands::BackgroundIndex) => {
+            let sessions = search::collect_sessions(&ToolName::ALL);
+            vector_index::build_index(&sessions).await?;
             return Ok(());
         }
         None => None,

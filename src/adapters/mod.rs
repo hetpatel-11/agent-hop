@@ -81,6 +81,16 @@ pub trait Adapter {
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String>;
 }
 
+pub fn adapter_for(tool: ToolName) -> Box<dyn Adapter> {
+    match tool {
+        ToolName::Claude => Box::new(claude::ClaudeAdapter),
+        ToolName::Codex => Box::new(codex::CodexAdapter),
+        ToolName::OpenCode => Box::new(opencode::OpenCodeAdapter),
+        ToolName::Pi => Box::new(pi::PiAdapter),
+        ToolName::Grok => Box::new(grok::GrokAdapter),
+    }
+}
+
 #[cfg(test)]
 mod roundtrip_tests {
     use super::*;

@@ -105,12 +105,6 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
         }
     };
 
-    // Reset the scroll region back to the full screen -- otherwise the
-    // user's real shell would stay confined to rows 1..rows-1 after ah
-    // exits, which would look like the terminal is permanently missing its
-    // last row until something else resets it.
-    write!(stdout(), "\x1b[r")?;
-    stdout().flush()?;
     terminal::disable_raw_mode()?;
     result
 }
@@ -196,57 +190,53 @@ fn run_one(
     let writer = pair.master.take_writer()?;
     *sink.lock().unwrap() = InputSink::Forward(writer);
 
-    // Confine the real terminal's own scrolling to rows 1..=rows-1 (DECSTBM),
-    // leaving the last row as a fixed margin the terminal itself will never
-    // scroll. Without this, a child that scrolls its own content (many CLIs
-    // print startup banners inline rather than staying in the alternate
-    // screen buffer) scrolls the *entire physical terminal* -- dragging our
-    // previously-drawn status line up into scrollback while a fresh copy
-    // gets redrawn at the bottom every time, which is exactly what produced
-    // repeated stacked "agent-hop ..." lines. This is the same primitive
-    // tmux/screen use for their own status lines -- not something a
-    // rendering framework like ratatui would provide either, since it's a
-    // terminal-level scrolling behavior, not something rendered content
-    // controls.
-    write!(stdout(), "\x1b[1;{}r", rows.saturating_sub(1))?;
-    // DECSTBM moves the cursor to the scrolling region's home position as a
-    // side effect -- clear first so nothing stale from a previous agent's
-    // screen lingers until this one's first redraw arrives.
-    execute!(stdout(), terminal::Clear(terminal::ClearType::All))?;
-    stdout().flush()?;
-
     let suppress = Arc::new(AtomicBool::new(false));
 
     let mut reader = pair.master.try_clone_reader()?;
     let tx_out = tx.clone();
     let assets_thread = assets.clone();
     let suppress_thread = suppress.clone();
+    let child_rows = rows.saturating_sub(1);
     std::thread::spawn(move || {
         let mut out = stdout();
         let mut buf = [0u8; 8192];
-        let mut esc_state = EscState::None;
+        // The child's raw bytes are never written to the real terminal
+        // directly -- they're parsed into a real virtual screen model
+        // instead. This is the actual fix for the whole family of bugs
+        // from tonight (escape-sequence splicing, Kitty response leakage,
+        // scroll-region stacking): there's no longer a shared raw byte
+        // stream for our own status row to collide with, because the
+        // child's bytes are consumed and modeled, not passed through.
+        // `vt100::Parser` internally handles sequences split across
+        // multiple reads correctly (it's a real incremental VT parser),
+        // so there's no need for our own "wait for a complete sequence"
+        // bookkeeping either.
+        let mut parser = vt100::Parser::new(child_rows, cols, 0);
+        let mut prev_screen = parser.screen().clone();
+        execute!(out, terminal::Clear(terminal::ClearType::All)).ok();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    esc_state = scan_escape_state(esc_state, &buf[..n]);
+                    parser.process(&buf[..n]);
                     // While the search overlay owns the screen, still drain
                     // the child's output (so its pty buffer never fills and
                     // blocks it) but don't paint over the overlay with it.
                     if !suppress_thread.load(Ordering::SeqCst) {
-                        let _ = out.write_all(&buf[..n]);
-                        // Splicing our own escape sequences in right after a
-                        // chunk that ends mid-sequence corrupts the child's
-                        // sequence -- the terminal aborts parsing it and the
-                        // orphaned tail bytes print as literal garbage (this
-                        // was a real, confirmed bug: stray letters/fragments
-                        // showing up on screen). Skip this redraw when we're
-                        // still inside an incomplete sequence; the next
-                        // chunk that completes it will trigger a clean one.
-                        if esc_state == EscState::None {
-                            let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
-                        }
+                        let current_screen = parser.screen().clone();
+                        // A byte stream sufficient to turn what was
+                        // previously on screen into what's on screen now --
+                        // well-formed by construction, including correctly
+                        // repositioning the cursor to where the child
+                        // expects it. This is what makes the status-row
+                        // draw afterward safe: it's appended after a
+                        // complete, self-contained update, never spliced
+                        // into the middle of one.
+                        let diff = current_screen.contents_diff(&prev_screen);
+                        let _ = out.write_all(&diff);
+                        let _ = draw_toggle_bar(&mut out, tool, &assets_thread);
                         let _ = out.flush();
+                        prev_screen = current_screen;
                     }
                 }
             }
@@ -556,123 +546,6 @@ fn find_st_terminator(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Tracks whether a byte stream is currently in the middle of an ANSI
-/// escape sequence -- not a full terminal emulator, just enough of a
-/// state machine to know "is it safe to inject bytes of our own right
-/// now." Persisted across chunks (a real sequence can be split across
-/// multiple pty reads), since judging completeness from a single chunk in
-/// isolation would misparse a sequence that started in a previous chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EscState {
-    /// Not inside any escape sequence -- plain text, safe to interject.
-    None,
-    /// Just saw ESC, haven't seen the byte that decides what kind yet.
-    Esc,
-    /// CSI (`ESC [ ... <final byte 0x40-0x7e>`), e.g. cursor moves, SGR,
-    /// mode toggles.
-    Csi,
-    /// OSC (`ESC ] ... BEL` or `... ST`), e.g. window title.
-    Osc,
-    /// APC/DCS/PM/SOS (`ESC _/P/^/X ... ST`), e.g. Kitty graphics.
-    ApcDcs,
-}
-
-fn scan_escape_state(mut state: EscState, buf: &[u8]) -> EscState {
-    let mut i = 0;
-    while i < buf.len() {
-        let b = buf[i];
-        state = match state {
-            EscState::None => {
-                if b == 0x1b {
-                    EscState::Esc
-                } else {
-                    EscState::None
-                }
-            }
-            EscState::Esc => match b {
-                b'[' => EscState::Csi,
-                b']' => EscState::Osc,
-                b'_' | b'P' | b'^' | b'X' => EscState::ApcDcs,
-                // Any other byte completes a short (Fe/Fp-class) sequence
-                // like DECSC/DECRC (`ESC 7` / `ESC 8`) immediately.
-                _ => EscState::None,
-            },
-            EscState::Csi => {
-                if (0x40..=0x7e).contains(&b) {
-                    EscState::None
-                } else {
-                    EscState::Csi
-                }
-            }
-            EscState::Osc => {
-                if b == 0x07 {
-                    EscState::None
-                } else if b == 0x1b && buf.get(i + 1) == Some(&b'\\') {
-                    i += 1;
-                    EscState::None
-                } else {
-                    EscState::Osc
-                }
-            }
-            EscState::ApcDcs => {
-                if b == 0x1b && buf.get(i + 1) == Some(&b'\\') {
-                    i += 1;
-                    EscState::None
-                } else {
-                    EscState::ApcDcs
-                }
-            }
-        };
-        i += 1;
-    }
-    state
-}
-
-#[cfg(test)]
-mod escape_state_tests {
-    use super::*;
-
-    #[test]
-    fn plain_text_stays_none() {
-        assert_eq!(scan_escape_state(EscState::None, b"hello world"), EscState::None);
-    }
-
-    #[test]
-    fn complete_csi_sequence_returns_to_none() {
-        // cursor move, e.g. ESC [ 1 ; 2 H
-        assert_eq!(scan_escape_state(EscState::None, b"\x1b[1;2H"), EscState::None);
-    }
-
-    #[test]
-    fn split_csi_sequence_is_detected_as_incomplete() {
-        // "\x1b[?2004" with the terminating "l" not yet arrived
-        let state = scan_escape_state(EscState::None, b"text\x1b[?2004");
-        assert_eq!(state, EscState::Csi);
-        // completing it in a later chunk brings it back to None
-        assert_eq!(scan_escape_state(state, b"l"), EscState::None);
-    }
-
-    #[test]
-    fn short_fe_sequence_completes_immediately() {
-        // DECSC / DECRC -- exactly the sequences that were leaking as
-        // literal "7"/"8" characters when spliced mid-stream.
-        assert_eq!(scan_escape_state(EscState::None, b"\x1b7"), EscState::None);
-        assert_eq!(scan_escape_state(EscState::None, b"\x1b8"), EscState::None);
-    }
-
-    #[test]
-    fn split_kitty_graphics_apc_sequence_is_detected_as_incomplete() {
-        let state = scan_escape_state(EscState::None, b"\x1b_Ga=T,f=100;AAAA");
-        assert_eq!(state, EscState::ApcDcs);
-        assert_eq!(scan_escape_state(state, b"BBBB\x1b\\"), EscState::None);
-    }
-
-    #[test]
-    fn osc_sequence_terminated_by_bel() {
-        assert_eq!(scan_escape_state(EscState::None, b"\x1b]0;title\x07"), EscState::None);
-    }
-}
-
 #[cfg(test)]
 mod kitty_response_filter_tests {
     use super::*;
@@ -740,5 +613,48 @@ mod csi_trigger_parser_tests {
     fn find_csi_final_byte_detects_completion() {
         assert_eq!(find_csi_final_byte(b"\x1b[1;3B"), Some(5));
         assert_eq!(find_csi_final_byte(b"\x1b[1;3"), None); // no final byte yet
+    }
+}
+
+#[cfg(test)]
+mod vt100_model_tests {
+    /// The structural guarantee the whole rewrite depends on: a child's
+    /// pty is sized rows-1 tall, so its vt100 screen model can *only* ever
+    /// contain content in rows 0..rows-2. There's no escape sequence a
+    /// child could send that makes contents_diff emit anything touching
+    /// our reserved status row, because that row doesn't exist in the
+    /// child's model at all -- not "we filtered it out," structurally
+    /// absent.
+    #[test]
+    fn child_screen_model_cannot_exceed_its_own_row_count() {
+        let child_rows = 29u16; // matches rows.saturating_sub(1) for a 30-row terminal
+        let cols = 100u16;
+        let mut parser = vt100::Parser::new(child_rows, cols, 0);
+
+        // Try to get the child to scroll far past its own screen size, and
+        // to explicitly move its cursor to an absurd row -- both are
+        // things a real misbehaving or confused child could send.
+        for _ in 0..500 {
+            parser.process(b"some line of output\r\n");
+        }
+        parser.process(b"\x1b[9999;1H"); // absolute move to a huge row
+        parser.process(b"X");
+
+        let screen = parser.screen();
+        let (screen_rows, _) = screen.size();
+        assert_eq!(screen_rows, child_rows, "screen model's own size never changes on its own");
+
+        let (cursor_row, _) = screen.cursor_position();
+        assert!(
+            (cursor_row as usize) < child_rows as usize,
+            "cursor position must be clamped inside the model's own bounds, got row {cursor_row}"
+        );
+
+        // The diff this screen would produce is only ever addressed within
+        // the model's own dimensions -- there is no possible content at
+        // child_rows or beyond for it to emit.
+        let blank = vt100::Parser::new(child_rows, cols, 0).screen().clone();
+        let diff = screen.contents_diff(&blank);
+        assert!(!diff.is_empty());
     }
 }

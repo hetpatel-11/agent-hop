@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
 Claude Code, Codex, OpenCode, Pi, and Grok each have their own CLI, their own session files, and their own idea of "resume." None of them can take over a conversation another one just had. `agent-hop` is the runtime around those harnesses: a native Rust binary that opens the real agent in a pty, keeps a strip of chrome `ah` owns, and can move the live thread into the next harness without you leaving the terminal or starting over.
 
-You work the way you already do. `claude` is still `claude`. Codex is still Codex. `ah` does not reimplement them, proxy their APIs, or invent a new agent. It is the host — PTY, Ghostty's VT engine, hop, search — and they are the guests.
+You work the way you already do. `claude` is still `claude`. Codex is still Codex. `ah` does not reimplement them, proxy their APIs, or invent a new agent. It is the runtime around them — PTY, Ghostty's VT engine, hop, search.
 
 When you hop Claude Code → Grok → Pi → OpenCode → Codex, the runtime finds the session the current harness just wrote for this project, translates the actual turns into the next harness's native format, and launches that harness's own resume command. Tool calls (shell, file edits, MCP) and attachments (images, PDFs) go with the thread. It is not a pasted summary.
 
@@ -57,7 +57,7 @@ Anonymous usage telemetry is on by default (no queries, paths, or chat content).
 ah
 ```
 
-Start the runtime, pick a harness, then work as usual. That harness is a child process; `ah` is the host:
+Start the runtime, pick a harness, then work as usual. That harness is a child process; `ah` wraps it:
 
 | Shortcut | What it does |
 |---|---|
@@ -109,7 +109,7 @@ ah telemetry on
 
 ## Architecture
 
-`ah` is a runtime: host the real harness, search the history those harnesses already wrote, translate a live session into another harness's format, and stay out of the way.
+`ah` is a runtime: run the real harness, search the history those harnesses already wrote, translate a live session into another harness's format, and stay out of the way.
 
 ```
 you ──► ah (picker / TUI chrome)

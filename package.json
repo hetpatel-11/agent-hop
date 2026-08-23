@@ -1,7 +1,7 @@
 {
   "name": "agent-hop",
   "version": "0.1.0",
-  "description": "Runtime for coding-agent harnesses. Host Claude Code, Codex, OpenCode, Pi, and Grok in one terminal, hop a live session between them, and search or resume any local chat.",
+  "description": "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal, hop a live session between them, and search or resume any local chat.",
   "keywords": [
     "runtime",
     "agent-runtime",

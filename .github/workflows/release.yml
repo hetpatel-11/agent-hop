@@ -225,7 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
-          NOTES="Native Rust runtime for coding-agent harnesses. Host Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop a live session between them; search or resume any local chat.
+          NOTES="Native Rust runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop a live session between them; search or resume any local chat.
 
           \`\`\`bash
           curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash

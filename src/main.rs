@@ -17,7 +17,7 @@ use agents::ToolName;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ah", version, about = "Runtime for coding-agent harnesses. Host Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session.")]
+#[command(name = "ah", version, about = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

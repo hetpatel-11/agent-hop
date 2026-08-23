@@ -2,7 +2,7 @@
 name = "agent-hop"
 version = "0.1.0"
 edition = "2024"
-description = "Runtime for coding-agent harnesses. Host Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session."
+description = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session."
 
 [[bin]]
 name = "ah"

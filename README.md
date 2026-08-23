@@ -2,249 +2,194 @@ https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
 *In demo: a Claude Code session, continued in Codex — as it is.*
 
-**Search all your coding-agent chats, then resume any session in any agent.**
+**Search all your coding-agent chats, then continue any session in any agent.**
 
 # agent-hop
 
 Your best coding-agent context is probably trapped in the wrong tool.
 
-`agent-hop` searches your local Claude Code, Codex, OpenCode, Pi, and Grok
-Build sessions from one picker, then resumes the selected chat in the original
-agent or converts it into another agent's native session format.
+`agent-hop` (`ah`) is a native Rust CLI. It wraps Claude Code, Codex, OpenCode, Pi, and Grok in one terminal, searches their local history from one picker, and hops a live conversation into another agent's native session format — tool calls and attachments included, not a summary.
 
-Why use it:
+Use it when you remember the topic, but not the tool, the project folder, or the exact session.
 
-- **Stop hunting through project folders** — search every supported agent's
-  local history from one command.
-- **Stop re-explaining context** — resume with the real conversation history,
-  not a summary.
-- **Keep the actual work, not just the words** — tool calls (shell commands,
-  file edits, MCP calls) and file attachments (images, PDFs) carry over too,
-  not just the text.
-- **Switch agents without starting over** — hop a Codex chat into OpenCode,
-  Claude Code into Codex, Grok into Pi, and more.
-- **Use it interactively or from scripts** — humans get a picker; agents can
-  call the deterministic non-interactive mode.
-- **100% local** — everything, including semantic search, runs on your
-  machine. Your sessions, including tool calls and attachments, never leave
-  your disk.
-
-Use it when you remember the topic, but not the tool, project directory, or
-exact session.
+- **One search box for every agent** — hybrid search over local Claude Code, Codex, OpenCode, Pi, and Grok history.
+- **Resume the real thread** — same-agent resume uses that tool's own session. No re-explaining.
+- **Hop mid-conversation** — switch agents without starting over. The next tool gets the actual turns, including shell/file/MCP calls and file attachments.
+- **The real agent, not a clone** — each tool still runs as itself in a pty. `ah` owns the chrome (toggle bar, hop, search), not the agent.
+- **Interactive or scripted** — humans get a TUI; agents and CI call `ah resume` non-interactively.
+- **Sessions stay on disk** — search and conversion read the same local files the agents write. Semantic search runs on your machine.
 
 ## Install
 
+macOS or Linux, no Node required:
+
 ```bash
-npm install -g agent-hop
+curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-Or with Bun, if you already use it:
+That downloads the native `ah` binary into `~/.local/bin` (override with `AH_BIN_DIR`). Pin a version with `AH_VERSION=0.1.0`.
+
+Or via npm / bun, if you already use them:
 
 ```bash
+npm install -g agent-hop
+# or
 bun install -g agent-hop
 ```
 
-If this is your first global Bun install, Bun will warn that its global bin
-folder isn't on your `PATH` yet -- add it (once) and reload your shell:
+npm is a binary CDN here, not a JavaScript app. The package is a tiny Node shim that execs the same Rust binary the curl installer puts on your PATH.
 
-```bash
-export PATH="$HOME/.bun/bin:$PATH"
-```
+Supported prebuilds: macOS arm64/x64, Linux x64/arm64, Windows x64. Windows: use npm, or download `agent-hop-windows-x64` from the [npm registry](https://www.npmjs.com/package/agent-hop-windows-x64).
+
+`ah` launches agents; it does not install them. The agent you hop into must already be on your `PATH`.
 
 Anonymous usage telemetry is on by default (no queries, paths, or chat content). Turn it off with `ah telemetry off` or `AH_TELEMETRY=0`. Details: https://agent-hop.com/telemetry
 
 ## Usage
 
 ```bash
-agent-hop
-```
-
-or the short alias:
-
-```bash
 ah
 ```
 
-Walks you through:
+Pick an agent, then work as usual. `ah` sits around that process:
 
-1. **Which agent(s) to search?** — all five, or restrict to one
-2. **Search for:** — hybrid search across local session history
-3. **Pick a session** — list with tool, title, date, project, and context preview
-4. **Resume in which agent?** — defaults to the same tool (native resume), or
-   pick a different one to convert into that tool's format first
-5. Launches you directly into the resumed session
+| Shortcut | What it does |
+|---|---|
+| `Ctrl+B` then `n` / `p` | Hop to the next / previous installed agent |
+| `Ctrl+B` then `a` | Open the agent picker (or click the bottom bar) |
+| `Ctrl+B` then `?` | Show every `ah` shortcut |
+| `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
+| `Ctrl+R` | Search local history and resume a session in the **same** agent |
 
-Non-interactive / scriptable form:
+Launch straight into a tool:
 
 ```bash
-agent-hop "auth migration" --agent claude --resume-in codex
+ah claude
+ah codex
+ah opencode
+ah pi
+ah grok
+```
+
+Search and resume outside the live TUI:
+
+```bash
+ah resume
+ah resume "auth migration"
+ah resume "auth migration" --agent claude
+ah resume "auth migration" --agent claude --resume-in codex
 ```
 
 | Flag | Description |
 |---|---|
-| `-a, --agent <tool>` | Restrict search to one agent |
-| `-r, --resume-in <tool>` | Resume the picked session in this agent (default: same tool) |
+| `-a, --agent <tool>` | Only search this agent (`claude`, `codex`, `opencode`, `pi`, `grok`) |
+| `-r, --resume-in <tool>` | Convert the picked session into this agent's format, then launch it |
 
-### Agent/script mode
+`Ctrl+R` and bare `ah resume` stay on the same agent. Cross-agent is the hop (`Ctrl+B` / `Alt+↑↓`) or `-r` for scripts.
 
-Agents should avoid the interactive picker. Use the explicit form:
-
-```bash
-ah "<specific query>" --agent <source-agent> --resume-in <target-agent>
-```
-
-Example:
+Without a TTY (another agent or a script), a query is required and the top match is auto-picked:
 
 ```bash
-ah "adobe premiere mcp setup" --agent codex --resume-in opencode
+ah resume "adobe premiere mcp setup" --agent codex --resume-in opencode
 ```
 
-In non-interactive mode, `agent-hop` automatically chooses the top-ranked
-session instead of asking you to pick one. Use a specific query and `--agent`
-whenever possible; vague queries like `"adobe"` may resume the wrong chat.
+Be specific. A vague query like `"adobe"` can resume the wrong chat.
 
-## Why it exists
+```bash
+ah telemetry          # status
+ah telemetry off
+ah telemetry on
+```
 
-Agent sessions are local, useful, and fragmented.
+## Architecture
 
-Each CLI stores its own history in its own shape. Claude Code cannot naturally
-resume a Codex thread. Codex cannot naturally pick up an OpenCode session.
-And when you are trying to find "that one chat where we debugged the auth
-flow," the built-in resume pickers usually only search one tool, one project,
-or one narrow session store.
+`ah` is one binary with four jobs: wrap the real agent, search local history, translate a session into another tool's format, and get out of the way.
 
-`agent-hop` makes your local agent history feel like one searchable workspace:
+```
+you ──► ah (picker / TUI chrome)
+          │
+          ├─ portable-pty ──► claude | codex | opencode | pi | grok
+          │                      ▲
+          │                      │ native resume command
+          │
+          ├─ libghostty-vt ──► render the agent's own terminal
+          │
+          ├─ adapters ──► read/write each tool's files on disk
+          │      │
+          │      └─ Turn[] (shared IR) ──► hop / ah resume -r
+          │
+          └─ search ──► BM25 + MiniLM (local ONNX) over ~/.agent-hop
+```
 
-- find the right thread without remembering which project directory it came from
-- continue in the original agent when that is what you want
-- hop the same conversation into a different agent when that agent is better for
-  the next step
-- preserve the actual conversation history, not a generated summary
+### What each piece is for
+
+**TUI shell (`src/tui.rs`, `src/picker.rs`)** — Starts the agent you picked inside a pty (`portable-pty`) and keeps a toggle bar `ah` owns. The agent never draws into that bar. Hop, search, and help are overlays on top of the still-running agent, not a separate app.
+
+**Terminal engine (`src/vt.rs`, `libghostty-vt`)** — Ghostty's embeddable VT parser, linked at build time. The agent is a real TUI (Kitty keyboard protocol, OSC 133 prompt marks, truecolor). We render what it would draw in Ghostty, instead of reimplementing a half-compatible terminal. End users never need Zig; only people building from source do.
+
+**Hop (`src/adapters/mod.rs`)** — On `Ctrl+B n/p/a` or `Alt+↑/↓`, `ah` finds the session the current agent just wrote for this project, reads it, trims it to a 200k-character budget (with a short synthetic summary of anything cut), writes it as the next agent's native session, and launches that agent's own resume command. Fast path: `find_latest_for_path` so a hop does not scan every session on disk.
+
+**Adapters (`src/adapters/<tool>.rs`)** — One module per agent. Each implements:
+
+- `list_sessions()` — cheap metadata for search
+- `read()` — that tool's files → `Turn[]`
+- `write()` — `Turn[]` → a new session in that tool's format
+- `resume_cmd()` — the argv to exec (`claude --resume …`, `codex resume …`, …)
+
+Adding an agent is one new adapter. The TUI and search do not change.
+
+**Shared IR (`Turn`)** — Every hop goes through one shape: role, text, structured tool calls (name / input / output), attachments (mime, base64, filename). Tool calls are not flattened into prose. Each writer emits the target's real blocks (`tool_use` / `function_call` / `ToolPart` / …), the same records that agent would have written itself.
+
+**Search (`src/search.rs`, `src/fuzzy.rs`, `src/resume.rs`)** — Two stages, same index:
+
+1. **Lexical, every keystroke** — BM25 over local sessions. Exact phrases first, then fuzzy (BK-tree), prefix (`ux` → `uxp`), and compound tokens (`agenthop` → `agent hop`), with a recency boost.
+2. **Semantic, after you pause** — `all-MiniLM-L6-v2` (384-d, mean-pooled) refines ranking. First use downloads the quantized ONNX model plus ONNX Runtime into `~/.agent-hop/` and keeps them. Later searches are local.
+
+The incremental vector index lives under `~/.agent-hop/`. New sessions are indexed by a detached `ah __background-index` so the picker never blocks on a full rebuild.
+
+**Standalone resume (`ah resume`)** — Same ranker and picker as `Ctrl+R`, without wrapping a live agent first. `-r` is the scripted hop. Non-interactive mode skips the TUI entirely and execs the target agent's resume command with inherited stdio.
+
+**Telemetry (`src/telemetry.rs`)** — Opt-out, self-hosted (`telemetry.agent-hop.com`). Sends aggregate usage (command, version, OS). Never queries, paths, project names, session ids, or chat content. Disabled by `AH_TELEMETRY=0`, `DO_NOT_TRACK=1`, or `ah telemetry off`.
+
+**Distribution** — CI builds one `ah` per platform. npm `optionalDependencies` (`agent-hop-darwin-arm64`, …) are those binaries; `bin/ah.js` is only a resolver. `install.sh` pulls the same tarball from the npm registry and drops `ah` on your PATH. Two front doors, one artifact.
+
+### Per-agent session stores
+
+`ah` reads and writes what each tool already uses:
+
+| Agent | On disk | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/projects/<encoded-cwd>/*.jsonl` | Directory name replaces every non-alphanumeric with `-`, not just `/`. |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | `response_item` continues the model; `event_msg` is what the TUI replays. |
+| OpenCode | official `opencode export` / `opencode import` | No raw SQLite writes. Part IDs must be unique or OpenCode silently drops the insert. |
+| Pi | `~/.pi/agent/sessions/--<encoded-cwd>--/` | Only `/` is encoded; `_` and `.` stay. |
+| Grok | `chat_history.jsonl` + `summary.json` per session | `updates.jsonl` is also written so the TUI can replay, not only continue. |
+
+Long threads are cut to the most recent slice that fits (`CONVERSION_CHAR_BUDGET`, 200k characters) rather than handed to a target that cannot load them.
 
 ## Supported agents
 
-| Agent | Same-tool resume | Cross-tool resume (write into this format) |
+| Agent | Same-tool resume | Hop / write into this format |
 |---|---|---|
-| Claude Code | ✅ | ✅ |
-| Codex | ✅ | ✅ |
-| OpenCode | ✅ | ✅ |
-| Pi | ✅ | ✅ |
-| Grok Build | ✅ | ✅ |
-
-`agent-hop` converts and launches sessions; it does not install the agent
-clients themselves. The agent selected under "Resume in which agent?" must
-already be installed and available on `PATH`.
-
-Every adapter has been verified with a real live model call actually
-recalling injected content across a resume.
-
-Muse Code support was removed for now — the write/resume path needs live
-Muse API access to verify correctly, which isn't available here. May come
-back once that's testable end-to-end.
-
-## How it works
-
-`agent-hop` has two layers:
-
-1. A **search layer** that indexes the local session stores from each supported
-   agent.
-2. A **handoff layer** that converts the selected conversation into the target
-   agent's native session format, then replaces the current process with that
-   agent's real resume command.
-
-No cloud sync is required. It reads the same local files the agents themselves
-write.
-
-### Search architecture
-
-Search is designed to feel instant while still catching non-literal matches:
-
-- **Stage 1: lexical search, every keystroke.** BM25 scores the local sessions
-  immediately. Exact phrase matches are prioritized, fuzzy typo matching handles
-  small misspellings, prefix matching catches cases like `ux` -> `uxp`, and a
-  recency multiplier makes recent exact matches easier to find.
-- **Stage 2: semantic refine, after you pause typing.** A small local MiniLM
-  embedding model (`all-MiniLM-L6-v2`, via `onnxruntime-web`) refines the ranking
-  against a cached vector index. The corpus is indexed in the background so
-  search never blocks on a full rebuild.
-- **No native dependency required.** The embedding runtime uses WASM, so the npm
-  package stays portable and avoids native ONNX install friction.
-
-The vector index lives under `~/.agent-hop/` and updates incrementally. New or
-changed sessions are indexed in the background; already-indexed sessions are
-reused.
-
-### Handoff architecture
-
-Each tool stores sessions on disk in its own format — some as flat JSONL
-files, some behind an official export/import CLI, and some with separate
-display/replay event streams. `agent-hop` normalizes all of them to one shape:
-
-```ts
-interface Turn {
-  role: "user" | "assistant";
-  text: string;
-  toolCalls?: ToolCallRecord[];   // shell commands, file edits, MCP calls, ...
-  attachments?: Attachment[];     // images, PDFs
-}
-```
-
-Tool calls and attachments aren't flattened into text — every adapter writes
-them as real, native structured entries in the target format (Claude Code's
-`tool_use`/`tool_result` blocks, Codex's `function_call`/
-`function_call_output`, Pi's `toolCall`/`toolResult`, OpenCode's `ToolPart`,
-Grok's `tool_calls`/`tool_result`), the same shape that agent's own client
-produces for a call it made itself. Each of those was verified against a
-real generated session from the actual tool, not guessed from
-documentation. A long session's full tool-call I/O can be large enough to
-exceed a target agent's context window on its own — `agent-hop` keeps the
-most recent slice that fits rather than handing over something the target
-can't load.
-
-Each adapter (`src/adapters/<tool>.ts`) implements:
-
-- `listSessions()` — cheap metadata scan for search
-- `read(ref)` — full conversation → `Turn[]`
-- `write(turns, projectPath)` — `Turn[]` → a new session in that tool's
-  native format, indistinguishable from one the tool created itself
-- `resumeCmd(sessionId, projectPath)` — the actual command to exec into
-
-Adding a new agent means writing one new adapter file; nothing else changes.
-
-### Per-tool notes
-
-- **Claude Code**: raw JSONL under `~/.claude/projects/<encoded-cwd>/`. The
-  directory name replaces *every* non-alphanumeric character with `-` (not
-  just `/`) — a real gotcha if you don't match it exactly.
-- **Codex**: raw JSONL rollout files under `~/.codex/sessions/YYYY/MM/DD/`.
-  `response_item` entries let Codex continue the conversation; `event_msg`
-  entries are also written so the TUI visibly replays prior turns.
-- **OpenCode**: uses the official `opencode export`/`opencode import`
-  commands rather than writing to its SQLite store directly. Message/part IDs
-  must be genuinely unique per session — OpenCode's schema uses them as
-  primary keys with `onConflictDoNothing()`, so a repeated ID silently no-ops
-  the insert with zero visible error.
-- **Pi**: JSONL under `~/.pi/agent/sessions/--<encoded-cwd>--/`. Unlike
-  Claude, Pi only replaces `/`, leaving `_` and `.` in path components intact.
-- **Grok Build**: `chat_history.jsonl` + `summary.json` per session, directory
-  keyed by URL-encoded cwd. `updates.jsonl` is also written so Grok's TUI can
-  render the previous chat history, not just continue from it invisibly.
-
-### Launch behavior
-
-On Unix-like systems, `agent-hop` uses true process replacement (`execve`) for
-the final launch when possible. That means once the target agent starts, there
-is no parent `agent-hop` process left holding the terminal. This keeps raw TTY
-input responsive for interactive agents like OpenCode and Pi.
+| Claude Code | yes | yes |
+| Codex | yes | yes |
+| OpenCode | yes | yes |
+| Pi | yes | yes |
+| Grok | yes | yes |
 
 ## Development
+
+Prebuilt installs do not need this. Building from source does: a current Rust toolchain, Zig 0.15.2 (for `libghostty-vt`), and libclang (for bindgen).
 
 ```bash
 git clone https://github.com/hetpatel-11/agent-hop.git
 cd agent-hop
-npm install
-npm run build
-npm link   # makes `agent-hop` available globally, pointing at your local build
+cargo build --release
+# binary: target/release/ah
 ```
 
-`npm run dev` runs the CLI directly via `tsx`, no build step needed.
+`npm run build` is the same `cargo build --release`. Do not copy the binary over a Homebrew/npm shim on macOS — Gatekeeper will kill a detached copy; symlink `~/.cargo/bin/ah` or `target/release/ah` instead.
+
+```bash
+cargo test --release
+```

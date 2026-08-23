@@ -175,13 +175,15 @@ jobs:
 
   publish:
     needs: build
-    # Only publish to npm for real release tags (v1.2.3), never for
-    # pre-release tags (v1.2.3-rc1, -beta, etc.). This lets a pre-release
-    # tag exercise the full cross-platform build matrix as a smoke test
-    # without pushing anything to the registry -- the build job still runs
-    # for every tag; only this publish step is gated.
+    # Only publish to npm / GitHub Releases for real release tags (v1.2.3),
+    # never for pre-release tags (v1.2.3-rc1, -beta, etc.). This lets a
+    # pre-release tag exercise the full cross-platform build matrix as a
+    # smoke test without pushing anything to the registry -- the build job
+    # still runs for every tag; only this publish step is gated.
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -201,6 +203,40 @@ jobs:
             cp staged/npm-$dir/* npm/$dir/bin/
           done
           chmod +x npm/darwin-arm64/bin/ah npm/darwin-x64/bin/ah npm/linux-x64/bin/ah npm/linux-arm64/bin/ah
+
+      - name: Stage GitHub Release binaries
+        run: |
+          mkdir -p dist
+          cp npm/darwin-arm64/bin/ah dist/ah-darwin-arm64
+          cp npm/darwin-x64/bin/ah dist/ah-darwin-x64
+          cp npm/linux-x64/bin/ah dist/ah-linux-x64
+          cp npm/linux-arm64/bin/ah dist/ah-linux-arm64
+          cp npm/win32-x64/bin/ah.exe dist/ah-windows-x64.exe
+          chmod +x dist/ah-darwin-arm64 dist/ah-darwin-x64 dist/ah-linux-x64 dist/ah-linux-arm64
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      # Tag pushes get a real GitHub Release with the same binaries npm
+      # ships. workflow_dispatch from a branch has no version tag to attach
+      # them to, so it only does the npm side (retries / skip-existing).
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          NOTES="Native Rust runtime for coding-agent harnesses. Host Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop a live session between them; search or resume any local chat.
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
+          \`\`\`
+
+          Or \`npm install -g agent-hop\`. Same \`ah\` binary either way."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes "$NOTES"
+          fi
 
       - name: Publish platform packages
         run: |

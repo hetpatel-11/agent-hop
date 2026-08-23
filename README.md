@@ -31,7 +31,9 @@ macOS or Linux, no Node required:
 curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-That downloads the native `ah` binary into `~/.local/bin` (override with `AH_BIN_DIR`). Pin a version with `AH_VERSION=0.1.0`.
+That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.0`.
+
+Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
 
 Or via npm / bun, if you already use them:
 
@@ -41,9 +43,9 @@ npm install -g agent-hop
 bun install -g agent-hop
 ```
 
-npm is a binary CDN here, not a JavaScript app. The package is a tiny Node shim that execs the same Rust binary the curl installer puts on your PATH.
+npm is a binary CDN here, not a JavaScript app. The package is a tiny Node shim that execs the same Rust binary GitHub Releases and the curl installer ship.
 
-Supported prebuilds: macOS arm64/x64, Linux x64/arm64, Windows x64. Windows: use npm, or download `agent-hop-windows-x64` from the [npm registry](https://www.npmjs.com/package/agent-hop-windows-x64).
+Supported prebuilds: macOS arm64/x64, Linux x64/arm64, Windows x64.
 
 `ah` is the runtime, not an installer. The harness you hop into must already be on your `PATH`.
 
@@ -155,7 +157,7 @@ The incremental vector index lives under `~/.agent-hop/`. New sessions are index
 
 **Telemetry (`src/telemetry.rs`)** — Opt-out, self-hosted (`telemetry.agent-hop.com`). Sends aggregate usage (command, version, OS). Never queries, paths, project names, session ids, or chat content. Disabled by `AH_TELEMETRY=0`, `DO_NOT_TRACK=1`, or `ah telemetry off`.
 
-**Distribution** — CI builds one `ah` per platform. npm `optionalDependencies` (`agent-hop-darwin-arm64`, …) are those binaries; `bin/ah.js` is only a resolver. `install.sh` pulls the same tarball from the npm registry and drops `ah` on your PATH. Two front doors, one artifact.
+**Distribution** — CI builds one `ah` per platform and ships it twice: a [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases) (what `install.sh` prefers) and npm `optionalDependencies` (`agent-hop-darwin-arm64`, …). `bin/ah.js` is only a resolver. Same artifact, two front doors.
 
 ### Per-agent session stores
 

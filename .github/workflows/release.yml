@@ -38,6 +38,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: "0.15.2"
+
+      # bindgen (used by build.rs to generate libghostty-vt's Rust bindings)
+      # needs libclang at build time. macOS/Linux runners already have it
+      # via Xcode CLT / apt-installed clang; windows-latest does not expose
+      # it where clang-sys looks by default, so it must be installed and
+      # pointed to explicitly here.
+      - if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "17"
+
       - run: cargo build --release --target ${{ matrix.target }}
 
       - name: Stage binary into npm platform package

@@ -512,13 +512,20 @@ fn trigger_background_indexing() {
     // This is a true background task, so ask the OS to schedule it at the
     // lowest niceness -- best-effort, not fatal if the platform disallows
     // it (e.g. no permission to renice, which requires nothing special
-    // for *lowering* your own child's priority on any platform this
-    // targets, but the syscall can still fail).
+    // for *lowering* your own child's priority on Unix, but the syscall
+    // can still fail). `setpriority`/`PRIO_PROCESS` are POSIX-only --
+    // `libc` doesn't define them on Windows at all, so this has to be
+    // behind `cfg(unix)` or it won't compile there; a real Windows
+    // equivalent (`SetPriorityClass`) could be added later, but this is
+    // a nice-to-have, not worth blocking a Windows build over.
+    #[cfg(unix)]
     if let Ok(child) = child {
         unsafe {
             let _ = libc::setpriority(libc::PRIO_PROCESS, child.id() as libc::id_t, 19);
         }
     }
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 /// One-shot hybrid search (BM25 + fuzzy + semantic, blended) for when a

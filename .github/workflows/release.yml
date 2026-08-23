@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # Retry a publish (or a rebuild) without minting a new version tag --
+  # used when a platform package is already on the registry and only the
+  # remaining ones / the main shim still need to go out.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -176,7 +180,7 @@ jobs:
     # tag exercise the full cross-platform build matrix as a smoke test
     # without pushing anything to the registry -- the build job still runs
     # for every tag; only this publish step is gated.
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -200,13 +204,44 @@ jobs:
 
       - name: Publish platform packages
         run: |
+          set -euo pipefail
+          publish_one() {
+            local dir="$1"
+            local name ver
+            name=$(node -p "require('./npm/${dir}/package.json').name")
+            ver=$(node -p "require('./npm/${dir}/package.json').version")
+            if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+              echo "skip ${name}@${ver} -- already on the registry"
+              return 0
+            fi
+            # First-time package names can trip npm's spam filter (we hit this
+            # on agent-hop-win32-x64). Retry a few times before failing the job.
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if npm publish "./npm/${dir}" --access public; then
+                return 0
+              fi
+              echo "publish ${name}@${ver} failed (attempt ${attempt}); waiting 30s"
+              sleep 30
+            done
+            echo "giving up on ${name}@${ver}"
+            return 1
+          }
           for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
-            npm publish ./npm/$dir --access public
+            publish_one "$dir"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main shim package
-        run: npm publish --access public
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+            echo "skip ${name}@${ver} -- already on the registry"
+            exit 0
+          fi
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

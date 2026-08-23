@@ -127,20 +127,29 @@ fn main() {
     // build.zig.zon so it stays truthful if GHOSTTY_COMMIT is ever bumped.
     let ghostty_version = read_ghostty_version(&src_dir);
 
-    // Keep Zig's caches on the same drive as the source we're building.
-    // Zig 0.15.2's build runner (std.Build.Step.Run.convertPathArg) asserts
-    // that a Run step's path args can be made relative to the child's cwd,
-    // and hits `unreachable` when they can't -- which on Windows happens
-    // whenever two paths live on different drive letters (Zig 0.16 later
-    // rewrote this to handle it gracefully). On GitHub's Windows runners the
-    // workspace is on D:\ but Zig's default global cache is under the user
-    // profile on C:\, so Ghostty's Windows-only `combine_archives` Run step
-    // straddles two drives and crashes the whole build. Pointing both caches
-    // at dirs beside the source (same drive) keeps every path on one drive
-    // and sidesteps the assertion. Harmless on macOS/Linux (single-rooted
-    // filesystems), so unconditional.
-    let local_cache = cache_root.join("zig-local-cache");
-    let global_cache = cache_root.join("zig-global-cache");
+    // Keep Zig's caches on the same drive as the source we're building, but
+    // *outside* target/ so CI's Rust cache (which caches target/) never
+    // saves or restores them.
+    //
+    // Same-drive: Zig 0.15.2's build runner (std.Build.Step.Run
+    // .convertPathArg) asserts a Run step's path args can be made relative to
+    // the child's cwd and hits `unreachable` when they can't -- which on
+    // Windows happens whenever two paths are on different drive letters (Zig
+    // 0.16 later handles it gracefully). GitHub's Windows workspace is on D:\
+    // but Zig's default global cache is under the user profile on C:\, so
+    // Ghostty's Windows-only combine_archives step straddled two drives and
+    // crashed. Rooting both caches at the manifest dir (same drive as the
+    // source under target/) keeps every path on one drive.
+    //
+    // Outside target/: Zig's build cache and its fetched-package state (e.g.
+    // uucode's generated `tables.zig` lazypath) do NOT survive being archived
+    // and restored by a generic cache action -- a restored copy panics with
+    // "unable to find named lazypath". These caches must be regenerated each
+    // run, so they live here where the Rust dep cache won't touch them; the
+    // heavy, cacheable cost (the Rust dependency tree) is cached separately.
+    let zig_cache_root = manifest_dir.join(".zig-cache-ah");
+    let local_cache = zig_cache_root.join("local");
+    let global_cache = zig_cache_root.join("global");
     let _ = fs::create_dir_all(&local_cache);
     let _ = fs::create_dir_all(&global_cache);
 

@@ -69,10 +69,16 @@ jobs:
         with:
           # Per-target bucket: matrix jobs share the job name and differ only
           # by --target (passed on the CLI, which rust-cache doesn't see), so
-          # without this their caches would collide. build.rs hash busts the
-          # vt cache when GHOSTTY_COMMIT changes.
-          key: ${{ matrix.target }}-vt-${{ hashFiles('build.rs') }}
-          cache-directories: target/ghostty-vt-src
+          # without this their caches would collide.
+          #
+          # Only the Rust dependency tree is cached (rust-cache's default
+          # ~/.cargo + target/ deps) -- that's the bulk of the build time.
+          # We deliberately do NOT cache the Ghostty source or Zig build
+          # caches: Zig's cache + fetched-package state doesn't survive
+          # archive/restore (a restored copy panics with "unable to find
+          # named lazypath 'tables.zig'"), so libghostty-vt is rebuilt each
+          # run from a fresh Zig cache kept outside target/ (see build.rs).
+          key: ${{ matrix.target }}
 
       # Cache the Zig toolchain itself (download + extract, ~1min on Windows)
       # so repeat runs skip re-fetching it. The install steps below check for

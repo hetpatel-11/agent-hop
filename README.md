@@ -2,22 +2,26 @@ https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
 *In demo: hopping Claude Code → Grok → Pi → OpenCode → Codex, in that order.*
 
-**Search all your coding-agent chats, then continue any session in any agent.**
+**A runtime for coding-agent harnesses.** Run Claude Code, Codex, OpenCode, Pi, and Grok inside one terminal, hop a live session between them, and search or resume any local chat.
 
 # agent-hop
 
-Your best coding-agent context is probably trapped in the wrong tool.
+`ah` is the process you start. The harness runs inside it.
 
-`agent-hop` (`ah`) is a native Rust CLI. It wraps Claude Code, Codex, OpenCode, Pi, and Grok in one terminal, searches their local history from one picker, and hops a live conversation into another agent's native session format — tool calls and attachments included, not a summary.
+Claude Code, Codex, OpenCode, Pi, and Grok each have their own CLI, their own session files, and their own idea of "resume." None of them can take over a conversation another one just had. `agent-hop` is the runtime around those harnesses: a native Rust binary that opens the real agent in a pty, keeps a strip of chrome `ah` owns, and can move the live thread into the next harness without you leaving the terminal or starting over.
 
-Use it when you remember the topic, but not the tool, the project folder, or the exact session.
+You work the way you already do. `claude` is still `claude`. Codex is still Codex. `ah` does not reimplement them, proxy their APIs, or invent a new agent. It is the host — PTY, Ghostty's VT engine, hop, search — and they are the guests.
 
-- **One search box for every agent** — hybrid search over local Claude Code, Codex, OpenCode, Pi, and Grok history.
-- **Resume the real thread** — same-agent resume uses that tool's own session. No re-explaining.
-- **Hop mid-conversation** — switch agents without starting over. The next tool gets the actual turns, including shell/file/MCP calls and file attachments.
-- **The real agent, not a clone** — each tool still runs as itself in a pty. `ah` owns the chrome (toggle bar, hop, search), not the agent.
-- **Interactive or scripted** — humans get a TUI; agents and CI call `ah resume` non-interactively.
-- **Sessions stay on disk** — search and conversion read the same local files the agents write. Semantic search runs on your machine.
+When you hop Claude Code → Grok → Pi → OpenCode → Codex, the runtime finds the session the current harness just wrote for this project, translates the actual turns into the next harness's native format, and launches that harness's own resume command. Tool calls (shell, file edits, MCP) and attachments (images, PDFs) go with the thread. It is not a pasted summary.
+
+Search and resume are part of the same runtime, not a separate product. Every harness writes history to disk in its own shape. `ah` indexes all of it locally — BM25 as you type, MiniLM when you pause — so you can pull up a thread you remember by topic, not by which tool or folder held it. `Ctrl+R` resumes in the same harness. A hop, or `ah resume -r`, continues it in a different one.
+
+- **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
+- **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format.
+- **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
+- **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
+- **Interactive or scripted** — humans stay in the TUI. Agents and CI call `ah resume` without a picker.
+- **Sessions never leave disk** — hop and search read the same files the harnesses already write. Telemetry, if left on, is aggregate usage only.
 
 ## Install
 
@@ -41,7 +45,7 @@ npm is a binary CDN here, not a JavaScript app. The package is a tiny Node shim 
 
 Supported prebuilds: macOS arm64/x64, Linux x64/arm64, Windows x64. Windows: use npm, or download `agent-hop-windows-x64` from the [npm registry](https://www.npmjs.com/package/agent-hop-windows-x64).
 
-`ah` launches agents; it does not install them. The agent you hop into must already be on your `PATH`.
+`ah` is the runtime, not an installer. The harness you hop into must already be on your `PATH`.
 
 Anonymous usage telemetry is on by default (no queries, paths, or chat content). Turn it off with `ah telemetry off` or `AH_TELEMETRY=0`. Details: https://agent-hop.com/telemetry
 
@@ -51,7 +55,7 @@ Anonymous usage telemetry is on by default (no queries, paths, or chat content).
 ah
 ```
 
-Pick an agent, then work as usual. `ah` sits around that process:
+Start the runtime, pick a harness, then work as usual. That harness is a child process; `ah` is the host:
 
 | Shortcut | What it does |
 |---|---|
@@ -103,7 +107,7 @@ ah telemetry on
 
 ## Architecture
 
-`ah` is one binary with four jobs: wrap the real agent, search local history, translate a session into another tool's format, and get out of the way.
+`ah` is a runtime: host the real harness, search the history those harnesses already wrote, translate a live session into another harness's format, and stay out of the way.
 
 ```
 you ──► ah (picker / TUI chrome)

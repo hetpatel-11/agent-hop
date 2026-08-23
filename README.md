@@ -1,6 +1,6 @@
 https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
-*In demo: a Claude Code session, continued in Codex — as it is.*
+*In demo: hopping Claude Code → Grok → Pi → OpenCode → Codex, in that order.*
 
 **Search all your coding-agent chats, then continue any session in any agent.**
 

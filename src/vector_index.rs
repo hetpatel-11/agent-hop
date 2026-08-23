@@ -51,9 +51,6 @@ fn save_index(index: &HashMap<String, SessionEntry>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
 fn char_len(s: &str) -> usize {
     s.chars().count()
 }

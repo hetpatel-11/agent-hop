@@ -453,9 +453,6 @@ fn resume_cmd_impl(session_id: &str, _project_path: &str) -> Vec<String> {
 pub struct PiAdapter;
 
 impl Adapter for PiAdapter {
-    fn tool(&self) -> ToolName {
-        ToolName::Pi
-    }
     fn list_sessions(&self) -> anyhow::Result<Vec<SessionRef>> {
         list_sessions()
     }

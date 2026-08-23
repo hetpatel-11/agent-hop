@@ -74,7 +74,6 @@ pub struct SessionRef {
 }
 
 pub trait Adapter {
-    fn tool(&self) -> ToolName;
     fn list_sessions(&self) -> anyhow::Result<Vec<SessionRef>>;
     fn read(&self, session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>>;
     fn write(&self, turns: &[Turn], project_path: &str) -> anyhow::Result<String>;

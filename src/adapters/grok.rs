@@ -626,9 +626,6 @@ fn resume_cmd_impl(session_id: &str, _project_path: &str) -> Vec<String> {
 pub struct GrokAdapter;
 
 impl Adapter for GrokAdapter {
-    fn tool(&self) -> ToolName {
-        ToolName::Grok
-    }
     fn list_sessions(&self) -> anyhow::Result<Vec<SessionRef>> {
         list_sessions()
     }

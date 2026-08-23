@@ -236,6 +236,11 @@ impl Terminal {
     /// user's own keystrokes (see `InputSink::Forward` in tui.rs) -- the
     /// terminal needs it too, to answer queries (DA/DSR and similar) on
     /// the child's behalf, exactly like a real terminal would.
+    /// Test-only wrapper around `with_host_colors` with no host palette --
+    /// the live TUI always goes through `with_host_colors` after querying
+    /// OSC 10/11. Kept so unit tests can construct a model without a real
+    /// terminal.
+    #[cfg(test)]
     pub fn new(cols: u16, rows: u16, writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         Self::with_host_colors(cols, rows, writer, None, None)
     }

@@ -50,10 +50,6 @@ fn extract_semver(s: &str) -> Option<String> {
     None
 }
 
-fn pad(n: u32) -> String {
-    format!("{n:02}")
-}
-
 fn codex_image_blocks(attachments: &[Attachment]) -> Vec<Value> {
     attachments
         .iter()
@@ -508,9 +504,6 @@ fn resume_cmd_impl(session_id: &str, _project_path: &str) -> Vec<String> {
 pub struct CodexAdapter;
 
 impl Adapter for CodexAdapter {
-    fn tool(&self) -> ToolName {
-        ToolName::Codex
-    }
     fn list_sessions(&self) -> anyhow::Result<Vec<SessionRef>> {
         list_sessions()
     }

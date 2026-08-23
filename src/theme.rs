@@ -14,9 +14,6 @@ pub fn bold(s: &str) -> String {
 pub fn yellow(s: &str) -> String {
     wrap("33", "39", s)
 }
-pub fn cyan(s: &str) -> String {
-    wrap("36", "39", s)
-}
 pub fn orange(s: &str) -> String {
     wrap("38;5;208", "39", s)
 }
@@ -89,10 +86,6 @@ pub const GREY_RATATUI: ratatui::style::Color = ratatui::style::Color::Indexed(2
 
 /// agent-hop.com's brand cyan (#22d3ee) as RGB, for `ratatui::style::Color::Rgb`.
 pub const BRAND_RGB: (u8, u8, u8) = (34, 211, 238);
-
-pub fn highlight_date(date_str: &str) -> String {
-    bold(&cyan(date_str))
-}
 
 /// "agent hop" in the same block-letter style (ANSI Shadow) the original
 /// TypeScript version rendered via `figlet`, generated once with the real

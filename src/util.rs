@@ -5,7 +5,7 @@
 //! source, since they document non-obvious behavior that was hit and fixed
 //! against real generated sessions, not theorized.
 
-use crate::adapters::{Role, Turn, ToolCallRecord};
+use crate::adapters::{Role, Turn};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -360,78 +360,6 @@ pub fn to_tool_input_object(input: &str) -> Value {
     }
 }
 
-/// Every real coding-agent tool call whose input is a shell/exec-style
-/// invocation is keyed the same handful of ways across agents (Codex's
-/// exec_command uses "cmd", Claude's Bash tool uses "command", etc.) --
-/// pulling the actual command out and rendering it as a real shell block is
-/// what makes it read like a native tool call instead of a JSON envelope
-/// dump. `description` is common alongside it (a human-readable one-liner
-/// of intent) and reads naturally as a comment above the command, matching
-/// how agents already narrate "why" before "what".
-fn extract_shell_command(parsed: &Value) -> Option<(String, Option<String>)> {
-    let obj = parsed.as_object()?;
-    for key in ["command", "cmd", "script"] {
-        if let Some(Value::String(cmd)) = obj.get(key) {
-            let description = obj
-                .get("description")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string());
-            return Some((cmd.clone(), description));
-        }
-    }
-    None
-}
-
-/// Renders tool calls as a plain-text block -- the shared fallback shape
-/// for cross-agent conversion (native write() paths) and for --print's
-/// output, since no structured tool_use/tool_result schema is portable
-/// across all five agents' formats. Deliberately terse and consistent
-/// regardless of which agent originally made the call.
-///
-/// Every target TUI renders markdown in assistant messages (that's how
-/// they render their own tool output), so real code fences read as a
-/// proper formatted block instead of a raw inline JSON dump -- which is
-/// what the plain "[tool call: x]\ninput: {...}" version produced, and
-/// looked like an unstyled wall of text next to everything else the TUI
-/// renders normally. The JSON itself also needs pretty-printing: a raw
-/// single-line stringified arguments blob (escaped quotes, embedded
-/// newlines as literal \n) reads as an unreadable wall of text even inside
-/// a fence -- confirmed genuinely bad by looking at a real screenshot of a
-/// resumed tool call, not just theorized.
-pub fn render_tool_calls(tool_calls: Option<&[ToolCallRecord]>) -> String {
-    let Some(tcs) = tool_calls else {
-        return String::new();
-    };
-    if tcs.is_empty() {
-        return String::new();
-    }
-    tcs.iter()
-        .map(|tc| {
-            let parsed: Option<Value> = serde_json::from_str(&tc.input).ok();
-            let input = if let Some(p) = &parsed {
-                if let Some((cmd, desc)) = extract_shell_command(p) {
-                    let comment = desc.map(|d| format!("# {d}\n")).unwrap_or_default();
-                    format!("```bash\n{comment}{cmd}\n```")
-                } else {
-                    format!(
-                        "```json\n{}\n```",
-                        serde_json::to_string_pretty(p).unwrap_or_default()
-                    )
-                }
-            } else {
-                format!("```\n{}\n```", tc.input)
-            };
-            let output = tc
-                .output
-                .as_ref()
-                .map(|o| format!("\nOutput:\n```\n{o}\n```"))
-                .unwrap_or_default();
-            format!("**Tool call: `{}`**\n{input}{output}", tc.name)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 // Full tool-call I/O (now preserved in full, not just narration text) can
 // make a real long-running session's converted size enormous -- a real
 // 547-turn session measured at ~3.3M characters (~820k estimated tokens),
@@ -463,6 +391,10 @@ fn turn_char_count(t: &Turn) -> usize {
 /// the budget -- they're usually tokenized far more efficiently than raw
 /// text per byte, and excluding them keeps this from over-trimming a
 /// conversation just because it happened to have a couple of screenshots.
+/// Live hops use `trim_turns_with_summary` (same cut, plus a digest of
+/// what was dropped). This is the cut-only helper, compiled in tests so
+/// the budget math can be asserted without going through the summary path.
+#[cfg(test)]
 pub fn trim_turns_to_budget(turns: Vec<Turn>, budget: usize) -> (Vec<Turn>, usize) {
     let mut total = 0usize;
     let mut cut_index = turns.len();
@@ -595,23 +527,10 @@ pub fn iso_string_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-/// Port of the TS `isoNow()` -- note this reproduces its exact (slightly
-/// unusual) truncation: `toISOString()` then drop the trailing "Z", drop
-/// the last 3 characters (the milliseconds digits), then re-append "Z",
-/// leaving a trailing ".Z" with no milliseconds. Ported literally rather
-/// than "fixed" since a target agent's on-disk format may depend on the
-/// exact string shape this has always produced.
-pub fn iso_now() -> String {
-    let s = iso_string_now();
-    let without_z = s.trim_end_matches('Z');
-    let truncated = &without_z[..without_z.len().saturating_sub(3)];
-    format!("{truncated}Z")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::Role;
+    use crate::adapters::{Role, ToolCallRecord};
 
     #[test]
     fn sanitize_tool_name_strips_leading_trailing_punctuation() {

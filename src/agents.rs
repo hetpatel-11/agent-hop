@@ -51,17 +51,6 @@ impl ToolName {
         }
     }
 
-    /// Domain used for the context.dev brand/logo lookup.
-    pub fn brand_domain(&self) -> &'static str {
-        match self {
-            ToolName::Claude => "anthropic.com",
-            ToolName::Codex => "openai.com",
-            ToolName::OpenCode => "opencode.ai",
-            ToolName::Pi => "heypi.com",
-            ToolName::Grok => "x.ai",
-        }
-    }
-
     pub fn install_command(&self) -> (&'static str, &'static [&'static str]) {
         match self {
             ToolName::Claude => ("npm", &["install", "-g", "@anthropic-ai/claude-code"]),

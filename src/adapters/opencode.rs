@@ -465,9 +465,6 @@ fn resume_cmd_impl(session_id: &str, _project_path: &str) -> Vec<String> {
 pub struct OpenCodeAdapter;
 
 impl Adapter for OpenCodeAdapter {
-    fn tool(&self) -> ToolName {
-        ToolName::OpenCode
-    }
     fn list_sessions(&self) -> anyhow::Result<Vec<SessionRef>> {
         list_sessions()
     }

@@ -56,6 +56,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The release build is dominated by compiling the Rust dependency tree
+      # (ort/ONNX, tokenizers, reqwest, ratatui, ...) from scratch -- ~6.5min
+      # on Windows with a cold cache. rust-cache restores ~/.cargo and the
+      # compiled deps in target/, and we add target/ghostty-vt-src so the
+      # downloaded Ghostty source + Zig-built libghostty-vt (the heavy C++
+      # simdutf/highway compile) are cached too. Keyed to include build.rs's
+      # hash so bumping GHOSTTY_COMMIT invalidates the vt cache. This
+      # workflow only runs on release tags, so the payoff is release-over-
+      # release (deps rarely change between tags), not the very first run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-target bucket: matrix jobs share the job name and differ only
+          # by --target (passed on the CLI, which rust-cache doesn't see), so
+          # without this their caches would collide. build.rs hash busts the
+          # vt cache when GHOSTTY_COMMIT changes.
+          key: ${{ matrix.target }}-vt-${{ hashFiles('build.rs') }}
+          cache-directories: target/ghostty-vt-src
+
+      # Cache the Zig toolchain itself (download + extract, ~1min on Windows)
+      # so repeat runs skip re-fetching it. The install steps below check for
+      # a restored copy before downloading.
+      - name: Cache Zig 0.15.2
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: zig-toolchain
+          key: zig-0.15.2-${{ matrix.zig-host }}
+
       # build.rs compiles libghostty-vt with Zig, pinned to 0.15.2 (the
       # commit's minimum_zig_version). We download the official build
       # directly instead of using mlugg/setup-zig: that action's only
@@ -73,15 +101,19 @@ jobs:
         run: |
           set -euo pipefail
           SLUG="${{ matrix.zig-host }}"
-          FILE="zig-${SLUG}-0.15.2.tar.xz"
-          echo "Downloading $FILE"
-          curl -fL --retry 6 --retry-all-errors --retry-delay 10 \
-            -o "$FILE" "https://ziglang.org/download/0.15.2/$FILE"
-          mkdir -p "$HOME/zig-install"
-          tar -xf "$FILE" -C "$HOME/zig-install"
-          ZIG_DIR="$HOME/zig-install/zig-${SLUG}-0.15.2"
-          echo "ZIG=$ZIG_DIR/zig" >> "$GITHUB_ENV"
-          "$ZIG_DIR/zig" version
+          DIR="zig-toolchain/zig-${SLUG}-0.15.2"
+          if [ ! -x "$DIR/zig" ]; then
+            FILE="zig-${SLUG}-0.15.2.tar.xz"
+            echo "Downloading $FILE"
+            curl -fL --retry 6 --retry-all-errors --retry-delay 10 \
+              -o "$FILE" "https://ziglang.org/download/0.15.2/$FILE"
+            mkdir -p zig-toolchain
+            tar -xf "$FILE" -C zig-toolchain
+          else
+            echo "Using cached Zig at $DIR"
+          fi
+          echo "ZIG=$PWD/$DIR/zig" >> "$GITHUB_ENV"
+          "$PWD/$DIR/zig" version
 
       # Separate step: on the Windows runner `bash` is Git-Bash, whose `tar`
       # is GNU tar and can't extract a .zip. Use PowerShell's native
@@ -93,12 +125,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $slug = '${{ matrix.zig-host }}'
-          $file = "zig-$slug-0.15.2.zip"
-          Write-Host "Downloading $file"
-          curl.exe -fL --retry 6 --retry-all-errors --retry-delay 10 `
-            -o $file "https://ziglang.org/download/0.15.2/$file"
-          Expand-Archive -Path $file -DestinationPath "$env:USERPROFILE\zig-install" -Force
-          $zigExe = "$env:USERPROFILE\zig-install\zig-$slug-0.15.2\zig.exe"
+          $dir = "zig-toolchain\zig-$slug-0.15.2"
+          if (-not (Test-Path "$dir\zig.exe")) {
+            $file = "zig-$slug-0.15.2.zip"
+            Write-Host "Downloading $file"
+            curl.exe -fL --retry 6 --retry-all-errors --retry-delay 10 `
+              -o $file "https://ziglang.org/download/0.15.2/$file"
+            Expand-Archive -Path $file -DestinationPath zig-toolchain -Force
+          } else {
+            Write-Host "Using cached Zig at $dir"
+          }
+          $zigExe = "$PWD\$dir\zig.exe"
           & $zigExe version
           "ZIG=$zigExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 

@@ -1,4 +1,4 @@
-https://github.com/user-attachments/assets/e80fbf5b-a899-4da2-a41f-43e1d6248d75
+https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
 *In demo: a Claude Code session, continued in Codex — as it is.*
 
@@ -50,6 +50,8 @@ folder isn't on your `PATH` yet -- add it (once) and reload your shell:
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
 ```
+
+Anonymous usage telemetry is on by default (no queries, paths, or chat content). Turn it off with `ah telemetry off` or `AH_TELEMETRY=0`. Details: https://agent-hop.com/telemetry
 
 ## Usage
 

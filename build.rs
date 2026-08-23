@@ -70,6 +70,30 @@ fn download_and_extract(cache_dir: &Path) {
     let _ = fs::remove_dir_all(&tmp_extract);
 }
 
+/// Reads Ghostty's declared version out of its `build.zig.zon` (the
+/// `.version = "X.Y.Z..."` line). Used to pass `-Dversion-string` so the
+/// build never falls into git-based version detection. Falls back to a
+/// valid placeholder semver if the field can't be read -- any valid
+/// semantic version works, since it's only cosmetic for an embedded
+/// libghostty-vt.
+fn read_ghostty_version(src_dir: &Path) -> String {
+    let zon = src_dir.join("build.zig.zon");
+    if let Ok(content) = fs::read_to_string(&zon) {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix(".version") {
+                // rest looks like: = "1.3.2-dev",
+                if let Some(open) = rest.find('"') {
+                    if let Some(close) = rest[open + 1..].find('"') {
+                        return rest[open + 1..open + 1 + close].to_string();
+                    }
+                }
+            }
+        }
+    }
+    "0.0.0".to_string()
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ZIG");
@@ -90,11 +114,25 @@ fn main() {
 
     let lib_out = src_dir.join("zig-out-agent-hop");
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
+
+    // Pin the version explicitly so Ghostty's build.zig skips its git-based
+    // version detection entirely. Without this, that detection runs `git`
+    // with the extracted source dir as cwd -- and since we cache that dir
+    // under our own `target/`, git walks *up* into agent-hop's own repo. If
+    // agent-hop's HEAD happens to sit on a tag (exactly what a release build
+    // does), Ghostty sees a tag that isn't its own `vX.Y.Z` and hard-panics
+    // ("tagged releases must be in vX.Y.Z format"). Passing -Dversion-string
+    // takes the git path out of the picture. The value is cosmetic for an
+    // embedded libghostty-vt; we read Ghostty's own declared version from
+    // build.zig.zon so it stays truthful if GHOSTTY_COMMIT is ever bumped.
+    let ghostty_version = read_ghostty_version(&src_dir);
+
     let mut cmd = Command::new(&zig);
     cmd.arg("build")
         .arg("-Demit-lib-vt")
         .arg(format!("-Doptimize={optimize}"))
         .arg(format!("-Dtarget={target_zig}"))
+        .arg(format!("-Dversion-string={ghostty_version}"))
         .arg("-Demit-xcframework=false")
         .arg("--prefix")
         .arg(&lib_out)

@@ -61,31 +61,40 @@ jobs:
       # point of failure. We set $ZIG (which build.rs reads) to an absolute
       # path rather than touching PATH, so it works regardless of the shell
       # the later cargo step runs in (pwsh on Windows).
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.15.2 (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           SLUG="${{ matrix.zig-host }}"
-          BASE="https://ziglang.org/download/0.15.2"
-          if [[ "$SLUG" == *windows* ]]; then
-            FILE="zig-${SLUG}-0.15.2.zip"
-          else
-            FILE="zig-${SLUG}-0.15.2.tar.xz"
-          fi
-          echo "Downloading $BASE/$FILE"
-          curl -fL --retry 6 --retry-all-errors --retry-delay 10 -o "$FILE" "$BASE/$FILE"
+          FILE="zig-${SLUG}-0.15.2.tar.xz"
+          echo "Downloading $FILE"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 10 \
+            -o "$FILE" "https://ziglang.org/download/0.15.2/$FILE"
           mkdir -p "$HOME/zig-install"
-          # bsdtar (present on all runners, incl. Windows) extracts both
-          # .tar.xz and .zip.
           tar -xf "$FILE" -C "$HOME/zig-install"
           ZIG_DIR="$HOME/zig-install/zig-${SLUG}-0.15.2"
-          if [[ "$SLUG" == *windows* ]]; then
-            echo "ZIG=$(cygpath -w "$ZIG_DIR/zig.exe")" >> "$GITHUB_ENV"
-            "$ZIG_DIR/zig.exe" version
-          else
-            echo "ZIG=$ZIG_DIR/zig" >> "$GITHUB_ENV"
-            "$ZIG_DIR/zig" version
-          fi
+          echo "ZIG=$ZIG_DIR/zig" >> "$GITHUB_ENV"
+          "$ZIG_DIR/zig" version
+
+      # Separate step: on the Windows runner `bash` is Git-Bash, whose `tar`
+      # is GNU tar and can't extract a .zip. Use PowerShell's native
+      # Expand-Archive instead, and set $ZIG to a Windows-style absolute path
+      # so build.rs's std::process::Command can exec it regardless of shell.
+      - name: Install Zig 0.15.2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $slug = '${{ matrix.zig-host }}'
+          $file = "zig-$slug-0.15.2.zip"
+          Write-Host "Downloading $file"
+          curl.exe -fL --retry 6 --retry-all-errors --retry-delay 10 `
+            -o $file "https://ziglang.org/download/0.15.2/$file"
+          Expand-Archive -Path $file -DestinationPath "$env:USERPROFILE\zig-install" -Force
+          $zigExe = "$env:USERPROFILE\zig-install\zig-$slug-0.15.2\zig.exe"
+          & $zigExe version
+          "ZIG=$zigExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # bindgen (used by build.rs to generate libghostty-vt's Rust bindings)
       # needs libclang at build time. macOS/Linux runners already have it

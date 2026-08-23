@@ -68,6 +68,12 @@ jobs:
 
   publish:
     needs: build
+    # Only publish to npm for real release tags (v1.2.3), never for
+    # pre-release tags (v1.2.3-rc1, -beta, etc.). This lets a pre-release
+    # tag exercise the full cross-platform build matrix as a smoke test
+    # without pushing anything to the registry -- the build job still runs
+    # for every tag; only this publish step is gated.
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

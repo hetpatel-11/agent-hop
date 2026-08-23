@@ -48,6 +48,6 @@
     "agent-hop-darwin-x64": "0.1.0",
     "agent-hop-linux-x64": "0.1.0",
     "agent-hop-linux-arm64": "0.1.0",
-    "agent-hop-win32-x64": "0.1.0"
+    "agent-hop-windows-x64": "0.1.0"
   }
 }

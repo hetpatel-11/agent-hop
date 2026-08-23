@@ -12,7 +12,7 @@ const PLATFORM_PACKAGES = {
   "darwin-x64": "agent-hop-darwin-x64",
   "linux-x64": "agent-hop-linux-x64",
   "linux-arm64": "agent-hop-linux-arm64",
-  "win32-x64": "agent-hop-win32-x64",
+  "win32-x64": "agent-hop-windows-x64",
 };
 
 const key = `${process.platform}-${process.arch}`;

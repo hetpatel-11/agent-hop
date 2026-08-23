@@ -127,6 +127,23 @@ fn main() {
     // build.zig.zon so it stays truthful if GHOSTTY_COMMIT is ever bumped.
     let ghostty_version = read_ghostty_version(&src_dir);
 
+    // Keep Zig's caches on the same drive as the source we're building.
+    // Zig 0.15.2's build runner (std.Build.Step.Run.convertPathArg) asserts
+    // that a Run step's path args can be made relative to the child's cwd,
+    // and hits `unreachable` when they can't -- which on Windows happens
+    // whenever two paths live on different drive letters (Zig 0.16 later
+    // rewrote this to handle it gracefully). On GitHub's Windows runners the
+    // workspace is on D:\ but Zig's default global cache is under the user
+    // profile on C:\, so Ghostty's Windows-only `combine_archives` Run step
+    // straddles two drives and crashes the whole build. Pointing both caches
+    // at dirs beside the source (same drive) keeps every path on one drive
+    // and sidesteps the assertion. Harmless on macOS/Linux (single-rooted
+    // filesystems), so unconditional.
+    let local_cache = cache_root.join("zig-local-cache");
+    let global_cache = cache_root.join("zig-global-cache");
+    let _ = fs::create_dir_all(&local_cache);
+    let _ = fs::create_dir_all(&global_cache);
+
     let mut cmd = Command::new(&zig);
     cmd.arg("build")
         .arg("-Demit-lib-vt")
@@ -134,6 +151,10 @@ fn main() {
         .arg(format!("-Dtarget={target_zig}"))
         .arg(format!("-Dversion-string={ghostty_version}"))
         .arg("-Demit-xcframework=false")
+        .arg("--cache-dir")
+        .arg(&local_cache)
+        .arg("--global-cache-dir")
+        .arg(&global_cache)
         .arg("--prefix")
         .arg(&lib_out)
         .current_dir(&src_dir);

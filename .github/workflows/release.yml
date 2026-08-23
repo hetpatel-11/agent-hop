@@ -8,6 +8,10 @@ on:
 jobs:
   build:
     strategy:
+      # One platform failing (often a transient Zig-mirror outage during
+      # setup, not our code) shouldn't cancel the other four -- we want to
+      # see every platform's real result independently.
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -38,6 +42,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # build.rs compiles libghostty-vt with Zig, pinned to 0.15.2 (the
+      # commit's minimum_zig_version). setup-zig retries across several
+      # community mirrors internally; combined with fail-fast: false above,
+      # a transient mirror outage on one platform no longer cancels the
+      # rest -- just re-run that single job.
       - uses: mlugg/setup-zig@v1
         with:
           version: "0.15.2"

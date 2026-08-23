@@ -71,10 +71,8 @@ pub struct UpdateInfo {
 
 /// Cached, network-optional version check. Never panics, never blocks
 /// longer than `FETCH_TIMEOUT`, and only hits the registry once per
-/// `CHECK_INTERVAL_SECS`. Simplified from the original TS version's
-/// interactive "update now or later?" prompt to a plain informational
-/// message -- printing one doesn't need a whole new interactive UI
-/// component the way an inline select would.
+/// `CHECK_INTERVAL_SECS`. The interactive "update now or later?" prompt
+/// lives in `prompt_and_maybe_update`.
 pub async fn check_for_update() -> UpdateInfo {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let cache = read_cache();
@@ -92,6 +90,127 @@ pub async fn check_for_update() -> UpdateInfo {
 
     let update_available = is_newer(&latest, &current);
     UpdateInfo { current, latest, update_available }
+}
+
+/// Interactive `Update now` / `Later` picker -- same two options the
+/// original TS CLI showed via clack `p.select`. Returns `true` if the
+/// user chose to update (caller should exit so they re-run the new
+/// binary); `false` if they picked Later, cancelled, or the picker
+/// itself failed (never block a launch on this).
+pub fn prompt_and_maybe_update(info: &UpdateInfo) -> bool {
+    match pick_update_now_or_later(info) {
+        Ok(true) => {
+            run_update();
+            println!("Updated. Run `ah` again to use the new version.");
+            true
+        }
+        Ok(false) | Err(_) => false,
+    }
+}
+
+fn pick_update_now_or_later(info: &UpdateInfo) -> anyhow::Result<bool> {
+    use crate::theme;
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        execute, queue,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+        terminal::{self, ClearType},
+    };
+    use std::io::{stdout, Write};
+
+    let options: [&str; 2] = ["Update now (recommended)", "Later"];
+    let hints: [&str; 2] = ["npm/bun install -g, then re-run ah", ""];
+    let mut selected: usize = 0;
+
+    let mut out = stdout();
+    terminal::enable_raw_mode()?;
+    execute!(out, cursor::Hide)?;
+
+    let result = (|| -> anyhow::Result<bool> {
+        let render = |out: &mut std::io::Stdout, selected: usize| -> anyhow::Result<()> {
+            queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
+            queue!(
+                out,
+                Print(format!(
+                    "{} {}\r\n",
+                    theme::bold(&theme::magenta("◆")),
+                    theme::bold(&format!(
+                        "A new version of agent-hop is available ({} → {}).",
+                        info.current, info.latest
+                    ))
+                ))
+            )?;
+            for (i, label) in options.iter().enumerate() {
+                let marker = if i == selected { "❯" } else { " " };
+                let hint = if hints[i].is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", theme::grey(hints[i]))
+                };
+                if i == selected {
+                    queue!(out, SetForegroundColor(Color::Cyan))?;
+                    queue!(out, Print(format!("{marker} {label}{hint}\r\n")))?;
+                    queue!(out, ResetColor)?;
+                } else {
+                    queue!(out, Print(format!("{} {}\r\n", marker, theme::grey(label))))?;
+                }
+            }
+            queue!(
+                out,
+                Print(format!("{}\r\n", theme::grey("  ↑/↓ move · enter select · esc later")))
+            )?;
+            queue!(out, cursor::MoveUp((options.len() + 2) as u16))?;
+            out.flush()?;
+            Ok(())
+        };
+
+        render(&mut out, selected)?;
+
+        loop {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Down => {
+                        selected = 1 - selected;
+                        render(&mut out, selected)?;
+                    }
+                    KeyCode::Enter => return Ok(selected == 0),
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })();
+
+    let _ = queue!(out, terminal::Clear(ClearType::FromCursorDown), cursor::Show);
+    let _ = out.flush();
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+/// Runs the global reinstall with visible output. Tries npm first (the
+/// documented default install path); if that fails outright (e.g. this was
+/// actually installed via bun and npm's global root doesn't have it), falls
+/// back to bun rather than leaving the user stuck. Never panics -- worst
+/// case is "update now" silently does nothing and they're no worse off
+/// than before. Ported from the TS `runUpdate`.
+fn run_update() {
+    let npm_ok = std::process::Command::new("npm")
+        .args(["install", "-g", "agent-hop@latest"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !npm_ok {
+        let _ = std::process::Command::new("bun")
+            .args(["install", "-g", "agent-hop@latest"])
+            .status();
+    }
 }
 
 #[cfg(test)]

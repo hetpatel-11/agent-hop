@@ -74,11 +74,8 @@ async fn main() -> anyhow::Result<()> {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             let info = update_check::check_for_update().await;
-            if info.update_available {
-                println!(
-                    "A new version of agent-hop is available ({} → {}). Run `npm install -g agent-hop@latest` (or the bun/pnpm equivalent) to update.",
-                    info.current, info.latest
-                );
+            if info.update_available && update_check::prompt_and_maybe_update(&info) {
+                return Ok(());
             }
         }
     }

@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-hop-telemetry",
+  "main": "worker.js",
+  "compatibility_date": "2025-08-01",
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-hop-telemetry",
+      "database_id": "2d6c3762-33fb-4876-8b69-4a275fe1723b"
+    }
+  ],
+  "routes": [
+    { "pattern": "telemetry.agent-hop.com", "custom_domain": true }
+  ]
+}

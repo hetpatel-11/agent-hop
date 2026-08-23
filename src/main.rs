@@ -9,6 +9,7 @@ mod fuzzy;
 mod theme;
 mod vector_index;
 mod resume;
+mod telemetry;
 mod update_check;
 mod vt;
 
@@ -45,6 +46,11 @@ enum Commands {
         #[arg(short = 'r', long = "resume-in")]
         resume_in: Option<String>,
     },
+    /// Show or change anonymous usage telemetry (on by default).
+    Telemetry {
+        /// `status` (default), `on`, or `off`
+        action: Option<String>,
+    },
     /// Hidden: runs the semantic-index build in-process. Never invoked
     /// directly by a user -- search.rs spawns this detached from the
     /// interactive CLI whenever there's unindexed content, so indexing
@@ -77,6 +83,39 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The telemetry control command isn't a session -- handle and exit
+    // before we init telemetry or emit a launch event.
+    if let Some(Commands::Telemetry { action }) = &cli.command {
+        match action.as_deref() {
+            Some("on") => {
+                telemetry::set_enabled(true).ok();
+                println!("Telemetry enabled.");
+            }
+            Some("off") => {
+                telemetry::set_enabled(false).ok();
+                println!("Telemetry disabled.");
+            }
+            _ => println!("{}", telemetry::status_line()),
+        }
+        return Ok(());
+    }
+
+    // Init telemetry for real user sessions only (never the detached
+    // background indexer). This shows the one-time notice when enabled.
+    if !is_background_index {
+        telemetry::init();
+        let entry = match &cli.command {
+            Some(Commands::Claude) => "claude",
+            Some(Commands::Codex) => "codex",
+            Some(Commands::Opencode) => "opencode",
+            Some(Commands::Pi) => "pi",
+            Some(Commands::Grok) => "grok",
+            Some(Commands::Resume { .. }) => "resume",
+            _ => "picker",
+        };
+        telemetry::capture("app_launched", serde_json::json!({ "entry": entry }));
+    }
+
     let initial_agent = match cli.command {
         Some(Commands::Claude) => Some(ToolName::Claude),
         Some(Commands::Codex) => Some(ToolName::Codex),
@@ -84,9 +123,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Pi) => Some(ToolName::Pi),
         Some(Commands::Grok) => Some(ToolName::Grok),
         Some(Commands::Resume { query, agent, resume_in }) => {
-            search::run_standalone_resume(query, agent, resume_in).await?;
+            let res = search::run_standalone_resume(query, agent, resume_in).await;
+            telemetry::flush().await;
+            res?;
             return Ok(());
         }
+        // Handled and returned above; kept for match exhaustiveness.
+        Some(Commands::Telemetry { .. }) => unreachable!(),
         Some(Commands::BackgroundIndex) => {
             let sessions = search::collect_sessions(&ToolName::ALL);
             vector_index::build_index(&sessions).await?;
@@ -100,7 +143,9 @@ async fn main() -> anyhow::Result<()> {
         None => picker::pick_agent().await?,
     };
 
-    tui::run(agent, None).await
+    let res = tui::run(agent, None).await;
+    telemetry::flush().await;
+    res
 }
 
 

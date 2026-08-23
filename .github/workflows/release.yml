@@ -22,11 +22,17 @@ jobs:
             npm-dir: darwin-arm64
             bin-name: ah
             zig-host: aarch64-macos
+          # Built on macos-14 (Apple Silicon), not macos-13: GitHub is
+          # deprecating the Intel runners and they can sit queued for a very
+          # long time or never schedule. Apple's toolchain and Zig both
+          # cross-compile arm64->x86_64 natively (build.rs passes
+          # -Dtarget=x86_64-macos via the Rust target), so the Intel host
+          # isn't needed. zig-host is the runner's own arch (aarch64-macos).
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             npm-dir: darwin-x64
             bin-name: ah
-            zig-host: x86_64-macos
+            zig-host: aarch64-macos
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             npm-dir: linux-x64

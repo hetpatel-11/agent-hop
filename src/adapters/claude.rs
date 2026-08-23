@@ -726,4 +726,34 @@ impl Adapter for ClaudeAdapter {
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String> {
         resume_cmd_impl(session_id, project_path)
     }
+    fn find_latest_for_path(&self, project_path: &str) -> Option<SessionRef> {
+        find_latest_for_path_impl(project_path)
+    }
+}
+
+/// Fast path for hop lookups: Claude Code's own directory layout already
+/// encodes the project path into the directory name (see `write_impl`'s
+/// use of `encode_dir`), so which session is the right one is answered by
+/// `std::fs::read_dir` and file mtimes alone -- no need to open or parse a
+/// single file's contents, let alone every session on disk the way
+/// `list_sessions()` does for the search UI. `read_impl` only needs
+/// `raw.file` from the `SessionRef`, so the rest of the fields here are
+/// harmless placeholders.
+fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
+    let real_cwd_str = real_cwd(project_path).ok()?;
+    let dir = projects_dir().join(encode_dir(&real_cwd_str));
+    let files = find_files(&dir, |p| p.extension().map(|e| e == "jsonl").unwrap_or(false));
+    let latest = files.into_iter().max_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok())?;
+    let session_id = latest.file_stem()?.to_string_lossy().to_string();
+    Some(SessionRef {
+        tool: ToolName::Claude,
+        session_id,
+        project_path: real_cwd_str,
+        title: String::new(),
+        snippet: String::new(),
+        body: None,
+        updated_at: 0,
+        raw: Some(json!({ "file": latest.to_string_lossy() })),
+        match_snippet: None,
+    })
 }

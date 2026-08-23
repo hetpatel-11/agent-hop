@@ -491,7 +491,7 @@ pub fn ensure_indexing_triggered(sessions: &[SessionRef]) -> bool {
 /// invocation exits.
 fn trigger_background_indexing() {
     let Ok(exe) = std::env::current_exe() else { return };
-    let _ = std::process::Command::new(exe)
+    let child = std::process::Command::new(exe)
         .arg("__background-index")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -501,6 +501,24 @@ fn trigger_background_indexing() {
     // a spawned (non-shell) Command on Unix already avoids being killed
     // by this process's own exit -- there's no `.unref()` equivalent
     // needed since Rust's Child isn't awaited here at all.
+
+    // The embedding model's inference (native ONNX Runtime here, same
+    // underlying concern the original TS version hit with onnxruntime's
+    // WASM backend) can use its own thread pool across every core during
+    // a call -- doesn't make embedding faster, but it can transiently
+    // saturate the machine and starve whatever foreground process you're
+    // actually looking at (e.g. an agent's TUI you just resumed into) of
+    // scheduling time, showing up as input lag with no obvious cause.
+    // This is a true background task, so ask the OS to schedule it at the
+    // lowest niceness -- best-effort, not fatal if the platform disallows
+    // it (e.g. no permission to renice, which requires nothing special
+    // for *lowering* your own child's priority on any platform this
+    // targets, but the syscall can still fail).
+    if let Ok(child) = child {
+        unsafe {
+            let _ = libc::setpriority(libc::PRIO_PROCESS, child.id() as libc::id_t, 19);
+        }
+    }
 }
 
 /// One-shot hybrid search (BM25 + fuzzy + semantic, blended) for when a
@@ -522,30 +540,163 @@ pub async fn search_sessions(sessions: Vec<SessionRef>, query: &str, opts: Searc
     SearchResult { results, indexing_in_background: pending }
 }
 
-/// Standalone `ah resume` -- search outside the TUI (crossterm owns stdin
-/// directly here, no relay thread exists yet), then jump straight into the
-/// TUI already resumed at whatever session was picked.
-pub async fn run_standalone_resume() -> anyhow::Result<()> {
-    let sessions = collect_sessions(&ToolName::ALL);
+fn parse_agent_arg(raw: &str) -> ToolName {
+    match ToolName::from_slug(raw) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "agent-hop: unknown agent \"{raw}\". Valid: {}",
+                ToolName::ALL.iter().map(|t| t.slug()).collect::<Vec<_>>().join(", ")
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Standalone `ah resume [query] [-a agent] [-r resume-in]` -- search
+/// outside the TUI (crossterm owns stdin directly here, no relay thread
+/// exists yet), then jump straight into the TUI already resumed at
+/// whatever session was picked.
+///
+/// Ported from the original CLI's non-interactive/scriptable design (see
+/// the v0.0.5 tag): a query can be given directly as an argument for a
+/// one-shot search, `-a` restricts which agent(s) to search, and `-r`
+/// resumes the picked session in a *different* agent than it was recorded
+/// in without needing to enter the live TUI and hop -- e.g. for scripting
+/// or another agent shelling out to this as a command. When stdin/stdout
+/// aren't both real terminals, there's no one to answer an interactive
+/// prompt (it would just hang), so a query is required up front and the
+/// top match is auto-picked rather than blocking forever.
+pub async fn run_standalone_resume(
+    query_arg: Option<String>,
+    agent_arg: Option<String>,
+    resume_in_arg: Option<String>,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let non_interactive = !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal();
+
+    if non_interactive && query_arg.is_none() {
+        eprintln!("agent-hop: running non-interactively (no TTY) -- a search query is required, e.g. `ah resume \"oauth bug\"`.");
+        std::process::exit(1);
+    }
+
+    let scope: Vec<ToolName> = match &agent_arg {
+        Some(a) => vec![parse_agent_arg(a)],
+        None => ToolName::ALL.to_vec(),
+    };
+
+    let sessions = collect_sessions(&scope);
     if sessions.is_empty() {
         println!("No sessions found yet.");
         return Ok(());
     }
 
-    crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
-    let mut keys = crate::resume::CrosstermKeys;
-    let mut out = std::io::stdout();
-    let selected = crate::resume::run_resume_ui(sessions, &mut keys, &mut out);
-    crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
-    crossterm::terminal::disable_raw_mode()?;
-
-    let Some(session_ref) = selected? else {
-        println!("Cancelled.");
-        return Ok(());
+    let session_ref = if let Some(query) = &query_arg {
+        // A query was already supplied -- one-shot hybrid search (BM25 +
+        // semantic), not the live-typing ranker, but still shown through
+        // the same interactive picker (pre-filled) so the user can keep
+        // refining or just confirm the top match. Non-interactive mode
+        // (no TTY) skips the picker entirely and takes the top result.
+        let result = search_sessions(sessions, query, SearchOptions::default()).await;
+        if result.indexing_in_background {
+            println!("Semantic search is still learning some newer sessions in the background — results will get sharper on your next search.");
+        }
+        if result.results.is_empty() {
+            println!("No sessions found. Try a different query or agent scope.");
+            return Ok(());
+        }
+        if non_interactive {
+            let picked = result.results[0].clone();
+            println!("Non-interactive: auto-picked top match -- [{}] {}", picked.tool.slug(), picked.title);
+            picked
+        } else {
+            crossterm::terminal::enable_raw_mode()?;
+            let mut keys = crate::resume::CrosstermKeys;
+            let mut out = std::io::stdout();
+            let outcome = crate::resume::run_resume_ui(result.results, query, &mut keys, &mut out);
+            crossterm::terminal::disable_raw_mode()?;
+            match outcome? {
+                crate::resume::ResumeOutcome::Resume(r) => r,
+                crate::resume::ResumeOutcome::Cancelled => {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+                crate::resume::ResumeOutcome::Quit => return Ok(()),
+            }
+        }
+    } else {
+        // No query yet -- the familiar live-typing overlay, re-ranking as
+        // you type.
+        crossterm::terminal::enable_raw_mode()?;
+        let mut keys = crate::resume::CrosstermKeys;
+        let mut out = std::io::stdout();
+        let outcome = crate::resume::run_resume_ui(sessions, "", &mut keys, &mut out);
+        crossterm::terminal::disable_raw_mode()?;
+        match outcome? {
+            crate::resume::ResumeOutcome::Resume(r) => r,
+            crate::resume::ResumeOutcome::Cancelled => {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            crate::resume::ResumeOutcome::Quit => return Ok(()),
+        }
     };
 
-    crate::tui::run(session_ref.tool, Some((session_ref.session_id, session_ref.project_path))).await
+    let target_tool = match &resume_in_arg {
+        Some(a) => parse_agent_arg(a),
+        None => session_ref.tool,
+    };
+    if !target_tool.is_installed() {
+        eprintln!("agent-hop: cannot resume in {}: \"{}\" is not installed or not on PATH.", target_tool.slug(), target_tool.binary());
+        std::process::exit(1);
+    }
+
+    // tui::run's own initial-launch handling already falls back to the
+    // home directory (with a visible warning) if this path no longer
+    // exists, so there's nothing extra to check here (interactive path
+    // only -- see below for why the non-interactive path checks it
+    // directly instead).
+    let project_path = session_ref.project_path.clone();
+
+    let session_id = if target_tool != session_ref.tool {
+        println!("Converting {} session for {}...", session_ref.tool.slug(), target_tool.slug());
+        crate::adapters::convert_session(&session_ref, target_tool, &project_path)?
+    } else {
+        session_ref.session_id
+    };
+
+    if non_interactive {
+        // The persistent switcher TUI (`tui::run`) unconditionally needs a
+        // real controlling terminal (it puts the terminal in raw mode and
+        // manages a pty directly) -- fundamentally incompatible with "no
+        // TTY," not just an inconvenience to work around. The original
+        // (pre-switcher) design didn't have this problem because it never
+        // wrapped the target agent in anything: it directly spawned (or
+        // execve'd) the target's own native resume command with inherited
+        // stdio. Do the same here for the non-interactive path specifically
+        // -- if the target agent *itself* also needs a real terminal for
+        // its own interactive UI, that's now its own error to report, not
+        // an artifact of our own code requiring one.
+        let project_dir = if std::path::Path::new(&project_path).exists() {
+            project_path
+        } else {
+            let home = dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+            eprintln!("agent-hop: original project directory no longer exists: {project_path}\nResuming in {home} instead.");
+            home
+        };
+        let cmd = crate::adapters::adapter_for(target_tool).resume_cmd(&session_id, &project_dir);
+        println!("Launching: {}", cmd.join(" "));
+        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).current_dir(&project_dir).status();
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+            Err(e) => {
+                eprintln!("agent-hop: failed to launch {}: {e}", target_tool.slug());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    crate::tui::run(target_tool, Some((session_id, project_path))).await
 }
 
 #[cfg(test)]

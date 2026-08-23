@@ -79,6 +79,23 @@ pub trait Adapter {
     fn read(&self, session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>>;
     fn write(&self, turns: &[Turn], project_path: &str) -> anyhow::Result<String>;
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String>;
+
+    /// Fast path for "the single most recent session for this exact
+    /// project path" -- what a hop actually needs. The default falls back
+    /// to the full `list_sessions()` scan (title/snippet/body extraction
+    /// for *every* session on disk, needed for the interactive search UI
+    /// but wasted work here), which measured at 650ms-1.2s+ against a
+    /// real, months-old session history, entirely on the critical path of
+    /// every single hop. Adapters override this with something that reads
+    /// only the small amount of metadata actually needed to identify a
+    /// match, skipping sessions that don't match well before paying for
+    /// full extraction (or, for Claude, skipping straight to the one
+    /// directory that can possibly contain a match at all, since project
+    /// path is already encoded into the directory name).
+    fn find_latest_for_path(&self, project_path: &str) -> Option<SessionRef> {
+        let target = canonical_or_self(project_path);
+        self.list_sessions().ok()?.into_iter().filter(|s| canonical_or_self(&s.project_path) == target).max_by_key(|s| s.updated_at)
+    }
 }
 
 pub fn adapter_for(tool: ToolName) -> Box<dyn Adapter> {
@@ -104,12 +121,22 @@ fn canonical_or_self(path: &str) -> String {
 /// (usually already canonical, but not guaranteed identical string
 /// representations across platforms).
 pub fn find_latest_session_for_path(tool: ToolName, project_path: &str) -> Option<SessionRef> {
-    let target = canonical_or_self(project_path);
-    let sessions = adapter_for(tool).list_sessions().ok()?;
-    sessions
-        .into_iter()
-        .filter(|s| canonical_or_self(&s.project_path) == target)
-        .max_by_key(|s| s.updated_at)
+    adapter_for(tool).find_latest_for_path(project_path)
+}
+
+/// Converts one already-known session into a target tool's native format --
+/// shared by the live in-TUI hop path (which first has to *find* the
+/// relevant session for a project path -- see `find_latest_session_for_path`
+/// and its caller) and the standalone `ah resume -r <tool>` path (which
+/// already has an exact `SessionRef` in hand from search, nothing to find).
+/// Trims to the target's context budget and folds anything cut into a short
+/// synthetic summary turn (see `trim_turns_with_summary`) rather than
+/// silently dropping it, the same shape several of these agents already use
+/// themselves when their own context fills up.
+pub fn convert_session(session_ref: &SessionRef, to: ToolName, project_path: &str) -> anyhow::Result<String> {
+    let turns = adapter_for(session_ref.tool).read(session_ref)?;
+    let turns = crate::util::trim_turns_with_summary(turns, crate::util::CONVERSION_CHAR_BUDGET);
+    adapter_for(to).write(&turns, project_path)
 }
 
 #[cfg(test)]

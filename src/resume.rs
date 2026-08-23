@@ -16,7 +16,26 @@ pub enum SearchKey {
     Enter,
     Up,
     Down,
+    /// Esc -- cancel the overlay, return to the agent conversation exactly
+    /// where it was.
     Escape,
+    /// Ctrl+C -- a real, hard quit of the whole program, same as pressing
+    /// it anywhere else in a normal CLI tool. Deliberately distinct from
+    /// `Escape`: the two used to be treated identically, which meant
+    /// there was no way to actually exit agent-hop from inside this
+    /// overlay -- confirmed confusing in real use.
+    Quit,
+}
+
+/// What the overlay resolved to once it exits.
+pub enum ResumeOutcome {
+    /// Esc -- caller should resume the conversation exactly as it was
+    /// before the overlay opened.
+    Cancelled,
+    /// Enter on a real result -- switch into this session.
+    Resume(SessionRef),
+    /// Ctrl+C -- exit the whole program, not just this overlay.
+    Quit,
 }
 
 pub trait KeySource {
@@ -41,7 +60,7 @@ impl KeySource for CrosstermKeys {
                     KeyCode::Enter => SearchKey::Enter,
                     KeyCode::Backspace => SearchKey::Backspace,
                     KeyCode::Esc => SearchKey::Escape,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => SearchKey::Escape,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => SearchKey::Quit,
                     KeyCode::Char(c) => SearchKey::Char(c),
                     _ => continue,
                 }));
@@ -134,7 +153,7 @@ impl KeySource for ChannelKeys {
             }
             if b0 == 0x03 {
                 self.pending.remove(0);
-                return Ok(Some(SearchKey::Escape));
+                return Ok(Some(SearchKey::Quit));
             }
             if b0 == 0x1b {
                 // start of an unrecognized escape sequence -- drop it
@@ -184,27 +203,51 @@ const MAX_VISIBLE_RESULTS: usize = 10;
 
 /// Shared search-and-select loop: renders a query line + ranked results,
 /// re-ranks (fast, BM25-only -- no embedding call per keystroke) on every
-/// query edit, arrow keys move the selection, Enter confirms, Escape/
-/// Ctrl+C cancels. Returns `None` on cancel.
-pub fn run_resume_ui(sessions: Vec<SessionRef>, keys: &mut impl KeySource, out: &mut impl Write) -> anyhow::Result<Option<SessionRef>> {
+/// query edit, arrow keys move the selection, Enter confirms, Escape
+/// cancels back to the conversation, Ctrl+C quits the whole program (see
+/// `SearchKey::Quit`'s doc comment for why these are no longer the same
+/// thing).
+pub fn run_resume_ui(
+    sessions: Vec<SessionRef>,
+    initial_query: &str,
+    keys: &mut impl KeySource,
+    out: &mut impl Write,
+) -> anyhow::Result<ResumeOutcome> {
     // Every search keeps the persistent semantic index fresh, even though
     // this interactive overlay itself only uses the fast, sync BM25 rank
     // per keystroke -- a per-keystroke embedding model call would be
     // real, felt latency in an interactive list.
     crate::search::ensure_indexing_triggered(&sessions);
     let ranker = Ranker::new(sessions);
-    let mut query = String::new();
+    // `ah resume "query"` pre-fills this (see `run_standalone_resume`) so a
+    // query given as a CLI argument narrows the list immediately instead of
+    // starting from an empty search -- the user can still keep typing to
+    // refine it, or just hit Enter on the top match.
+    let mut query = initial_query.to_string();
     let mut selected = 0usize;
     let mut results = ranker.rank(&query, MAX_VISIBLE_RESULTS);
 
+    // The real terminal cursor is hidden for the whole overlay: `render`
+    // draws its own visual cursor (the solid block after the query text),
+    // and the real cursor otherwise ends up parked wherever the last
+    // `Print` call left it (after the footer line) -- a second, unrelated
+    // blinking cursor on screen at the same time as our drawn one,
+    // confirmed confusing in real use. Restored below before returning,
+    // on every exit path, via the single `break`-driven loop.
+    queue!(out, cursor::Hide)?;
+
     render(out, &query, &results, selected)?;
 
-    loop {
+    let outcome = loop {
         match keys.next_key()? {
-            None => return Ok(None),
-            Some(SearchKey::Escape) => return Ok(None),
+            None => break ResumeOutcome::Cancelled,
+            Some(SearchKey::Escape) => break ResumeOutcome::Cancelled,
+            Some(SearchKey::Quit) => break ResumeOutcome::Quit,
             Some(SearchKey::Enter) => {
-                return Ok(results.into_iter().nth(selected));
+                break match results.into_iter().nth(selected) {
+                    Some(r) => ResumeOutcome::Resume(r),
+                    None => ResumeOutcome::Cancelled,
+                };
             }
             Some(SearchKey::Up) => {
                 if selected > 0 {
@@ -231,25 +274,58 @@ pub fn run_resume_ui(sessions: Vec<SessionRef>, keys: &mut impl KeySource, out: 
                 render(out, &query, &results, selected)?;
             }
         }
-    }
+    };
+
+    queue!(out, cursor::Show)?;
+    out.flush()?;
+    Ok(outcome)
 }
 
+/// Renders in Clack's visual language (the `@clack/prompts` look:
+/// diamond-headed step, a connecting spine down the left margin, hollow/
+/// filled circles for unselected/selected items) -- reimplemented directly
+/// rather than pulling in the `cliclack` crate, since that crate wants to
+/// own its own event loop and raw-mode session for a fixed set of
+/// discrete prompts, whereas this overlay is a continuously-reactive
+/// fuzzy search fed through our own custom key-routing (`ChannelKeys`)
+/// while a backgrounded agent's pty keeps draining -- the visual style
+/// carries over cleanly, the input model doesn't.
 fn render(out: &mut impl Write, query: &str, results: &[SessionRef], selected: usize) -> anyhow::Result<()> {
     queue!(out, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
-    queue!(out, Print(format!("Search: {query}\u{2588}\r\n\r\n")))?;
+    let spine = theme::grey("\u{2502}");
+    queue!(
+        out,
+        Print(format!("{}  {}\r\n", theme::bold(&theme::magenta("\u{25c6}")), theme::bold("Resume a session")))
+    )?;
+    queue!(out, Print(format!("{spine}\r\n")))?;
+    queue!(out, Print(format!("{spine}  {}{query}\u{2588}\r\n", theme::grey("Search  "))))?;
+    queue!(out, Print(format!("{spine}\r\n")))?;
     if results.is_empty() {
-        queue!(out, Print("  (no results)\r\n"))?;
+        queue!(out, Print(format!("{spine}  {}\r\n", theme::grey("(no results)"))))?;
     }
     for (i, r) in results.iter().enumerate() {
-        let marker = if i == selected { "\u{276f}" } else { " " };
         let tag = theme::tool_tag(r.tool);
         let title: String = r.title.chars().take(70).collect();
-        queue!(out, Print(format!("{marker} {tag} {title}\r\n")))?;
-        if let Some(snippet) = &r.match_snippet {
-            queue!(out, Print(format!("    {snippet}\r\n")))?;
+        if i == selected {
+            let marker = theme::bold(&theme::magenta("\u{25cf}"));
+            queue!(out, Print(format!("{spine}  {marker} {tag} {}\r\n", theme::bold(&title))))?;
+            if let Some(snippet) = &r.match_snippet {
+                queue!(out, Print(format!("{spine}     {}\r\n", theme::grey(snippet))))?;
+            }
+        } else {
+            let marker = theme::grey("\u{25cb}");
+            queue!(out, Print(format!("{spine}  {marker} {tag} {title}\r\n")))?;
         }
     }
-    queue!(out, Print("\r\n  \u{2191}/\u{2193} to move, enter to resume, esc to cancel\r\n"))?;
+    queue!(out, Print(format!("{spine}\r\n")))?;
+    queue!(
+        out,
+        Print(format!(
+            "{}  {}\r\n",
+            theme::grey("\u{2514}"),
+            theme::grey("\u{2191}/\u{2193} move \u{00b7} enter resume \u{00b7} esc cancel")
+        ))
+    )?;
     out.flush()?;
     Ok(())
 }

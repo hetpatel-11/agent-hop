@@ -13,18 +13,24 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 portable-pty = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
-vte = "0.13"
-vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["clock"] }
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "tls-rustls"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 regex = "1"
 libc = "0.2"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+bindgen = "0.70"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+flate2 = "1"
+tar = "0.4"

@@ -7,7 +7,7 @@
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 
@@ -17,6 +17,82 @@ const TOKENIZER_CONFIG_URL: &str = "https://huggingface.co/Xenova/all-MiniLM-L6-
 
 fn model_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".agent-hop").join("model")
+}
+
+/// Pinned ONNX Runtime release. `ort` is built with `load-dynamic` (see
+/// Cargo.toml's comment on why: `libghostty-vt`, the terminal engine
+/// backing the TUI, statically links a large enough native library on its
+/// own that a second one -- the ~20MB+ of object code ONNX Runtime's
+/// default static-linking mode would otherwise embed -- pushes the binary
+/// past a hard ARM64 relative-addressing limit (`ADRP/imm12` can't reach
+/// `___dso_handle` from OrtApis code anymore, confirmed live as a real
+/// linker failure). `load-dynamic` means `ort` never embeds ONNX Runtime's
+/// code at all; it loads a `.dylib`/`.so`/`.dll` at runtime instead, found
+/// via `ORT_DYLIB_PATH`. Downloaded and cached under
+/// ~/.agent-hop/onnxruntime/ the same way the embedding model itself
+/// already is (see `ensure_model` below) -- once per version, forever
+/// after.
+const ORT_VERSION: &str = "1.22.0";
+
+fn onnxruntime_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".agent-hop").join("onnxruntime").join(ORT_VERSION)
+}
+
+/// (release asset name without extension, path to the dylib/so/dll inside
+/// the extracted archive, whether the asset is a .zip instead of .tar.gz).
+fn onnxruntime_asset() -> anyhow::Result<(&'static str, &'static str, bool)> {
+    Ok(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("onnxruntime-osx-arm64", "lib/libonnxruntime.dylib", false),
+        ("macos", "x86_64") => ("onnxruntime-osx-x86_64", "lib/libonnxruntime.dylib", false),
+        ("linux", "x86_64") => ("onnxruntime-linux-x64", "lib/libonnxruntime.so", false),
+        ("linux", "aarch64") => ("onnxruntime-linux-aarch64", "lib/libonnxruntime.so", false),
+        ("windows", "x86_64") => ("onnxruntime-win-x64", "lib/onnxruntime.dll", true),
+        ("windows", "aarch64") => ("onnxruntime-win-arm64", "lib/onnxruntime.dll", true),
+        (os, arch) => anyhow::bail!("no prebuilt ONNX Runtime available for {os}/{arch}"),
+    })
+}
+
+fn extract_tar_gz(bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
+    let tar = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(tar);
+    archive.unpack(dest)?;
+    Ok(())
+}
+
+fn extract_zip(bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    archive.extract(dest)?;
+    Ok(())
+}
+
+/// Downloads and extracts the official ONNX Runtime release for the
+/// current platform on first use, cached under
+/// ~/.agent-hop/onnxruntime/<version>/ forever after. Returns the path to
+/// the extracted dynamic library, for `ort::init_from`.
+async fn ensure_onnxruntime_dylib(on_progress: &(impl Fn(&str) + Sync)) -> anyhow::Result<PathBuf> {
+    let (asset_name, lib_rel_path, is_zip) = onnxruntime_asset()?;
+    let dir = onnxruntime_dir();
+    let extracted_root = dir.join(format!("{asset_name}-{ORT_VERSION}"));
+    let lib_path = extracted_root.join(lib_rel_path);
+
+    if lib_path.exists() {
+        return Ok(lib_path);
+    }
+
+    std::fs::create_dir_all(&dir)?;
+    let ext = if is_zip { "zip" } else { "tgz" };
+    let url = format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{asset_name}-{ORT_VERSION}.{ext}");
+    on_progress("Downloading ONNX Runtime...");
+    let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+
+    if is_zip {
+        extract_zip(&bytes, &dir)?;
+    } else {
+        extract_tar_gz(&bytes, &dir)?;
+    }
+
+    anyhow::ensure!(lib_path.exists(), "ONNX Runtime archive extracted but expected library not found at {}", lib_path.display());
+    Ok(lib_path)
 }
 
 // ort's Error<R> carries the failed resource (e.g. the SessionBuilder
@@ -59,6 +135,19 @@ pub async fn ensure_model(on_progress: impl Fn(&str) + Sync) -> anyhow::Result<(
     }
 
     if SESSION.get().is_none() {
+        // Must happen before the first `Session::builder()` call anywhere
+        // in the process -- `ort`'s API loader is a lazily-initialized
+        // global that locks in whichever dylib path it finds (or its
+        // platform-default guess) the first time any `ort` API is touched.
+        let dylib_path = ensure_onnxruntime_dylib(&on_progress).await?;
+        // SAFETY: single-threaded at this point in startup (called once,
+        // guarded by `SESSION.get().is_none()` above, before any other
+        // thread has a reason to touch `ort`) -- `set_var` here can't race
+        // with a read of the same variable from another thread.
+        unsafe {
+            std::env::set_var("ORT_DYLIB_PATH", &dylib_path);
+        }
+
         on_progress("Loading embedding model...");
         let builder = Session::builder().map_err(ort_err)?;
         let mut builder = builder.with_optimization_level(GraphOptimizationLevel::Level3).map_err(ort_err)?;

@@ -8,3 +8,4 @@ dist/
 
 /target
 __pycache__/
+/.herdr-reference

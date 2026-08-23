@@ -1,5 +1,4 @@
 mod agents;
-mod logos;
 mod picker;
 mod tui;
 mod search;
@@ -10,6 +9,8 @@ mod fuzzy;
 mod theme;
 mod vector_index;
 mod resume;
+mod update_check;
+mod vt;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
@@ -34,7 +35,16 @@ enum Commands {
     /// Launch straight into Grok
     Grok,
     /// Search and resume a past session (standalone, outside the TUI)
-    Resume,
+    Resume {
+        /// Search query (omitted = interactive prompt)
+        query: Option<String>,
+        /// Restrict search to one agent (claude|codex|opencode|pi|grok)
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Resume the picked session in this agent (default: same tool)
+        #[arg(short = 'r', long = "resume-in")]
+        resume_in: Option<String>,
+    },
     /// Hidden: runs the semantic-index build in-process. Never invoked
     /// directly by a user -- search.rs spawns this detached from the
     /// interactive CLI whenever there's unindexed content, so indexing
@@ -47,14 +57,34 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Skipped for the hidden background-index command (runs silently,
+    // detached, with no one to read a message anyway) and whenever
+    // stdin/stdout aren't both real terminals (a script/another agent
+    // invoking this shouldn't ever stop to mention an update). Bounded to
+    // ~1.5s by the check itself even when it does run, so this never
+    // meaningfully delays a launch.
+    let is_background_index = matches!(cli.command, Some(Commands::BackgroundIndex));
+    if !is_background_index {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            let info = update_check::check_for_update().await;
+            if info.update_available {
+                println!(
+                    "A new version of agent-hop is available ({} → {}). Run `npm install -g agent-hop@latest` (or the bun/pnpm equivalent) to update.",
+                    info.current, info.latest
+                );
+            }
+        }
+    }
+
     let initial_agent = match cli.command {
         Some(Commands::Claude) => Some(ToolName::Claude),
         Some(Commands::Codex) => Some(ToolName::Codex),
         Some(Commands::Opencode) => Some(ToolName::OpenCode),
         Some(Commands::Pi) => Some(ToolName::Pi),
         Some(Commands::Grok) => Some(ToolName::Grok),
-        Some(Commands::Resume) => {
-            search::run_standalone_resume().await?;
+        Some(Commands::Resume { query, agent, resume_in }) => {
+            search::run_standalone_resume(query, agent, resume_in).await?;
             return Ok(());
         }
         Some(Commands::BackgroundIndex) => {

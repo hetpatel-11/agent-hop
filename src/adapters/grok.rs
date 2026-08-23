@@ -641,4 +641,39 @@ impl Adapter for GrokAdapter {
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String> {
         resume_cmd_impl(session_id, project_path)
     }
+    fn find_latest_for_path(&self, project_path: &str) -> Option<SessionRef> {
+        find_latest_for_path_impl(project_path)
+    }
+}
+
+/// Fast path for hop lookups -- same rationale as Claude/pi: Grok's own
+/// directory layout already encodes the project path (`write_impl`'s
+/// `encode_uri_component`), one subdirectory per session underneath that,
+/// so the newest session for a path is a directory listing + mtime
+/// comparison, no file content needs reading.
+fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
+    let real_cwd_str = real_cwd(project_path).ok()?;
+    let dir = sessions_dir().join(encode_uri_component(&real_cwd_str));
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let latest_dir = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())?;
+    let session_id = latest_dir.file_name()?.to_string_lossy().to_string();
+    let chat_file = latest_dir.join("chat_history.jsonl");
+    if !chat_file.exists() {
+        return None;
+    }
+    Some(SessionRef {
+        tool: ToolName::Grok,
+        session_id,
+        project_path: real_cwd_str,
+        title: String::new(),
+        snippet: String::new(),
+        body: None,
+        updated_at: 0,
+        raw: Some(json!({ "file": chat_file.to_string_lossy() })),
+        match_snippet: None,
+    })
 }

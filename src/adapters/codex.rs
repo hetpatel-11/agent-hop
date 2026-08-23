@@ -523,4 +523,49 @@ impl Adapter for CodexAdapter {
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String> {
         resume_cmd_impl(session_id, project_path)
     }
+    fn find_latest_for_path(&self, project_path: &str) -> Option<SessionRef> {
+        find_latest_for_path_impl(project_path)
+    }
+}
+
+/// Fast path for hop lookups. Unlike Claude, codex keeps every session in
+/// one flat directory with `cwd` recorded *inside* each file (its first
+/// line, `session_meta`), so a directory-name shortcut isn't available --
+/// but checking just that first line per file is far cheaper than
+/// `list_sessions()`'s full title/body extraction, and candidates are
+/// checked newest-mtime-first and stop at the first match, so this
+/// realistically reads one line from one or a few files, not the whole
+/// history.
+fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
+    let target = std::fs::canonicalize(project_path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| project_path.to_string());
+    let dir = sessions_dir();
+    let mut files = find_files(&dir, |p| p.extension().map(|e| e == "jsonl").unwrap_or(false));
+    files.sort_by_key(|f| std::cmp::Reverse(std::fs::metadata(f).and_then(|m| m.modified()).ok()));
+    for file in files {
+        let Ok(f) = std::fs::File::open(&file) else { continue };
+        let Some(Ok(first_line)) = std::io::BufRead::lines(std::io::BufReader::new(f)).next() else { continue };
+        let Ok(obj) = serde_json::from_str::<Value>(&first_line) else { continue };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = obj.get("payload").and_then(|v| v.as_object()) else { continue };
+        let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+        let canon_cwd = std::fs::canonicalize(cwd).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| cwd.to_string());
+        if canon_cwd != target {
+            continue;
+        }
+        let session_id = payload.get("id").and_then(|v| v.as_str())?.to_string();
+        return Some(SessionRef {
+            tool: ToolName::Codex,
+            session_id,
+            project_path: canon_cwd,
+            title: String::new(),
+            snippet: String::new(),
+            body: None,
+            updated_at: 0,
+            raw: Some(json!({ "file": file.to_string_lossy() })),
+            match_snippet: None,
+        });
+    }
+    None
 }

@@ -28,6 +28,19 @@ impl ToolName {
         }
     }
 
+    /// Full product name, for anywhere reading as prose matters more than
+    /// a compact tag (e.g. the transition splash's "Switching to Claude
+    /// Code..." -- `slug()` alone reads flat/technical there).
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ToolName::Claude => "Claude Code",
+            ToolName::Codex => "Codex",
+            ToolName::OpenCode => "OpenCode",
+            ToolName::Pi => "Pi",
+            ToolName::Grok => "Grok",
+        }
+    }
+
     pub fn binary(&self) -> &'static str {
         match self {
             ToolName::Claude => "claude",

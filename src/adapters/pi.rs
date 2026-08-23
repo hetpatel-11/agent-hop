@@ -468,4 +468,60 @@ impl Adapter for PiAdapter {
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String> {
         resume_cmd_impl(session_id, project_path)
     }
+    fn find_latest_for_path(&self, project_path: &str) -> Option<SessionRef> {
+        find_latest_for_path_impl(project_path)
+    }
+}
+
+/// Fast path for hop lookups -- same rationale as Claude's: pi's own
+/// directory layout already encodes the project path (see `write_impl`'s
+/// `encode_dir`), so this is a directory listing + mtime comparison, no
+/// file content needs reading at all.
+fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
+    let real_cwd_str = real_cwd(project_path).ok()?;
+    let dir = sessions_dir().join(encode_dir(&real_cwd_str));
+    let files = find_files(&dir, |p| p.extension().map(|e| e == "jsonl").unwrap_or(false));
+    let latest = files.into_iter().max_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok())?;
+    let session_id = latest.file_stem()?.to_string_lossy().to_string();
+    Some(SessionRef {
+        tool: ToolName::Pi,
+        session_id,
+        project_path: real_cwd_str,
+        title: String::new(),
+        snippet: String::new(),
+        body: None,
+        updated_at: 0,
+        raw: Some(json!({ "file": latest.to_string_lossy() })),
+        match_snippet: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_dir_flattens_windows_paths_with_no_leading_separator() {
+        // Regression test for a real reported bug (upstream PR #2, closed
+        // in favor of this fix being carried into the Rust port): the
+        // original encoding only stripped a leading "/" or "\\" and never
+        // touched the colon after a Windows drive letter, so a cwd like
+        // `C:\Users\test\src\demo` produced a directory name that still
+        // contained a literal ":", which Windows rejects anywhere but the
+        // drive prefix -- `mkdir 'C:\Users\test\.pi\agent\sessions\--C:\
+        // Users\test\src\demo--'` failed with ENOENT. `canonicalize` fails
+        // for a nonexistent/foreign-OS-style path and falls back to the
+        // raw string unchanged, so this exercises the same fallback path
+        // that hit the bug on a real Windows machine, even running on a
+        // non-Windows CI/dev machine.
+        let encoded = encode_dir("C:\\Users\\test\\src\\demo");
+        assert!(!encoded.contains(':'), "encoded dir must not contain a colon: {encoded}");
+        assert!(!encoded.contains('\\'), "encoded dir must not contain a backslash: {encoded}");
+    }
+
+    #[test]
+    fn encode_dir_flattens_unix_paths() {
+        let encoded = encode_dir("/Users/test/src/demo");
+        assert_eq!(encoded, "--Users-test-src-demo--");
+    }
 }

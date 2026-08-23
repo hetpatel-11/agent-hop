@@ -258,7 +258,27 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
 /// use as a field-complete template -- opencode's import schema requires
 /// many fields (mode, path, tokens, cost, parentID chains...) not worth
 /// hand-guessing when a real example already satisfies them.
-fn real_export_template() -> Option<(Value, Value)> {
+///
+/// Cached for the process lifetime (see `real_export_template`) -- this
+/// scans up to 20 sessions and calls the real `opencode export` CLI
+/// (subprocess, real interpreter startup cost each time) for each one
+/// until it finds a pair, which measured at up to ~1.7s wall-clock in a
+/// real hop. The template itself doesn't change within one run of
+/// agent-hop, so paying that cost more than once per process is pure
+/// waste -- directly part of why hops felt slow.
+/// Kicks off the (expensive, subprocess-based) export-template derivation
+/// in the background at process start, so the cache above is already warm
+/// by the time a hop into OpenCode actually happens -- otherwise the
+/// *first* hop into OpenCode in any given `ah` process still pays the
+/// full ~1.4-1.8s cost (confirmed live), even though every hop after that
+/// is ~2ms once the cache is populated. Fire-and-forget: nothing needs
+/// this call's result directly, it only exists to populate the cache
+/// ahead of the moment it's actually needed.
+pub fn prewarm_export_template_cache() {
+    std::thread::spawn(real_export_template);
+}
+
+fn real_export_template_uncached() -> Option<(Value, Value)> {
     let db_uri = format!("file:{}?mode=ro", db_path().to_string_lossy());
     let out = Command::new("sqlite3")
         .args(["-json", &db_uri, "SELECT id FROM session LIMIT 20"])
@@ -286,6 +306,11 @@ fn real_export_template() -> Option<(Value, Value)> {
         }
     }
     None
+}
+
+fn real_export_template() -> Option<(Value, Value)> {
+    static CACHE: std::sync::OnceLock<Option<(Value, Value)>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(real_export_template_uncached).clone()
 }
 
 fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {

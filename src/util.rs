@@ -5,7 +5,7 @@
 //! source, since they document non-obvious behavior that was hit and fixed
 //! against real generated sessions, not theorized.
 
-use crate::adapters::{Turn, ToolCallRecord};
+use crate::adapters::{Role, Turn, ToolCallRecord};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -479,6 +479,116 @@ pub fn trim_turns_to_budget(turns: Vec<Turn>, budget: usize) -> (Vec<Turn>, usiz
     (kept, dropped)
 }
 
+/// Extracts path-looking values from a tool call's raw JSON input string --
+/// deliberately just a regex over common argument keys rather than a full
+/// JSON parse, since the exact schema varies per tool and this only needs
+/// to be good enough for a human-readable digest, not a faithful replay.
+fn extract_touched_paths(tool_input: &str, into: &mut Vec<String>) {
+    static PATH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PATH_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?:file_path|notebook_path|path|filename)"\s*:\s*"([^"]+)"#).unwrap()
+    });
+    for cap in re.captures_iter(tool_input) {
+        let path = cap[1].to_string();
+        if !into.contains(&path) {
+            into.push(path);
+        }
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// Builds a short, fast, purely-local digest of the turns `trim_turns_to_budget`
+/// is about to drop -- no model call involved (a hop needs to stay quick), just
+/// heuristics over what's already in memory. Returns `None` if nothing was
+/// dropped. Used so a hop into a different agent reads as "keep going from
+/// here, here's roughly what came before," not a cold, silent truncation --
+/// several of the agents this crate targets do something like this
+/// themselves internally when their own context fills up (an
+/// auto-compact-style summary turn), so a receiving agent seeing one in its
+/// history is a familiar shape, not something unusual.
+pub fn summarize_dropped_turns(dropped: &[Turn]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let first_user_text = dropped.iter().find(|t| t.role == Role::User).map(|t| truncate_chars(&t.text, 240));
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for t in dropped {
+        if let Some(tcs) = &t.tool_calls {
+            for tc in tcs {
+                if !tool_names.contains(&tc.name) {
+                    tool_names.push(tc.name.clone());
+                }
+                extract_touched_paths(&tc.input, &mut files);
+            }
+        }
+    }
+
+    let mut summary = format!(
+        "[agent-hop summary of earlier context]\nThis conversation continued from an earlier session; {} earlier turn(s) were trimmed to stay within the context budget.",
+        dropped.len()
+    );
+    if let Some(task) = first_user_text {
+        if !task.is_empty() {
+            summary.push_str(&format!("\nOriginal task: \"{task}\""));
+        }
+    }
+    if !tool_names.is_empty() {
+        summary.push_str(&format!("\nTools used earlier: {}", tool_names.join(", ")));
+    }
+    if !files.is_empty() {
+        let shown: Vec<&String> = files.iter().take(12).collect();
+        let shown_str = shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+        let more = files.len().saturating_sub(shown.len());
+        if more > 0 {
+            summary.push_str(&format!("\nFiles touched earlier: {shown_str} (+{more} more)"));
+        } else {
+            summary.push_str(&format!("\nFiles touched earlier: {shown_str}"));
+        }
+    }
+    Some(summary)
+}
+
+/// Trims to the character budget (see `trim_turns_to_budget`) and, if
+/// anything was actually dropped, prepends a synthetic summary turn (see
+/// `summarize_dropped_turns`) describing what came before -- the version
+/// of this that should actually be called wherever a session is carried
+/// from one agent's format into another's.
+pub fn trim_turns_with_summary(turns: Vec<Turn>, budget: usize) -> Vec<Turn> {
+    let cut_index = {
+        let mut total = 0usize;
+        let mut idx = turns.len();
+        for i in (0..turns.len()).rev() {
+            total += turn_char_count(&turns[i]);
+            if total > budget {
+                idx = i + 1;
+                break;
+            }
+            idx = i;
+        }
+        idx
+    };
+    if cut_index == 0 {
+        return turns;
+    }
+    let (dropped, kept) = turns.split_at(cut_index);
+    let summary = summarize_dropped_turns(dropped);
+    let mut result = Vec::with_capacity(kept.len() + 1);
+    if let Some(text) = summary {
+        result.push(Turn { role: Role::User, text, tool_calls: None, attachments: None });
+    }
+    result.extend_from_slice(kept);
+    result
+}
+
 /// Matches JS `new Date().toISOString()`: always millisecond precision,
 /// always a "Z" (UTC) suffix.
 pub fn iso_string_now() -> String {
@@ -594,6 +704,44 @@ mod tests {
         let (kept, dropped) = trim_turns_to_budget(turns, 1000);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn trim_turns_with_summary_prepends_digest_when_something_dropped() {
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: "please fix the login bug".to_string(),
+                tool_calls: Some(vec![ToolCallRecord {
+                    name: "Edit".to_string(),
+                    input: r#"{"file_path": "src/auth.rs", "old_string": "x", "new_string": "y"}"#.to_string(),
+                    output: None,
+                }]),
+                attachments: None,
+            },
+            Turn { role: Role::Assistant, text: "a".repeat(100), tool_calls: None, attachments: None },
+            Turn { role: Role::User, text: "c".repeat(100), tool_calls: None, attachments: None },
+        ];
+        let result = trim_turns_with_summary(turns, 150);
+        // the last (most recent) turn always survives, plus a synthetic
+        // summary turn describing what was cut
+        assert_eq!(result.len(), 2);
+        assert!(result[0].text.contains("agent-hop summary"));
+        assert!(result[0].text.contains("login bug"));
+        assert!(result[0].text.contains("Edit"));
+        assert!(result[0].text.contains("src/auth.rs"));
+        assert!(result[1].text.starts_with('c'));
+    }
+
+    #[test]
+    fn trim_turns_with_summary_is_a_noop_when_nothing_dropped() {
+        let turns = vec![
+            Turn { role: Role::User, text: "a".repeat(10), tool_calls: None, attachments: None },
+            Turn { role: Role::Assistant, text: "b".repeat(10), tool_calls: None, attachments: None },
+        ];
+        let result = trim_turns_with_summary(turns, 1000);
+        assert_eq!(result.len(), 2);
+        assert!(!result[0].text.contains("agent-hop summary"));
     }
 
     #[test]

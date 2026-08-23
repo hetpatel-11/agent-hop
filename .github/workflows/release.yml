@@ -14,26 +14,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # zig-host is the arch-os slug of the runner itself (each entry
+          # builds natively), used to fetch the matching Zig 0.15.2 build
+          # from ziglang.org.
           - target: aarch64-apple-darwin
             os: macos-14
             npm-dir: darwin-arm64
             bin-name: ah
+            zig-host: aarch64-macos
           - target: x86_64-apple-darwin
             os: macos-13
             npm-dir: darwin-x64
             bin-name: ah
+            zig-host: x86_64-macos
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             npm-dir: linux-x64
             bin-name: ah
+            zig-host: x86_64-linux
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             npm-dir: linux-arm64
             bin-name: ah
+            zig-host: aarch64-linux
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             npm-dir: win32-x64
             bin-name: ah.exe
+            zig-host: x86_64-windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -43,13 +51,41 @@ jobs:
           targets: ${{ matrix.target }}
 
       # build.rs compiles libghostty-vt with Zig, pinned to 0.15.2 (the
-      # commit's minimum_zig_version). setup-zig retries across several
-      # community mirrors internally; combined with fail-fast: false above,
-      # a transient mirror outage on one platform no longer cancels the
-      # rest -- just re-run that single job.
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: "0.15.2"
+      # commit's minimum_zig_version). We download the official build
+      # directly instead of using mlugg/setup-zig: that action's only
+      # non-mirror fallback is ziglang.org/builds/, which serves master
+      # nightlies, not tagged releases -- so for a pinned release version
+      # it depends entirely on community mirrors, and an outage there
+      # (observed 5xx across every mirror at once) fails the whole release.
+      # curl --retry against the canonical release URL has no such single
+      # point of failure. We set $ZIG (which build.rs reads) to an absolute
+      # path rather than touching PATH, so it works regardless of the shell
+      # the later cargo step runs in (pwsh on Windows).
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          SLUG="${{ matrix.zig-host }}"
+          BASE="https://ziglang.org/download/0.15.2"
+          if [[ "$SLUG" == *windows* ]]; then
+            FILE="zig-${SLUG}-0.15.2.zip"
+          else
+            FILE="zig-${SLUG}-0.15.2.tar.xz"
+          fi
+          echo "Downloading $BASE/$FILE"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 10 -o "$FILE" "$BASE/$FILE"
+          mkdir -p "$HOME/zig-install"
+          # bsdtar (present on all runners, incl. Windows) extracts both
+          # .tar.xz and .zip.
+          tar -xf "$FILE" -C "$HOME/zig-install"
+          ZIG_DIR="$HOME/zig-install/zig-${SLUG}-0.15.2"
+          if [[ "$SLUG" == *windows* ]]; then
+            echo "ZIG=$(cygpath -w "$ZIG_DIR/zig.exe")" >> "$GITHUB_ENV"
+            "$ZIG_DIR/zig.exe" version
+          else
+            echo "ZIG=$ZIG_DIR/zig" >> "$GITHUB_ENV"
+            "$ZIG_DIR/zig" version
+          fi
 
       # bindgen (used by build.rs to generate libghostty-vt's Rust bindings)
       # needs libclang at build time. macOS/Linux runners already have it

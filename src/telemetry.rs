@@ -10,12 +10,15 @@
 //! derived from the content of a user's chats.
 //!
 //! Design constraints, in priority order:
-//!   1. Never crash the app. Every failure path is swallowed.
-//!   2. Never block the app meaningfully. Sends are batched and flushed once
-//!      at exit, bounded by `FLUSH_TIMEOUT`.
-//!   3. Be honest and killable. A one-time notice is printed, and telemetry
-//!      can be turned off via env var, the `ah telemetry off` command, or the
-//!      cross-tool `DO_NOT_TRACK` standard.
+//! Events (all aggregate; never queries, paths, chat, or agent session ids):
+//!   - `app_launched` — `entry` (picker/resume/claude/…) and `installed`
+//!     (harness slugs on PATH).
+//!   - `hop` — `from`/`to` slugs, `via` (next/prev/picker), `converted`.
+//!   - `resume` — `from`/`to`, `same_agent`, `via` (cli/overlay), whether
+//!     they had a query / restricted `-a` / were interactive.
+//!   - `search_cancelled` — `via` (cli/overlay).
+//!   - `agent_selected` — startup picker: which slug, and whether it was
+//!     already installed.
 //!
 //! Control surface (any one disables it):
 //!   - `AH_TELEMETRY=0` (also accepts `false`/`off`/`no`)

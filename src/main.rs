@@ -110,7 +110,13 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Resume { .. }) => "resume",
             _ => "picker",
         };
-        telemetry::capture("app_launched", serde_json::json!({ "entry": entry }));
+        telemetry::capture(
+            "app_launched",
+            serde_json::json!({
+                "entry": entry,
+                "installed": ToolName::installed_slugs(),
+            }),
+        );
     }
 
     let initial_agent = match cli.command {

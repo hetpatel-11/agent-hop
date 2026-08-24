@@ -625,6 +625,7 @@ pub async fn run_standalone_resume(
             match outcome? {
                 crate::resume::ResumeOutcome::Resume(r) => r,
                 crate::resume::ResumeOutcome::Cancelled => {
+                    crate::telemetry::capture("search_cancelled", serde_json::json!({ "via": "cli" }));
                     println!("Cancelled.");
                     return Ok(());
                 }
@@ -642,6 +643,7 @@ pub async fn run_standalone_resume(
         match outcome? {
             crate::resume::ResumeOutcome::Resume(r) => r,
             crate::resume::ResumeOutcome::Cancelled => {
+                crate::telemetry::capture("search_cancelled", serde_json::json!({ "via": "cli" }));
                 println!("Cancelled.");
                 return Ok(());
             }
@@ -657,6 +659,19 @@ pub async fn run_standalone_resume(
         eprintln!("agent-hop: cannot resume in {}: \"{}\" is not installed or not on PATH.", target_tool.slug(), target_tool.binary());
         std::process::exit(1);
     }
+
+    crate::telemetry::capture(
+        "resume",
+        serde_json::json!({
+            "from": session_ref.tool.slug(),
+            "to": target_tool.slug(),
+            "same_agent": target_tool == session_ref.tool,
+            "via": "cli",
+            "interactive": !non_interactive,
+            "had_query": query_arg.is_some(),
+            "scoped": agent_arg.is_some(),
+        }),
+    );
 
     // tui::run's own initial-launch handling already falls back to the
     // home directory (with a visible warning) if this path no longer

@@ -72,11 +72,20 @@ pub async fn pick_agent() -> anyhow::Result<ToolName> {
     terminal::disable_raw_mode()?;
 
     let tool = result?;
+    let already_installed = installed[ToolName::ALL.iter().position(|t| *t == tool).unwrap()];
 
-    if !installed[ToolName::ALL.iter().position(|t| *t == tool).unwrap()] {
+    if !already_installed {
         install(tool)?;
         installed[ToolName::ALL.iter().position(|t| *t == tool).unwrap()] = true;
     }
+
+    crate::telemetry::capture(
+        "agent_selected",
+        serde_json::json!({
+            "agent": tool.slug(),
+            "was_installed": already_installed,
+        }),
+    );
 
     Ok(tool)
 }

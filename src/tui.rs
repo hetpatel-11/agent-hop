@@ -1,6 +1,7 @@
 use crate::adapters::{self, adapter_for};
 use crate::agents::ToolName;
 use crate::resume::{self, ChannelKeys, KeySource};
+use crate::telemetry;
 use crate::theme;
 use crate::vt;
 use crossterm::{cursor, execute, queue, style::Print, terminal};
@@ -219,18 +220,50 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
         match run_one(current, &project_path, launch, &sink, &mouse_sink, &overlay_click_sink, &tx, &rx, generation_id, host_colors) {
             Ok(RunOutcome::Exited) | Ok(RunOutcome::Quit) => break Ok(()),
             Ok(RunOutcome::Hop(dir)) => {
+                let via = match dir {
+                    HopDirection::Next => "next",
+                    HopDirection::Prev => "prev",
+                };
                 let next = match dir {
                     HopDirection::Next => next_installed(current, 1),
                     HopDirection::Prev => next_installed(current, -1),
                 };
                 launch = hop_to(current, next, &project_path, &rx);
+                telemetry::capture(
+                    "hop",
+                    serde_json::json!({
+                        "from": current.slug(),
+                        "to": next.slug(),
+                        "via": via,
+                        "converted": matches!(launch, Launch::Resume(_)),
+                    }),
+                );
                 current = next;
             }
             Ok(RunOutcome::HopTo(next)) => {
                 launch = hop_to(current, next, &project_path, &rx);
+                telemetry::capture(
+                    "hop",
+                    serde_json::json!({
+                        "from": current.slug(),
+                        "to": next.slug(),
+                        "via": "picker",
+                        "converted": matches!(launch, Launch::Resume(_)),
+                    }),
+                );
                 current = next;
             }
             Ok(RunOutcome::ResumeInto { tool, session_id, project_path: new_path }) => {
+                telemetry::capture(
+                    "resume",
+                    serde_json::json!({
+                        "from": current.slug(),
+                        "to": tool.slug(),
+                        "same_agent": current == tool,
+                        "via": "overlay",
+                        "interactive": true,
+                    }),
+                );
                 current = tool;
                 // Mid-TUI (raw mode already active) -- no visible warning
                 // here, just a silent, safe fallback plus a debug-log
@@ -850,6 +883,7 @@ fn run_one(
                         }
                     }
                     resume::ResumeOutcome::Cancelled => {
+                        crate::telemetry::capture("search_cancelled", serde_json::json!({ "via": "overlay" }));
                         // Every overlay leaves `sink` parked on
                         // `InputSink::Capture` (see its own doc comment on
                         // why it can't restore this itself). Whenever we're

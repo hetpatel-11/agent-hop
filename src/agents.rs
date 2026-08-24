@@ -68,6 +68,12 @@ impl ToolName {
     pub fn is_installed(&self) -> bool {
         which(self.binary()).is_some()
     }
+
+    /// Slugs of harnesses currently on PATH. Aggregate-only — used by
+    /// telemetry so we know which tools a given install can even hop to.
+    pub fn installed_slugs() -> Vec<&'static str> {
+        ToolName::ALL.into_iter().filter(ToolName::is_installed).map(|t| t.slug()).collect()
+    }
 }
 
 impl fmt::Display for ToolName {

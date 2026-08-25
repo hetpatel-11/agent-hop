@@ -1438,7 +1438,15 @@ fn spawn_live_tab(
 
     let mut cmd = match kind {
         TabKind::Shell => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let shell = std::env::var("SHELL")
+                .or_else(|_| std::env::var("COMSPEC"))
+                .unwrap_or_else(|_| {
+                    if cfg!(windows) {
+                        "cmd.exe".into()
+                    } else {
+                        "/bin/zsh".into()
+                    }
+                });
             CommandBuilder::new(shell)
         }
         TabKind::Agent(tool) => match &launch {

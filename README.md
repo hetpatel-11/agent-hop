@@ -116,7 +116,7 @@ ah telemetry on
 ah feedback "the hop bar is hard to see"
 ```
 
-From inside a live pane (`AH_SOCK` is set), agents and you can drive the mux without targeting the pane that issued the command:
+From inside a live pane (`AH_SOCK` is set; macOS and Linux), agents and you can drive the mux without targeting the pane that issued the command:
 
 ```bash
 ah tab                  # new tab (picker)

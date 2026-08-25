@@ -5,9 +5,7 @@
 
 use crate::agents::ToolName;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 pub const SOCK_ENV: &str = "AH_SOCK";
@@ -52,14 +50,16 @@ pub struct PaneRequest {
 
 pub struct ControlServer {
     pub path: PathBuf,
-    listener: UnixListener,
+    #[cfg(unix)]
+    listener: std::os::unix::net::UnixListener,
 }
 
+#[cfg(unix)]
 pub fn bind() -> anyhow::Result<ControlServer> {
+    use std::os::unix::net::UnixListener;
     let path = std::env::temp_dir().join(format!("ah-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -68,6 +68,12 @@ pub fn bind() -> anyhow::Result<ControlServer> {
     Ok(ControlServer { path, listener })
 }
 
+#[cfg(not(unix))]
+pub fn bind() -> anyhow::Result<ControlServer> {
+    anyhow::bail!("pane control socket is not available on Windows")
+}
+
+#[cfg(unix)]
 pub fn spawn_listener(server: ControlServer, tx: Sender<PaneRequest>) {
     std::thread::spawn(move || {
         let listener = server.listener;
@@ -84,6 +90,9 @@ pub fn spawn_listener(server: ControlServer, tx: Sender<PaneRequest>) {
     });
 }
 
+#[cfg(not(unix))]
+pub fn spawn_listener(_server: ControlServer, _tx: Sender<PaneRequest>) {}
+
 fn parse_tool(slug: Option<&str>) -> Result<Option<ToolName>, &'static str> {
     match slug {
         None | Some("") => Ok(None),
@@ -93,7 +102,9 @@ fn parse_tool(slug: Option<&str>) -> Result<Option<ToolName>, &'static str> {
     }
 }
 
-fn handle_client(stream: UnixStream, tx: &Sender<PaneRequest>) {
+#[cfg(unix)]
+fn handle_client(stream: std::os::unix::net::UnixStream, tx: &Sender<PaneRequest>) {
+    use std::io::{BufRead, BufReader};
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -154,7 +165,13 @@ fn parse_line(line: &str) -> Result<PaneRequest, &'static str> {
     parse_request(req)
 }
 
-fn write_reply(stream: &mut UnixStream, ok: bool, error: Option<&str>) -> std::io::Result<()> {
+#[cfg(unix)]
+fn write_reply(
+    stream: &mut std::os::unix::net::UnixStream,
+    ok: bool,
+    error: Option<&str>,
+) -> std::io::Result<()> {
+    use std::io::Write;
     let body = serde_json::to_string(&Reply {
         ok,
         error: error.map(|s| s.to_string()),
@@ -164,7 +181,21 @@ fn write_reply(stream: &mut UnixStream, ok: bool, error: Option<&str>) -> std::i
     stream.flush()
 }
 
+#[cfg(not(unix))]
+pub fn request(
+    _op: &str,
+    _agent: Option<&str>,
+    _tab: Option<u32>,
+    _path: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("ah tab/hop/close/focus/workspace need macOS or Linux")
+}
+
+#[cfg(unix)]
 pub fn request(op: &str, agent: Option<&str>, tab: Option<u32>, path: Option<&str>) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
     let sock = std::env::var(SOCK_ENV).map_err(|_| {
         anyhow::anyhow!("this command only works inside a live ah pane")
     })?;

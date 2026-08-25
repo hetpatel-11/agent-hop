@@ -16,6 +16,11 @@
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/feedback" || url.pathname.endsWith("/feedback")) {
+      return handleFeedback(request, env);
+    }
+
     if (request.method !== "POST") {
       return new Response("ok", { status: 200 });
     }
@@ -69,6 +74,43 @@ export default {
     return new Response("", { status: 204 });
   },
 };
+
+async function handleFeedback(request, env) {
+  if (request.method !== "POST") {
+    return new Response("ok", { status: 200 });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("bad json", { status: 400 });
+  }
+  const message = typeof body?.message === "string" ? body.message.trim().slice(0, 4000) : "";
+  if (!message) {
+    return new Response("empty", { status: 400 });
+  }
+  const country = request.cf?.country ?? null;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO feedback
+         (device_id, app_version, os, arch, country, message, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        str(body.device_id),
+        str(body.app_version),
+        str(body.os),
+        str(body.arch),
+        country,
+        message,
+        new Date().toISOString()
+      )
+      .run();
+  } catch {
+    return new Response("", { status: 204 });
+  }
+  return new Response("", { status: 204 });
+}
 
 function str(v) {
   return typeof v === "string" ? v.slice(0, 512) : v == null ? null : String(v).slice(0, 512);

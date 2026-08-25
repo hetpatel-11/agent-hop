@@ -10,6 +10,8 @@ mod theme;
 mod vector_index;
 mod resume;
 mod telemetry;
+mod feedback;
+mod control;
 mod update_check;
 mod vt;
 
@@ -51,6 +53,43 @@ enum Commands {
         /// `status` (default), `on`, or `off`
         action: Option<String>,
     },
+    /// Send us a short note. Lands in the same D1 database as telemetry.
+    Feedback {
+        /// Your message. Omit to type it on the next line.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        message: Vec<String>,
+    },
+    /// Open a new tab in the parent ah session. Only works from inside a pane
+    /// (`AH_SOCK` is set). Same idea as cmux: the agent runs a command, the
+    /// multiplexer opens the panel. `ah tab codex` skips the picker.
+    Tab {
+        /// Agent slug (claude|codex|opencode|pi|grok). Omit to use the picker.
+        agent: Option<String>,
+    },
+    Hop {
+        /// Target agent (claude|codex|opencode|pi|grok). Hops another tab, never this pane.
+        agent: String,
+        /// 1-based tab in this workspace. Omit if there is exactly one other tab.
+        #[arg(long)]
+        tab: Option<u32>,
+    },
+    /// Close another tab (never this pane).
+    Close {
+        #[arg(long)]
+        tab: Option<u32>,
+    },
+    /// Focus a tab (1-based). This pane keeps running.
+    Focus {
+        tab: u32,
+    },
+    /// New workspace, or `next`/`prev`.
+    Workspace {
+        action: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Hidden: runs the semantic-index build in-process. Never invoked
     /// directly by a user -- search.rs spawns this detached from the
     /// interactive CLI whenever there's unindexed content, so indexing
@@ -70,7 +109,20 @@ async fn main() -> anyhow::Result<()> {
     // ~1.5s by the check itself even when it does run, so this never
     // meaningfully delays a launch.
     let is_background_index = matches!(cli.command, Some(Commands::BackgroundIndex));
-    if !is_background_index {
+    let skip_update = is_background_index
+        || matches!(
+            cli.command,
+            Some(
+                Commands::Telemetry { .. }
+                    | Commands::Feedback { .. }
+                    | Commands::Tab { .. }
+                    | Commands::Hop { .. }
+                    | Commands::Close { .. }
+                    | Commands::Focus { .. }
+                    | Commands::Workspace { .. }
+            )
+        );
+    if !skip_update {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             let info = update_check::check_for_update().await;
@@ -97,6 +149,53 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Tab { agent }) = &cli.command {
+        control::request("tab", agent.as_deref(), None, None)?;
+        println!("Opening a new tab.");
+        return Ok(());
+    }
+    if let Some(Commands::Hop { agent, tab }) = &cli.command {
+        control::request("hop", Some(agent), *tab, None)?;
+        println!("Hopping the other tab to {agent}.");
+        return Ok(());
+    }
+    if let Some(Commands::Close { tab }) = &cli.command {
+        control::request("close", None, *tab, None)?;
+        println!("Closing the other tab.");
+        return Ok(());
+    }
+    if let Some(Commands::Focus { tab }) = &cli.command {
+        control::request("focus", None, Some(*tab), None)?;
+        println!("Focusing tab {tab}.");
+        return Ok(());
+    }
+    if let Some(Commands::Workspace { action, path, agent }) = &cli.command {
+        let op = match action.as_deref() {
+            Some("next") => "workspace-next",
+            Some("prev") => "workspace-prev",
+            None => "workspace",
+            Some(other) => anyhow::bail!("unknown workspace action '{other}' (use next, prev, or omit)"),
+        };
+        control::request(op, agent.as_deref(), None, path.as_deref())?;
+        println!("Workspace command sent.");
+        return Ok(());
+    }
+
+    if let Some(Commands::Feedback { message }) = cli.command {
+        match feedback::collect_message(message) {
+            Ok(text) if text.trim().is_empty() => {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            Ok(text) => match feedback::submit(&text).await {
+                Ok(()) => println!("Thanks — we got it."),
+                Err(e) => anyhow::bail!("Could not send feedback: {e}"),
+            },
+            Err(e) => anyhow::bail!(e),
+        }
+        return Ok(());
+    }
+
     // Init telemetry for real user sessions only (never the detached
     // background indexer). This shows the one-time notice when enabled.
     if !is_background_index {
@@ -108,7 +207,8 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Pi) => "pi",
             Some(Commands::Grok) => "grok",
             Some(Commands::Resume { .. }) => "resume",
-            _ => "picker",
+            Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::BackgroundIndex) => "picker",
+            None => "picker",
         };
         telemetry::capture(
             "app_launched",
@@ -132,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         // Handled and returned above; kept for match exhaustiveness.
-        Some(Commands::Telemetry { .. }) => unreachable!(),
+        Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. }) => unreachable!(),
         Some(Commands::BackgroundIndex) => {
             let sessions = search::collect_sessions(&ToolName::ALL);
             vector_index::build_index(&sessions).await?;

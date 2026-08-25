@@ -143,6 +143,12 @@ fn device_id() -> String {
     fresh
 }
 
+/// Anonymous per-install id. Used by `ah feedback` so a note can be tied
+/// to the same install as telemetry without requiring telemetry to be on.
+pub fn install_id() -> String {
+    device_id()
+}
+
 /// Print the one-time disclosure the first time telemetry runs for a user,
 /// then record that we've shown it so it never repeats. Only prints when
 /// stderr is a real terminal -- scripts and other agents shouldn't get a

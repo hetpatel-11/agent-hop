@@ -486,6 +486,11 @@ fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {
         if content.is_empty() && turn.tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true) && attachments.is_empty() {
             continue;
         }
+        // response_item is what the model resumes from; event_msg is what
+        // the TUI paints. Hop compact/digest stays in context only.
+        if crate::util::is_hop_context_only(turn) {
+            continue;
+        }
         let event_payload = if turn.role == Role::User {
             json!({ "type": "user_message", "message": if combined_text.is_empty() { "[image attached]".to_string() } else { combined_text.clone() } })
         } else {

@@ -157,6 +157,7 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
     };
     let lines = read_jsonl_lines(Path::new(&updates_file));
     let mut turns: Vec<Turn> = Vec::new();
+    let mut last_recap: Option<String> = None;
 
     // Images arrive as their OWN user_message_chunk event, separate from
     // the text chunk for the same turn -- both need buffering until the
@@ -237,6 +238,15 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
         let Some(update) = obj.get("params").and_then(|p| p.get("update")) else { continue };
         let kind = update.get("sessionUpdate").and_then(|v| v.as_str()).unwrap_or("");
 
+        if kind == "session_recap" {
+            if let Some(summary) = update.get("summary").and_then(|v| v.as_str()) {
+                let summary = summary.trim();
+                if !summary.is_empty() {
+                    last_recap = Some(summary.to_string());
+                }
+            }
+            continue;
+        }
         if kind == "user_message_chunk" {
             ensure_role(LastRole::User, &mut last_role, &mut turns, &mut user_text_parts, &mut user_attachments, &mut assistant_text_parts, &mut pending_tool_calls, &mut pending_attachments, &mut call_index);
             let content = update.get("content");
@@ -322,6 +332,17 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
     }
     flush_user(&mut turns, &mut user_text_parts, &mut user_attachments);
     flush_assistant(&mut turns, &mut assistant_text_parts, &mut pending_tool_calls, &mut pending_attachments, &mut call_index);
+    if let Some(summary) = last_recap {
+        turns.insert(
+            0,
+            Turn {
+                role: Role::User,
+                text: format!("{}\n{summary}", crate::util::NATIVE_COMPACT_MARKER),
+                tool_calls: None,
+                attachments: None,
+            },
+        );
+    }
     Ok(turns)
 }
 
@@ -456,6 +477,9 @@ fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {
     for (i, turn) in turns.iter().enumerate() {
         let event_num = i as i64 + 1;
         let ts = session_start_sec + i as i64;
+        if crate::util::is_hop_context_only(turn) {
+            continue;
+        }
         if turn.role == Role::User {
             updates.push(json!({
                 "timestamp": ts,

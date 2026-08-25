@@ -586,7 +586,7 @@ fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {
             } else {
                 Value::String(combined_text.clone())
             };
-            let entry = json!({
+            let mut entry = json!({
                 "parentUuid": parent_uuid,
                 "isSidechain": false,
                 "promptId": Uuid::new_v4().to_string(),
@@ -600,6 +600,14 @@ fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {
                 "sessionId": new_id,
                 "version": cli_version,
             });
+            // Same flags Claude writes for its own auto-compact: the model
+            // still sees the text; the TUI does not paint it as a user bubble.
+            if crate::util::is_hop_context_only(turn) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("isCompactSummary".to_string(), json!(true));
+                    obj.insert("isVisibleInTranscriptOnly".to_string(), json!(true));
+                }
+            }
             lines.push(entry.to_string());
             parent_uuid = Some(my_uuid.clone());
             last_uuid = Some(my_uuid);

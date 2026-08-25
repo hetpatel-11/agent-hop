@@ -128,10 +128,9 @@ pub fn find_latest_session_for_path(tool: ToolName, project_path: &str) -> Optio
 /// relevant session for a project path -- see `find_latest_session_for_path`
 /// and its caller) and the standalone `ah resume -r <tool>` path (which
 /// already has an exact `SessionRef` in hand from search, nothing to find).
-/// Trims to the target's context budget and folds anything cut into a short
-/// synthetic summary turn (see `trim_turns_with_summary`) rather than
-/// silently dropping it, the same shape several of these agents already use
-/// themselves when their own context fills up.
+/// Trims to the target's context budget, preferring a source-harness
+/// compact/recap when one is stored in plaintext, otherwise folding anything
+/// cut into a short synthetic summary turn (see `trim_turns_with_summary`).
 pub fn convert_session(session_ref: &SessionRef, to: ToolName, project_path: &str) -> anyhow::Result<String> {
     let turns = adapter_for(session_ref.tool).read(session_ref)?;
     let turns = crate::util::trim_turns_with_summary(turns, crate::util::CONVERSION_CHAR_BUDGET);

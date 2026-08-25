@@ -17,7 +17,9 @@ When you hop Claude Code → Grok → Pi → OpenCode → Codex, the runtime fin
 Search and resume are part of the same runtime, not a separate product. Every harness writes history to disk in its own shape. `ah` indexes all of it locally — BM25 as you type, MiniLM when you pause — so you can pull up a thread you remember by topic, not by which tool or folder held it. `Ctrl+R` resumes in the same harness. A hop, or `ah resume -r`, continues it in a different one.
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
-- **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format.
+- **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
+- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. When an agent exits, that tab becomes a shell instead of quitting `ah`.
+- **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
 - **Interactive or scripted** — humans stay in the TUI. Agents and CI call `ah resume` without a picker.
@@ -31,7 +33,7 @@ macOS or Linux, no Node required:
 curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.0`.
+That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.1`.
 
 Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
 
@@ -61,8 +63,14 @@ Start the runtime, pick a harness, then work as usual. That harness is a child p
 
 | Shortcut | What it does |
 |---|---|
-| `Ctrl+B` then `n` / `p` | Hop to the next / previous installed agent |
+| `Ctrl+B` then `n` / `p` | Hop **this** tab to the next / previous installed agent |
 | `Ctrl+B` then `a` | Open the agent picker (or click the bottom bar) |
+| `Ctrl+B` then `c` | New tab in this workspace |
+| `Ctrl+B` then `w` | New workspace (folder), then pick an agent |
+| `Ctrl+B` then `o` / `i` | Next / previous tab |
+| `Ctrl+B` then `[` / `]` | Previous / next workspace |
+| `Ctrl+B` then `1`–`9` | Focus that tab |
+| `Ctrl+B` then `x` | Close this tab |
 | `Ctrl+B` then `?` | Show every `ah` shortcut |
 | `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
 | `Ctrl+R` | Search local history and resume a session in the **same** agent |
@@ -105,7 +113,24 @@ Be specific. A vague query like `"adobe"` can resume the wrong chat.
 ah telemetry          # status
 ah telemetry off
 ah telemetry on
+ah feedback "the hop bar is hard to see"
 ```
+
+From inside a live pane (`AH_SOCK` is set), agents and you can drive the mux without targeting the pane that issued the command:
+
+```bash
+ah tab                  # new tab (picker)
+ah tab codex            # new tab, skip picker
+ah hop grok             # hop the other tab (omit --tab if there is exactly one other)
+ah hop grok --tab 2
+ah close --tab 2        # never closes the calling pane
+ah focus 2
+ah workspace            # new workspace
+ah workspace next
+ah workspace prev
+```
+
+When the last agent in a tab exits, that tab becomes `$SHELL`. `exit` or `Ctrl+B x` closes it. Hop from a shell starts a fresh agent (no convert).
 
 ## Architecture
 
@@ -133,7 +158,9 @@ you ──► ah (picker / TUI chrome)
 
 **Terminal engine (`src/vt.rs`, `libghostty-vt`)** — Ghostty's embeddable VT parser, linked at build time. The agent is a real TUI (Kitty keyboard protocol, OSC 133 prompt marks, truecolor). We render what it would draw in Ghostty, instead of reimplementing a half-compatible terminal. End users never need Zig; only people building from source do.
 
-**Hop (`src/adapters/mod.rs`)** — On `Ctrl+B n/p/a` or `Alt+↑/↓`, `ah` finds the session the current agent just wrote for this project, reads it, trims it to a 200k-character budget (with a short synthetic summary of anything cut), writes it as the next agent's native session, and launches that agent's own resume command. Fast path: `find_latest_for_path` so a hop does not scan every session on disk.
+**Hop (`src/adapters/mod.rs`)** — On `Ctrl+B n/p/a` or `Alt+↑/↓`, `ah` finds the session the current agent just wrote for this project, reads it, trims it to a 200k-character budget, writes it as the next agent's native session, and launches that agent's own resume command. If the source already stored a compact/recap (Claude user compact, Grok `session_recap`), that text is reserved first and hidden from the target TUI as a bubble; Codex compact is encrypted and unused. Anything else that still doesn't fit gets a local digest, also hidden. Fast path: `find_latest_for_path` so a hop does not scan every session on disk.
+
+**Mux (`src/tui.rs`, `src/control.rs`)** — Tabs live in workspaces (folders). Chrome is a full-height sidebar plus a tab strip on the pane. Pane commands go over a unix socket (`$AH_SOCK` / `$AH_TAB_ID`) so a child cannot hop or close itself. `ah feedback` posts to the same worker as telemetry.
 
 **Adapters (`src/adapters/<tool>.rs`)** — One module per agent. Each implements:
 

@@ -12,8 +12,12 @@ use ratatui::style::{Color as RColor, Modifier as RModifier, Style};
 use ratatui::text::{Line as RLine, Span};
 use ratatui::Terminal as RTerminal;
 use std::io::{stdout, Read, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+/// Unix socket path the parent `ah` listens on so a pane can run `ah tab`.
+static CONTROL_SOCK: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Resolves a `vt::Cell`'s already-libghostty-resolved color to the
 /// ratatui color that reproduces it. `None` (the cell has no explicit
@@ -100,6 +104,8 @@ enum HopDirection {
 enum RunEvent {
     ChildExited(u64),
     Hop(HopDirection),
+    HopTo(ToolName),
+    ResumeInto { tool: ToolName, session_id: String, project_path: String },
     SearchResume,
     /// A left-click landed on the bottom toggle bar (see
     /// `MouseDecode::OpenAgentPicker`) -- open the same agent list
@@ -112,10 +118,131 @@ enum RunEvent {
     /// are otherwise discoverable except by reading the toggle bar's own
     /// (necessarily terse) hint text.
     ShowHelp,
+    /// `PREFIX_KEY` then `c` -- new tab: another live agent PTY, current
+    /// tab keeps running (unlike hop, which replaces the focused tab).
+    NewTab,
+    Pane(crate::control::PaneRequest),
+    NewWorkspace,
+    NextWorkspace,
+    PrevWorkspace,
+    /// `PREFIX_KEY` then `o` / `i` -- next / previous tab.
+    NextTab,
+    PrevTab,
+    /// `PREFIX_KEY` then `x` -- close the focused tab (kills that agent).
+    CloseTab,
+    /// `PREFIX_KEY` then `1`…`9`, or a click on a tab in the top strip.
+    FocusTab(usize),
+    /// Left-click on our chrome (top tab strip or session sidebar).
+    ChromeClick { x: u16, y: u16 },
     /// The real terminal was resized (new cols, new rows). Not tied to any
     /// particular generation -- always relevant regardless of which agent
     /// is currently running.
     Resized(u16, u16),
+}
+
+/// Chrome labels: workspaces in the sidebar, tabs of the focused workspace on top.
+#[derive(Clone)]
+struct TabStrip {
+    workspaces: Vec<(String, usize)>,
+    ws_focus: usize,
+    tabs: Vec<TabKind>,
+    tab_focus: usize,
+}
+
+struct Workspace {
+    path: String,
+    tabs: Vec<LiveTab>,
+    focus: usize,
+}
+
+/// One live PTY: an agent, or a leftover shell after the agent exits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabKind {
+    Agent(ToolName),
+    Shell,
+}
+
+impl TabKind {
+    fn slug(self) -> &'static str {
+        match self {
+            TabKind::Agent(t) => t.slug(),
+            TabKind::Shell => "term",
+        }
+    }
+
+    fn tool(self) -> Option<ToolName> {
+        match self {
+            TabKind::Agent(t) => Some(t),
+            TabKind::Shell => None,
+        }
+    }
+}
+
+/// One live agent PTY. Switching tabs never kills this; hop/close/exit does.
+struct LiveTab {
+    id: u64,
+    kind: TabKind,
+    project_path: String,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    resize_tx: mpsc::Sender<(u16, u16)>,
+    wake_tx: mpsc::Sender<ChildMsg>,
+    paint: Arc<AtomicBool>,
+    suppress: Arc<AtomicBool>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+fn sync_tab_strip(strip: &Arc<Mutex<TabStrip>>, workspaces: &[Workspace], ws_focus: usize) {
+    let mut s = strip.lock().unwrap();
+    s.workspaces = workspaces.iter().map(|w| (w.path.clone(), w.tabs.len())).collect();
+    s.ws_focus = ws_focus;
+    if let Some(ws) = workspaces.get(ws_focus) {
+        s.tabs = ws.tabs.iter().map(|t| t.kind).collect();
+        s.tab_focus = ws.focus;
+    } else {
+        s.tabs.clear();
+        s.tab_focus = 0;
+    }
+}
+
+fn unpaint_all(workspaces: &[Workspace]) {
+    for ws in workspaces {
+        for tab in &ws.tabs {
+            tab.paint.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn focus_active(
+    workspaces: &mut [Workspace],
+    ws_focus: usize,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    strip: &Arc<Mutex<TabStrip>>,
+) {
+    unpaint_all(workspaces);
+    if let Some(ws) = workspaces.get_mut(ws_focus) {
+        if ws.focus >= ws.tabs.len() {
+            ws.focus = ws.tabs.len().saturating_sub(1);
+        }
+        focus_tab(&mut ws.tabs, ws.focus, sink, mouse_sink);
+    }
+    sync_tab_strip(strip, workspaces, ws_focus);
+}
+
+fn focus_tab(
+    tabs: &mut [LiveTab],
+    focus: usize,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+) {
+    for (i, tab) in tabs.iter().enumerate() {
+        tab.paint.store(i == focus, Ordering::SeqCst);
+    }
+    if let Some(tab) = tabs.get(focus) {
+        *sink.lock().unwrap() = InputSink::Forward(tab.writer.clone());
+        *mouse_sink.lock().unwrap() = Some(tab.wake_tx.clone());
+        let _ = tab.wake_tx.send(ChildMsg::Wake);
+    }
 }
 
 /// What to do with the pty we're about to spawn: launch the agent fresh,
@@ -128,28 +255,15 @@ enum Launch {
 
 /// Outcome of running one agent to completion.
 enum RunOutcome {
-    /// The child exited on its own (user quit the agent normally). Skips
-    /// the explicit `child.kill()` below on the way out -- it's already
-    /// gone.
+    #[allow(dead_code)]
     Exited,
-    /// Ctrl+C pressed inside the search-and-resume overlay -- a real,
-    /// hard quit of the whole program (see `resume::SearchKey::Quit`).
-    /// Deliberately a separate variant from `Exited`, not reusing it: the
-    /// agent underneath the overlay is still very much alive at this
-    /// point (the overlay only ever suppresses its output, never touches
-    /// the process), so this must still go through the explicit
-    /// `child.kill()` below, unlike a genuine self-exit.
+    #[allow(dead_code)]
     Quit,
-    /// Alt+Up/Down was pressed -- translate the live conversation into the
-    /// next/prev installed agent's format and continue there.
+    #[allow(dead_code)]
     Hop(HopDirection),
-    /// A specific agent was picked from the agent-list overlay (see
-    /// `RunEvent::AgentPicker`) -- same live-conversation translation as
-    /// `Hop`, just jumping straight to a chosen tool instead of
-    /// stepping next/prev through the installed list.
+    #[allow(dead_code)]
     HopTo(ToolName),
-    /// The user picked a session from the in-TUI search overlay -- jump
-    /// straight to it (that tool's own native resume, no translation).
+    #[allow(dead_code)]
     ResumeInto { tool: ToolName, session_id: String, project_path: String },
 }
 
@@ -170,6 +284,26 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
 
     spawn_stdin_relay(sink.clone(), mouse_sink.clone(), overlay_click_sink.clone(), tx.clone());
     spawn_resize_poller(tx.clone());
+    let control_path = match crate::control::bind() {
+        Ok(server) => {
+            let path = server.path.clone();
+            *CONTROL_SOCK.lock().unwrap() = Some(path.clone());
+            let (ctl_tx, ctl_rx) = mpsc::channel();
+            crate::control::spawn_listener(server, ctl_tx);
+            let tx_ctl = tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(ev) = ctl_rx.recv() {
+                    match ev {
+                        crate::control::PaneRequest { from_tab, op } => {
+                            let _ = tx_ctl.send(RunEvent::Pane(crate::control::PaneRequest { from_tab, op }));
+                        }
+                    }
+                }
+            });
+            Some(path)
+        }
+        Err(_) => None,
+    };
     // See its own doc comment: without this, the *first* hop into OpenCode
     // in any given `ah` process still pays ~1.4-1.8s (a real subprocess
     // call), even though every hop after that is ~2ms. Kicking it off here
@@ -186,6 +320,14 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
             Launch::Fresh,
         ),
     };
+    let tab_strip: Arc<Mutex<TabStrip>> = Arc::new(Mutex::new(TabStrip {
+        workspaces: vec![(project_path.clone(), 1)],
+        ws_focus: 0,
+        tabs: vec![TabKind::Agent(current)],
+        tab_focus: 0,
+    }));
+    let mut workspaces: Vec<Workspace> = Vec::new();
+    let mut ws_focus: usize = 0;
 
     terminal::enable_raw_mode()?;
     // Every full-screen terminal app -- vim, htop, Codex/Claude/opencode
@@ -215,11 +357,104 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
     }
     execute!(stdout(), cursor::Show).ok();
 
+    let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    match spawn_live_tab(
+        TabKind::Agent(current),
+        &project_path,
+        launch,
+        &sink,
+        &mouse_sink,
+        &tx,
+        generation_id,
+        host_colors,
+        true,
+        tab_strip.clone(),
+    ) {
+        Ok(tab) => {
+            workspaces.push(Workspace { path: project_path.clone(), tabs: vec![tab], focus: 0 });
+            ws_focus = 0;
+            sync_tab_strip(&tab_strip, &workspaces, ws_focus);
+        }
+        Err(e) => {
+            let _ = stdout().write_all(MOUSE_CAPTURE_DISABLE);
+            let _ = stdout().flush();
+            execute!(stdout(), terminal::LeaveAlternateScreen).ok();
+            if let Some(path) = &control_path {
+                let _ = std::fs::remove_file(path);
+                *CONTROL_SOCK.lock().unwrap() = None;
+            }
+            terminal::disable_raw_mode()?;
+            return Err(e);
+        }
+    }
+
     let result: anyhow::Result<()> = loop {
-        let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        match run_one(current, &project_path, launch, &sink, &mouse_sink, &overlay_click_sink, &tx, &rx, generation_id, host_colors) {
-            Ok(RunOutcome::Exited) | Ok(RunOutcome::Quit) => break Ok(()),
-            Ok(RunOutcome::Hop(dir)) => {
+        if workspaces.is_empty() {
+            break Ok(());
+        }
+
+        match rx.recv() {
+            Ok(RunEvent::ChildExited(g)) => {
+                let mut found: Option<(usize, usize, bool)> = None;
+                for (wi, ws) in workspaces.iter().enumerate() {
+                    if let Some(ti) = ws.tabs.iter().position(|t| t.id == g) {
+                        found = Some((wi, ti, matches!(ws.tabs[ti].kind, TabKind::Shell)));
+                        break;
+                    }
+                }
+                if let Some((wi, ti, was_shell)) = found {
+                    let path = workspaces[wi].path.clone();
+                    let mut dead = workspaces[wi].tabs.remove(ti);
+                    let _ = dead.child.kill();
+                    let _ = dead.child.wait();
+                    if !was_shell {
+                        // Agent left (Ctrl+C / its own quit). Keep the tab
+                        // and drop into a normal shell in that folder.
+                        let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                        match spawn_live_tab(
+                            TabKind::Shell,
+                            &path,
+                            Launch::Fresh,
+                            &sink,
+                            &mouse_sink,
+                            &tx,
+                            generation_id,
+                            host_colors,
+                            wi == ws_focus,
+                            tab_strip.clone(),
+                        ) {
+                            Ok(tab) => {
+                                workspaces[wi].tabs.insert(ti, tab);
+                                workspaces[wi].focus = ti;
+                                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                                continue;
+                            }
+                            Err(e) => debug_log("SHELL_FALLBACK_ERR", format!("{e:#}").as_bytes()),
+                        }
+                    }
+                    if workspaces[wi].tabs.is_empty() {
+                        workspaces.remove(wi);
+                        if workspaces.is_empty() {
+                            break Ok(());
+                        }
+                        if ws_focus >= workspaces.len() {
+                            ws_focus = workspaces.len() - 1;
+                        } else if wi < ws_focus {
+                            ws_focus -= 1;
+                        }
+                    } else if workspaces[wi].focus >= workspaces[wi].tabs.len() {
+                        workspaces[wi].focus = workspaces[wi].tabs.len() - 1;
+                    } else if ti < workspaces[wi].focus {
+                        workspaces[wi].focus -= 1;
+                    }
+                    focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                }
+            }
+            Ok(RunEvent::Hop(dir)) => {
+                let ws = &workspaces[ws_focus];
+                let tab = &ws.tabs[ws.focus];
+                current = tab.kind.tool().unwrap_or_else(|| next_installed(ToolName::Claude, 1));
+                project_path = ws.path.clone();
                 let via = match dir {
                     HopDirection::Next => "next",
                     HopDirection::Prev => "prev",
@@ -228,7 +463,10 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                     HopDirection::Next => next_installed(current, 1),
                     HopDirection::Prev => next_installed(current, -1),
                 };
-                launch = hop_to(current, next, &project_path, &rx);
+                launch = match workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind {
+                    TabKind::Shell => Launch::Fresh,
+                    TabKind::Agent(_) => hop_to(current, next, &project_path, &rx, true),
+                };
                 telemetry::capture(
                     "hop",
                     serde_json::json!({
@@ -238,10 +476,33 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                         "converted": matches!(launch, Launch::Resume(_)),
                     }),
                 );
+                match replace_focused_tab(
+                    &mut workspaces[ws_focus],
+                    next,
+                    &project_path,
+                    launch,
+                    &sink,
+                    &mouse_sink,
+                    &overlay_click_sink,
+                    &tx,
+                    &generation,
+                    host_colors,
+                    &tab_strip,
+                ) {
+                    Ok(()) => sync_tab_strip(&tab_strip, &workspaces, ws_focus),
+                    Err(e) => break Err(e),
+                }
                 current = next;
             }
-            Ok(RunOutcome::HopTo(next)) => {
-                launch = hop_to(current, next, &project_path, &rx);
+            Ok(RunEvent::HopTo(next)) => {
+                let ws = &workspaces[ws_focus];
+                let tab = &ws.tabs[ws.focus];
+                current = tab.kind.tool().unwrap_or_else(|| next_installed(ToolName::Claude, 1));
+                project_path = ws.path.clone();
+                launch = match workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind {
+                    TabKind::Shell => Launch::Fresh,
+                    TabKind::Agent(_) => hop_to(current, next, &project_path, &rx, true),
+                };
                 telemetry::capture(
                     "hop",
                     serde_json::json!({
@@ -251,27 +512,37 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                         "converted": matches!(launch, Launch::Resume(_)),
                     }),
                 );
+                match replace_focused_tab(
+                    &mut workspaces[ws_focus],
+                    next,
+                    &project_path,
+                    launch,
+                    &sink,
+                    &mouse_sink,
+                    &overlay_click_sink,
+                    &tx,
+                    &generation,
+                    host_colors,
+                    &tab_strip,
+                ) {
+                    Ok(()) => sync_tab_strip(&tab_strip, &workspaces, ws_focus),
+                    Err(e) => break Err(e),
+                }
                 current = next;
             }
-            Ok(RunOutcome::ResumeInto { tool, session_id, project_path: new_path }) => {
+            Ok(RunEvent::ResumeInto { tool, session_id, project_path: new_path }) => {
+                let from = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
                 telemetry::capture(
                     "resume",
                     serde_json::json!({
-                        "from": current.slug(),
+                        "from": from.slug(),
                         "to": tool.slug(),
-                        "same_agent": current == tool,
+                        "same_agent": from == tool,
                         "via": "overlay",
                         "interactive": true,
                     }),
                 );
                 current = tool;
-                // Mid-TUI (raw mode already active) -- no visible warning
-                // here, just a silent, safe fallback plus a debug-log
-                // breadcrumb. A plain eprintln! would corrupt the display
-                // (raw mode doesn't do \n -> \r\n translation), and this is
-                // exactly the same "don't crash on a missing directory"
-                // safety net as the initial-launch case, just without
-                // anywhere clean to print to right now.
                 project_path = resolve_project_path(new_path, false);
                 launch = Launch::Resume(session_id);
                 let splash_start = std::time::Instant::now();
@@ -280,16 +551,642 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                     std::thread::sleep(remaining);
                 }
                 execute!(stdout(), cursor::Show).ok();
+                if let Some(existing) = workspaces.iter().position(|w| w.path == project_path) {
+                    ws_focus = existing;
+                    match replace_focused_tab(
+                        &mut workspaces[ws_focus],
+                        current,
+                        &project_path,
+                        launch,
+                        &sink,
+                        &mouse_sink,
+                        &overlay_click_sink,
+                        &tx,
+                        &generation,
+                        host_colors,
+                        &tab_strip,
+                    ) {
+                        Ok(()) => focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip),
+                        Err(e) => break Err(e),
+                    }
+                } else {
+                    unpaint_all(&workspaces);
+                    let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    match spawn_live_tab(
+                        TabKind::Agent(current),
+                        &project_path,
+                        launch,
+                        &sink,
+                        &mouse_sink,
+                        &tx,
+                        generation_id,
+                        host_colors,
+                        true,
+                        tab_strip.clone(),
+                    ) {
+                        Ok(tab) => {
+                            workspaces.push(Workspace { path: project_path.clone(), tabs: vec![tab], focus: 0 });
+                            ws_focus = workspaces.len() - 1;
+                            sync_tab_strip(&tab_strip, &workspaces, ws_focus);
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
             }
-            Err(e) => break Err(e),
+            Ok(RunEvent::Resized(new_cols, new_rows)) => {
+                for ws in &workspaces {
+                    for tab in &ws.tabs {
+                        let _ = tab.resize_tx.send((new_cols, new_rows));
+                    }
+                }
+            }
+            Ok(RunEvent::SearchResume) => {
+                let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+                match run_search_overlay(&sink, &suppress) {
+                    resume::ResumeOutcome::Resume(selected) => {
+                        let _ = tx.send(RunEvent::ResumeInto {
+                            tool: selected.tool,
+                            session_id: selected.session_id,
+                            project_path: selected.project_path,
+                        });
+                    }
+                    resume::ResumeOutcome::Cancelled => {
+                        crate::telemetry::capture("search_cancelled", serde_json::json!({ "via": "overlay" }));
+                        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                    }
+                    resume::ResumeOutcome::Quit => {
+                        for ws in &mut workspaces {
+                            for tab in &mut ws.tabs {
+                                let _ = tab.child.kill();
+                                let _ = tab.child.wait();
+                            }
+                        }
+                        break Ok(());
+                    }
+                }
+            }
+            Ok(RunEvent::AgentPicker) => {
+                let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                    Some(picked) if workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool() != Some(picked) => {
+                        let _ = tx.send(RunEvent::HopTo(picked));
+                    }
+                    _ => {
+                        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                    }
+                }
+            }
+            Ok(RunEvent::ShowHelp) => {
+                let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+                run_help_overlay(&sink, &suppress);
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::NewTab) => {
+                let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                    Some(picked) => add_agent_tab(
+                        &mut workspaces,
+                        ws_focus,
+                        picked,
+                        &sink,
+                        &mouse_sink,
+                        &tx,
+                        &generation,
+                        host_colors,
+                        &tab_strip,
+                    ),
+                    None => {
+                        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                    }
+                }
+            }
+            Ok(RunEvent::Pane(req)) => handle_pane_request(
+                req,
+                &mut workspaces,
+                &mut ws_focus,
+                &sink,
+                &mouse_sink,
+                &overlay_click_sink,
+                &tx,
+                &generation,
+                host_colors,
+                &tab_strip,
+                &rx,
+            ),
+            Ok(RunEvent::NewWorkspace) => {
+                let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+                let default_path = workspaces[ws_focus].path.clone();
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                match run_path_overlay(&sink, &suppress, &default_path) {
+                    Some(path) => {
+                        let path = expand_workspace_path(&path);
+                        match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                            Some(picked) => {
+                                unpaint_all(&workspaces);
+                                let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                                match spawn_live_tab(
+                                    TabKind::Agent(picked),
+                                    &path,
+                                    Launch::Fresh,
+                                    &sink,
+                                    &mouse_sink,
+                                    &tx,
+                                    generation_id,
+                                    host_colors,
+                                    true,
+                                    tab_strip.clone(),
+                                ) {
+                                    Ok(tab) => {
+                                        workspaces.push(Workspace { path, tabs: vec![tab], focus: 0 });
+                                        ws_focus = workspaces.len() - 1;
+                                        sync_tab_strip(&tab_strip, &workspaces, ws_focus);
+                                    }
+                                    Err(e) => {
+                                        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                                        debug_log("NEW_WORKSPACE_ERR", format!("{e:#}").as_bytes());
+                                    }
+                                }
+                            }
+                            None => focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip),
+                        }
+                    }
+                    None => focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip),
+                }
+            }
+            Ok(RunEvent::NextTab) => {
+                let n = workspaces[ws_focus].tabs.len();
+                if n > 1 {
+                    workspaces[ws_focus].focus = (workspaces[ws_focus].focus + 1) % n;
+                }
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::PrevTab) => {
+                let n = workspaces[ws_focus].tabs.len();
+                if n > 1 {
+                    workspaces[ws_focus].focus = (workspaces[ws_focus].focus + n - 1) % n;
+                }
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::NextWorkspace) if workspaces.len() > 1 => {
+                ws_focus = (ws_focus + 1) % workspaces.len();
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::PrevWorkspace) if workspaces.len() > 1 => {
+                ws_focus = (ws_focus + workspaces.len() - 1) % workspaces.len();
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::NextWorkspace | RunEvent::PrevWorkspace) => {
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::CloseTab) => {
+                let last_workspace = workspaces.len() == 1;
+                let last_tab = workspaces[ws_focus].tabs.len() == 1;
+                if last_workspace && last_tab {
+                    let mut dead = workspaces[ws_focus].tabs.remove(0);
+                    let _ = dead.child.kill();
+                    let _ = dead.child.wait();
+                    break Ok(());
+                }
+                let focus = workspaces[ws_focus].focus;
+                let mut dead = workspaces[ws_focus].tabs.remove(focus);
+                let _ = dead.child.kill();
+                let _ = dead.child.wait();
+                if workspaces[ws_focus].tabs.is_empty() {
+                    workspaces.remove(ws_focus);
+                    if ws_focus >= workspaces.len() {
+                        ws_focus = workspaces.len() - 1;
+                    }
+                } else if workspaces[ws_focus].focus >= workspaces[ws_focus].tabs.len() {
+                    workspaces[ws_focus].focus = workspaces[ws_focus].tabs.len() - 1;
+                }
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::FocusTab(i)) => {
+                if i < workspaces[ws_focus].tabs.len() {
+                    workspaces[ws_focus].focus = i;
+                    focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                }
+            }
+            Ok(RunEvent::ChromeClick { x, y }) => {
+                let side = terminal::size().map(|(c, _)| sidebar_cols(c)).unwrap_or(0);
+                if side > 0 && x < side {
+                    match hit_test_sidebar(workspaces.len(), y) {
+                        TabBarHit::Focus(i) if i < workspaces.len() => {
+                            ws_focus = i;
+                            focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                        }
+                        TabBarHit::New => {
+                            let _ = tx.send(RunEvent::NewWorkspace);
+                        }
+                        _ => {}
+                    }
+                } else if y < TOP_BAR_ROWS {
+                    match hit_test_tab_bar(&workspaces[ws_focus].tabs, x.saturating_sub(side), if side == 0 { 4 } else { 1 }) {
+                        TabBarHit::Focus(i) => {
+                            workspaces[ws_focus].focus = i;
+                            focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+                        }
+                        TabBarHit::New => {
+                            let _ = tx.send(RunEvent::NewTab);
+                        }
+                        TabBarHit::Miss => {}
+                    }
+                }
+            }
+            Err(_) => break Ok(()),
         }
     };
 
     let _ = stdout().write_all(MOUSE_CAPTURE_DISABLE);
     let _ = stdout().flush();
     execute!(stdout(), terminal::LeaveAlternateScreen).ok();
+    if let Some(path) = control_path {
+        let _ = std::fs::remove_file(&path);
+        *CONTROL_SOCK.lock().unwrap() = None;
+    }
     terminal::disable_raw_mode()?;
     result
+}
+
+enum TabBarHit {
+    Focus(usize),
+    New,
+    Miss,
+}
+
+fn hit_test_tab_bar(tabs: &[LiveTab], x: u16, start: u16) -> TabBarHit {
+    let mut col = start;
+    for (i, tab) in tabs.iter().enumerate() {
+        let w = format!(" {} ", tab.kind.slug()).chars().count() as u16;
+        if x >= col && x < col + w {
+            return TabBarHit::Focus(i);
+        }
+        col = col.saturating_add(w);
+    }
+    if x >= col && x < col.saturating_add(3) {
+        return TabBarHit::New;
+    }
+    TabBarHit::Miss
+}
+
+fn hit_test_sidebar(n_workspaces: usize, y: u16) -> TabBarHit {
+    let mut row: u16 = 1;
+    for i in 0..n_workspaces {
+        if y >= row && y < row.saturating_add(SIDEBAR_SESSION_ROWS) {
+            return TabBarHit::Focus(i);
+        }
+        row = row.saturating_add(SIDEBAR_SESSION_ROWS);
+    }
+    if y >= row && y < row.saturating_add(2) {
+        return TabBarHit::New;
+    }
+    TabBarHit::Miss
+}
+
+fn expand_workspace_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
+    }
+    if trimmed == "~" {
+        return dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| trimmed.into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn workspace_title(path: &str) -> String {
+    let s = shorten_path(path);
+    std::path::Path::new(&s)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && n != "~")
+        .unwrap_or(s)
+}
+
+fn shorten_path(path: &str) -> String {
+    let mut s = path.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if s == home {
+            return "~".into();
+        }
+        let prefix = format!("{home}/");
+        if s.starts_with(&prefix) {
+            s = format!("~/{}", &s[prefix.len()..]);
+        }
+    }
+    const MAX: usize = 20;
+    if s.chars().count() <= MAX {
+        return s;
+    }
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 2 {
+        format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        s.chars().skip(s.chars().count().saturating_sub(MAX)).collect()
+    }
+}
+
+fn find_tab_by_id(workspaces: &[Workspace], id: u64) -> Option<(usize, usize)> {
+    for (wi, ws) in workspaces.iter().enumerate() {
+        if let Some(ti) = ws.tabs.iter().position(|t| t.id == id) {
+            return Some((wi, ti));
+        }
+    }
+    None
+}
+
+/// 1-based `--tab` among `tab_count` tabs. Never the caller's own index.
+fn resolve_other_tab_index(
+    tab_count: usize,
+    self_index: usize,
+    tab_1based: Option<usize>,
+) -> Result<usize, &'static str> {
+    let target = match tab_1based {
+        Some(t) if t >= 1 && t <= tab_count => t - 1,
+        Some(_) => return Err("no such tab"),
+        None => {
+            let others: Vec<usize> = (0..tab_count).filter(|i| *i != self_index).collect();
+            if others.len() == 1 {
+                others[0]
+            } else {
+                return Err("pass --tab N (1-based). You cannot target your own tab.");
+            }
+        }
+    };
+    if target == self_index {
+        return Err("cannot change your own tab");
+    }
+    Ok(target)
+}
+
+/// 1-based `--tab` in the caller's workspace, never the caller's own tab.
+fn resolve_other_tab(
+    workspaces: &[Workspace],
+    from_id: u64,
+    tab_1based: Option<usize>,
+) -> Result<(usize, usize), String> {
+    let (wi, self_ti) = find_tab_by_id(workspaces, from_id)
+        .ok_or_else(|| "could not identify this pane".to_string())?;
+    let n = workspaces[wi].tabs.len();
+    let target = resolve_other_tab_index(n, self_ti, tab_1based).map_err(str::to_string)?;
+    Ok((wi, target))
+}
+
+fn handle_pane_request(
+    req: crate::control::PaneRequest,
+    workspaces: &mut Vec<Workspace>,
+    ws_focus: &mut usize,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+    rx: &mpsc::Receiver<RunEvent>,
+) {
+    use crate::control::PaneOp;
+    match req.op {
+        PaneOp::NewTab { tool } => match tool {
+            Some(picked) => add_agent_tab(
+                workspaces, *ws_focus, picked, sink, mouse_sink, tx, generation, host_colors, tab_strip,
+            ),
+            None => {
+                let _ = tx.send(RunEvent::NewTab);
+            }
+        },
+        PaneOp::Hop { tab, tool } => {
+            let Ok((wi, ti)) = resolve_other_tab(workspaces, req.from_tab, tab) else {
+                debug_log("PANE_HOP_REFUSED", b"self or missing tab");
+                return;
+            };
+            let path = workspaces[wi].path.clone();
+            let from = workspaces[wi].tabs[ti].kind.tool();
+            let launch = match from {
+                None => Launch::Fresh,
+                Some(current) => hop_to(current, tool, &path, rx, false),
+            };
+            if let Err(e) = replace_tab_at(
+                &mut workspaces[wi],
+                ti,
+                tool,
+                &path,
+                launch,
+                sink,
+                mouse_sink,
+                tx,
+                generation,
+                host_colors,
+                tab_strip,
+            ) {
+                debug_log("PANE_HOP_ERR", format!("{e:#}").as_bytes());
+            }
+            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+        }
+        PaneOp::Close { tab } => {
+            let Ok((wi, ti)) = resolve_other_tab(workspaces, req.from_tab, tab) else {
+                debug_log("PANE_CLOSE_REFUSED", b"self or missing tab");
+                return;
+            };
+            if workspaces.len() == 1 && workspaces[wi].tabs.len() == 1 {
+                return;
+            }
+            let mut dead = workspaces[wi].tabs.remove(ti);
+            let _ = dead.child.kill();
+            let _ = dead.child.wait();
+            if workspaces[wi].tabs.is_empty() {
+                workspaces.remove(wi);
+                if *ws_focus >= workspaces.len() {
+                    *ws_focus = workspaces.len().saturating_sub(1);
+                } else if wi < *ws_focus {
+                    *ws_focus -= 1;
+                }
+            } else if workspaces[wi].focus >= workspaces[wi].tabs.len() {
+                workspaces[wi].focus = workspaces[wi].tabs.len() - 1;
+            } else if ti < workspaces[wi].focus {
+                workspaces[wi].focus -= 1;
+            }
+            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+        }
+        PaneOp::Focus { tab } => {
+            let Some((wi, _)) = find_tab_by_id(workspaces, req.from_tab) else { return };
+            let i = tab.saturating_sub(1);
+            if i < workspaces[wi].tabs.len() {
+                *ws_focus = wi;
+                workspaces[wi].focus = i;
+                focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+            }
+        }
+        PaneOp::WorkspaceNext if workspaces.len() > 1 => {
+            *ws_focus = (*ws_focus + 1) % workspaces.len();
+            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+        }
+        PaneOp::WorkspacePrev if workspaces.len() > 1 => {
+            *ws_focus = (*ws_focus + workspaces.len() - 1) % workspaces.len();
+            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+        }
+        PaneOp::WorkspaceNext | PaneOp::WorkspacePrev => {
+            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+        }
+        PaneOp::WorkspaceNew { path, tool } => {
+            let default_path = workspaces.get(*ws_focus).map(|w| w.path.clone()).unwrap_or_else(|| ".".into());
+            let path = match path {
+                Some(p) => expand_workspace_path(&p),
+                None => {
+                    let suppress = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].suppress.clone();
+                    match run_path_overlay(sink, &suppress, &default_path) {
+                        Some(p) => expand_workspace_path(&p),
+                        None => {
+                            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+                            return;
+                        }
+                    }
+                }
+            };
+            let picked = match tool {
+                Some(t) => t,
+                None => {
+                    let suppress = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].suppress.clone();
+                    let current = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus]
+                        .kind
+                        .tool()
+                        .unwrap_or(ToolName::Claude);
+                    match run_agent_picker(sink, overlay_click_sink, &suppress, current) {
+                        Some(t) => t,
+                        None => {
+                            focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+                            return;
+                        }
+                    }
+                }
+            };
+            unpaint_all(workspaces);
+            let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            match spawn_live_tab(
+                TabKind::Agent(picked),
+                &path,
+                Launch::Fresh,
+                sink,
+                mouse_sink,
+                tx,
+                generation_id,
+                host_colors,
+                true,
+                tab_strip.clone(),
+            ) {
+                Ok(tab) => {
+                    workspaces.push(Workspace { path, tabs: vec![tab], focus: 0 });
+                    *ws_focus = workspaces.len() - 1;
+                    sync_tab_strip(tab_strip, workspaces, *ws_focus);
+                }
+                Err(e) => {
+                    focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
+                    debug_log("PANE_WS_ERR", format!("{e:#}").as_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn add_agent_tab(
+    workspaces: &mut Vec<Workspace>,
+    ws_focus: usize,
+    tool: ToolName,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+) {
+    let path = workspaces[ws_focus].path.clone();
+    let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    workspaces[ws_focus].tabs[workspaces[ws_focus].focus]
+        .paint
+        .store(false, Ordering::SeqCst);
+    match spawn_live_tab(
+        TabKind::Agent(tool),
+        &path,
+        Launch::Fresh,
+        sink,
+        mouse_sink,
+        tx,
+        generation_id,
+        host_colors,
+        true,
+        tab_strip.clone(),
+    ) {
+        Ok(tab) => {
+            let ws = &mut workspaces[ws_focus];
+            ws.tabs.push(tab);
+            ws.focus = ws.tabs.len() - 1;
+            sync_tab_strip(tab_strip, workspaces, ws_focus);
+        }
+        Err(e) => {
+            focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
+            debug_log("NEW_TAB_ERR", format!("{e:#}").as_bytes());
+        }
+    }
+}
+
+fn replace_tab_at(
+    ws: &mut Workspace,
+    index: usize,
+    tool: ToolName,
+    project_path: &str,
+    launch: Launch,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+) -> anyhow::Result<()> {
+    let focused = ws.focus == index;
+    let mut dead = ws.tabs.remove(index);
+    dead.paint.store(false, Ordering::SeqCst);
+    let _ = dead.child.kill();
+    let _ = dead.child.wait();
+    let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let tab = spawn_live_tab(
+        TabKind::Agent(tool),
+        project_path,
+        launch,
+        sink,
+        mouse_sink,
+        tx,
+        generation_id,
+        host_colors,
+        focused,
+        tab_strip.clone(),
+    )?;
+    ws.tabs.insert(index, tab);
+    Ok(())
+}
+
+fn replace_focused_tab(
+    ws: &mut Workspace,
+    tool: ToolName,
+    project_path: &str,
+    launch: Launch,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    _overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+) -> anyhow::Result<()> {
+    let i = ws.focus;
+    replace_tab_at(ws, i, tool, project_path, launch, sink, mouse_sink, tx, generation, host_colors, tab_strip)
 }
 
 /// Shared by both hop paths -- Alt+Up/Down stepping next/prev, and picking
@@ -301,9 +1198,11 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
 /// seconds, and not draining `rx` during that window is what let a second
 /// hop keypress queue up and fire late, looking like a phantom extra hop),
 /// then returns the `Launch` the caller should hand to the next `run_one`.
-fn hop_to(current: ToolName, next: ToolName, project_path: &str, rx: &mpsc::Receiver<RunEvent>) -> Launch {
+fn hop_to(current: ToolName, next: ToolName, project_path: &str, rx: &mpsc::Receiver<RunEvent>, splash: bool) -> Launch {
     let splash_start = std::time::Instant::now();
-    let _ = draw_transition_splash(&mut stdout(), "Switching to", next);
+    if splash {
+        let _ = draw_transition_splash(&mut stdout(), "Switching to", next);
+    }
 
     let (result_tx, result_rx) = mpsc::channel();
     let path_for_thread = project_path.to_string();
@@ -325,10 +1224,12 @@ fn hop_to(current: ToolName, next: ToolName, project_path: &str, rx: &mpsc::Rece
         // until this hop lands.
         let _ = rx.recv_timeout(std::time::Duration::from_millis(50));
     };
-    if let Some(remaining) = SPLASH_MIN_DURATION.checked_sub(splash_start.elapsed()) {
-        std::thread::sleep(remaining);
+    if splash {
+        if let Some(remaining) = SPLASH_MIN_DURATION.checked_sub(splash_start.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        execute!(stdout(), cursor::Show).ok();
     }
-    execute!(stdout(), cursor::Show).ok();
     launch
 }
 
@@ -410,20 +1311,29 @@ fn resolve_project_path(path: String, warn_visibly: bool) -> String {
 /// faster than this floor.
 const SPLASH_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(550);
 
-/// Rows of `ah`'s own chrome around the child agent's screen: a 3-row
-/// block-letter "AH" logo strip pinned to the very top (see
-/// `write_top_bar`) plus the existing toggle bar pinned to the bottom (see
-/// `write_toggle_bar`). Both are drawn by us, never by the child -- the
-/// child's own pty is sized `rows - CHROME_ROWS` tall and its content is
-/// offset down by `TOP_BAR_ROWS` when composited into the real frame, so
-/// there's no coordinate a misbehaving child could send that reaches either
-/// row (see `child_screen_model_cannot_exceed_its_own_row_count`). A
-/// multi-row top strip (not one line of text) is what actually reads as a
-/// logo mark rather than a caption -- the bottom bar already carries the
-/// tool name and keybinding hints, so the top strip carries nothing but the
-/// brand itself.
-const TOP_BAR_ROWS: u16 = 3;
+/// Chrome around the child: a 1-row tab strip on top, a session sidebar
+/// on the left (when the terminal is wide enough), and the hop/hint bar
+/// on the bottom. The child's pty is `child_pty_size` — never our chrome.
+const TOP_BAR_ROWS: u16 = 1;
 const CHROME_ROWS: u16 = TOP_BAR_ROWS + 1;
+const SIDEBAR_COLS: u16 = 24;
+const SIDEBAR_MIN_TERM_COLS: u16 = 72;
+const SIDEBAR_SESSION_ROWS: u16 = 3;
+
+fn sidebar_cols(term_cols: u16) -> u16 {
+    if term_cols >= SIDEBAR_MIN_TERM_COLS {
+        SIDEBAR_COLS
+    } else {
+        0
+    }
+}
+
+fn child_pty_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
+    (
+        term_cols.saturating_sub(sidebar_cols(term_cols)).max(20),
+        term_rows.saturating_sub(CHROME_ROWS).max(4),
+    )
+}
 
 /// ah's own tmux/herdr-style prefix key -- Ctrl+B (0x02), matching herdr's
 /// own default exactly. Alt+Up/Down and clicking the toggle bar both
@@ -485,116 +1395,78 @@ const MOUSE_CAPTURE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 /// brand as the thing doing the handing-off.
 fn draw_transition_splash(out: &mut impl Write, verb: &str, tool: ToolName) -> anyhow::Result<()> {
     let (cols, rows) = terminal::size()?;
-    // `cursor::MoveTo(0, 0)` in the same batch as `Hide` is deliberate, not
-    // just belt-and-suspenders: `Hide` stops the cursor from *blinking*,
-    // but doesn't relocate it -- it stays wherever the just-exited agent
-    // last left it. Confirmed live as a real, visible glitch: a hidden
-    // cursor can still cause a one-frame flash of misplaced/deformed
-    // content right as the terminal repaints, if the real terminal's own
-    // redraw happens to race with `Hide` taking effect. Parking it at the
-    // origin removes any chance of that flash landing somewhere that looks
-    // wrong, regardless of timing.
     execute!(out, terminal::Clear(terminal::ClearType::All), cursor::Hide, cursor::MoveTo(0, 0))?;
-
-    // A brief brand-cyan bar sweeping top to bottom before the wordmark
-    // settles -- gives the transition actual motion instead of one static
-    // frame appearing and holding, which is what "switching agents" used
-    // to look like. ~100ms total, so it reads as a deliberate flourish, not
-    // a delay.
-    let sweep_frames = 6u16.min(rows.max(1));
-    for i in 0..sweep_frames {
-        let row = (u32::from(i) * u32::from(rows) / u32::from(sweep_frames)) as u16;
-        queue!(out, cursor::MoveTo(0, row), Print(theme::brand_cyan(&"\u{2588}".repeat(cols as usize))))?;
-        out.flush()?;
-        std::thread::sleep(std::time::Duration::from_millis(18));
-        queue!(out, cursor::MoveTo(0, row), Print(" ".repeat(cols as usize)))?;
-    }
-
-    let message = format!("{verb} {}...", tool.display_name());
-    let use_big = cols >= theme::BRAND_WORDMARK_WIDTH;
-
-    let wordmark_lines: Vec<&str> = if use_big { theme::BRAND_WORDMARK.trim_matches('\n').lines().collect() } else { Vec::new() };
-    let content_height = if use_big { wordmark_lines.len() as u16 + 2 } else { 2 };
-    let mut row = rows.saturating_sub(content_height) / 2;
-
-    if use_big {
-        // One shared column for every row, computed from the *widest* row --
-        // not `line.chars().count()` recomputed per row. The ANSI-Shadow
-        // letterforms are ragged on the right (e.g. "P"'s foot has no
-        // stroke on its bottom two rows), so several rows are a few
-        // characters "shorter" than the others purely because their
-        // trailing blank columns aren't part of the string at all, not
-        // because the artwork itself is narrower there. Centering each row
-        // independently by its own (different) length shifted those
-        // shorter rows rightward relative to the rest -- confirmed live as
-        // the actual cause of the wordmark looking like its last couple of
-        // rows were shifted right during the splash. Every row starts at
-        // the same left edge; the raggedness is purely on the right, where
-        // it belongs.
-        let wordmark_width = wordmark_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
-        let wordmark_col = cols.saturating_sub(wordmark_width) / 2;
-        for line in &wordmark_lines {
-            queue!(out, cursor::MoveTo(wordmark_col, row), Print(theme::bold(&theme::brand_cyan(line))))?;
-            row += 1;
-        }
-    } else {
-        let compact = "agent-hop";
-        let col = cols.saturating_sub(compact.chars().count() as u16) / 2;
-        queue!(out, cursor::MoveTo(col, row), Print(theme::brand()))?;
-        row += 1;
-    }
-    row += 1;
-    let col = cols.saturating_sub(message.chars().count() as u16) / 2;
-    queue!(out, cursor::MoveTo(col, row), Print(theme::tool_color(tool, &message)))?;
+    let line1 = "ah";
+    let line2 = format!("{verb} {}…", tool.display_name());
+    let row = rows.saturating_sub(3) / 2;
+    let c1 = cols.saturating_sub(line1.chars().count() as u16) / 2;
+    let c2 = cols.saturating_sub(line2.chars().count() as u16) / 2;
+    queue!(out, cursor::MoveTo(c1, row), Print(theme::grey(line1)))?;
+    queue!(out, cursor::MoveTo(c2, row.saturating_add(2)), Print(theme::grey(&line2)))?;
     out.flush()?;
     Ok(())
 }
+
 #[allow(clippy::too_many_arguments)]
-fn run_one(
-    tool: ToolName,
+fn spawn_live_tab(
+    kind: TabKind,
     project_path: &str,
     launch: Launch,
     sink: &Arc<Mutex<InputSink>>,
     mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
-    overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>,
     tx: &mpsc::Sender<RunEvent>,
-    rx: &mpsc::Receiver<RunEvent>,
     generation_id: u64,
     host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
-) -> anyhow::Result<RunOutcome> {
-    // Checked here, not just left to fail at spawn time: a resumed-from-
-    // search session (`ResumeInto`) can name a tool that was installed
-    // when that session was originally recorded but isn't anymore (or
-    // never was on this machine -- syncing session history across
-    // machines, for instance). Alt+Up/Down hopping is already immune to
-    // this (`next_installed` only ever cycles through installed tools),
-    // but that guard doesn't cover a session picked directly by name via
-    // search. Failing here gives a clean, actionable message instead of a
-    // raw spawn ENOENT that looks like "command not found" with no
-    // context about which agent or why.
-    if !tool.is_installed() {
-        anyhow::bail!("Cannot resume in {}: \"{}\" is not installed or not on PATH.", tool.slug(), tool.binary());
+    initially_focused: bool,
+    tab_strip: Arc<Mutex<TabStrip>>,
+) -> anyhow::Result<LiveTab> {
+    if let TabKind::Agent(tool) = kind {
+        if !tool.is_installed() {
+            anyhow::bail!("Cannot resume in {}: \"{}\" is not installed or not on PATH.", tool.slug(), tool.binary());
+        }
     }
     let t_run_one_start = std::time::Instant::now();
     let pty_system = native_pty_system();
-    let (cols, rows) = terminal::size()?;
+    let (term_cols, term_rows) = terminal::size()?;
+    let (cols, child_rows) = child_pty_size(term_cols, term_rows);
     let pair = pty_system.openpty(PtySize {
-        rows: rows.saturating_sub(CHROME_ROWS),
+        rows: child_rows,
         cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
 
-    let mut cmd = match &launch {
-        Launch::Fresh => CommandBuilder::new(tool.binary()),
-        Launch::Resume(session_id) => {
-            let argv = adapter_for(tool).resume_cmd(session_id, project_path);
-            let mut cmd = CommandBuilder::new(&argv[0]);
-            cmd.args(&argv[1..]);
-            cmd
+    let mut cmd = match kind {
+        TabKind::Shell => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            CommandBuilder::new(shell)
         }
+        TabKind::Agent(tool) => match &launch {
+            Launch::Fresh => CommandBuilder::new(tool.binary()),
+            Launch::Resume(session_id) => {
+                let argv = adapter_for(tool).resume_cmd(session_id, project_path);
+                let mut cmd = CommandBuilder::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                cmd
+            }
+        },
     };
     cmd.cwd(project_path);
+    if let Some(sock) = CONTROL_SOCK.lock().unwrap().as_ref() {
+        cmd.env(crate::control::SOCK_ENV, sock.to_string_lossy().as_ref());
+        cmd.env(crate::control::TAB_ENV, generation_id.to_string());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(rest) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&rest));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            }
+        }
+    }
     // If agent-hop itself is being run from inside a live Claude Code
     // session (e.g. testing agent-hop from within Claude Code, or any
     // other nested-agent scenario), these env vars leak into the spawned
@@ -614,7 +1486,7 @@ fn run_one(
             cmd.env_remove(key);
         }
     }
-    let mut child = pair.slave.spawn_command(cmd)?;
+    let child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     debug_log("TIMING_RUN_ONE_TO_SPAWN", format!("{:?}", t_run_one_start.elapsed()).as_bytes());
 
@@ -627,6 +1499,7 @@ fn run_one(
     *sink.lock().unwrap() = InputSink::Forward(writer.clone());
 
     let suppress = Arc::new(AtomicBool::new(false));
+    let paint = Arc::new(AtomicBool::new(initially_focused));
     // Resize requests are forwarded here rather than applied where they're
     // received (the main loop below, on the caller's thread). The pty
     // resize (which is what actually sends the child a real SIGWINCH) and
@@ -709,10 +1582,15 @@ fn run_one(
     // tracking mode/format -- swapped in lockstep with `sink` in
     // `MouseSink`, mirroring exactly how `InputSink` already routes raw
     // keystrokes to whichever child is currently active.
-    *mouse_sink.lock().unwrap() = Some(byte_tx.clone());
+    let wake_tx = byte_tx.clone();
+    if initially_focused {
+        *mouse_sink.lock().unwrap() = Some(byte_tx.clone());
+        *sink.lock().unwrap() = InputSink::Forward(writer.clone());
+    }
 
     let vt_writer = writer.clone();
     let writer_for_mouse = writer.clone();
+    let paint_thread = paint.clone();
     let (host_fg, host_bg) = host_colors;
     std::thread::spawn(move || {
         // The child's raw bytes are never written to the real terminal
@@ -736,16 +1614,37 @@ fn run_one(
         // every ratatui app), so nothing in this file re-implements
         // terminal *rendering* by hand -- only the read side, from
         // libghostty-vt's own render-state API.
-        let mut applied_dims = (cols, rows);
-        let mut term = vt::Terminal::with_host_colors(cols, rows.saturating_sub(CHROME_ROWS), vt_writer, host_fg, host_bg);
+        let mut applied_dims = (term_cols, term_rows);
+        let mut term = vt::Terminal::with_host_colors(cols, child_rows, vt_writer, host_fg, host_bg);
+        let mut rterm: Option<RTerminal<CrosstermBackend<Stdout>>> = None;
 
-        let Ok(mut rterm) = RTerminal::new(CrosstermBackend::new(stdout())) else {
-            let _ = tx_out.send(RunEvent::ChildExited(generation_id));
-            return;
+        let paint_frame = |rterm: &mut Option<RTerminal<CrosstermBackend<Stdout>>>, term: &mut vt::Terminal, strip: &TabStrip| {
+            let Some(rt) = (if rterm.is_none() {
+                match RTerminal::new(CrosstermBackend::new(stdout())) {
+                    Ok(mut t) => {
+                        // Splash (and any previous tab) painted outside
+                        // ratatui. Reset the real screen and ratatui's
+                        // back buffer so the first draw is a full frame,
+                        // not a diff against leftover wordmark cells.
+                        let _ = t.clear();
+                        *rterm = Some(t);
+                        rterm.as_mut()
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                rterm.as_mut()
+            }) else {
+                return;
+            };
+            if let Err(e) = render_frame(rt, term, kind, strip) {
+                debug_log("RENDER_FRAME_ERR", format!("{e:#}").as_bytes());
+            }
         };
-        let _ = rterm.clear();
-        if let Err(e) = render_frame(&mut rterm, &mut term, tool) {
-            debug_log("RENDER_FRAME_ERR", format!("{e:#}").as_bytes());
+
+        if paint_thread.load(Ordering::SeqCst) {
+            let strip = tab_strip.lock().unwrap().clone();
+            paint_frame(&mut rterm, &mut term, &strip);
         }
 
         // How often the loop wakes up even with no child data, purely to
@@ -766,7 +1665,7 @@ fn run_one(
             if current_dims != *applied_dims {
                 debug_log("RESIZE_APPLIED_TO_MODEL", format!("{applied_dims:?} -> {current_dims:?}").as_bytes());
                 *applied_dims = current_dims;
-                let new_child_rows = current_dims.1.saturating_sub(CHROME_ROWS);
+                let (new_cols, new_child_rows) = child_pty_size(current_dims.0, current_dims.1);
                 // The pty resize (which is what actually delivers SIGWINCH
                 // to the child) and the model resize below happen back to
                 // back on this one thread, with nothing else able to run
@@ -777,11 +1676,11 @@ fn run_one(
                 // resizes its own buffers automatically before every frame.
                 let _ = master.resize(PtySize {
                     rows: new_child_rows,
-                    cols: current_dims.0,
+                    cols: new_cols,
                     pixel_width: 0,
                     pixel_height: 0,
                 });
-                term.resize(current_dims.0, new_child_rows);
+                term.resize(new_cols, new_child_rows);
             }
             current_dims
         };
@@ -802,11 +1701,16 @@ fn run_one(
             // is a full repaint rather than a diff against a screen that
             // no longer reflects reality.
             let is_suppressed = suppress_thread.load(Ordering::SeqCst);
-            if was_suppressed && !is_suppressed {
-                let _ = rterm.clear();
-                if let Err(e) = render_frame(&mut rterm, &mut term, tool) {
-                    debug_log("RENDER_FRAME_ERR", format!("{e:#}").as_bytes());
+            let is_paint = paint_thread.load(Ordering::SeqCst);
+            if !is_paint {
+                rterm = None;
+            }
+            if was_suppressed && !is_suppressed && is_paint {
+                if let Some(rt) = rterm.as_mut() {
+                    let _ = rt.clear();
                 }
+                let strip = tab_strip.lock().unwrap().clone();
+                paint_frame(&mut rterm, &mut term, &strip);
             }
             was_suppressed = is_suppressed;
 
@@ -815,10 +1719,9 @@ fn run_one(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let before = applied_dims;
                     apply_resize_if_pending(&mut applied_dims, &mut term);
-                    if applied_dims != before && !suppress_thread.load(Ordering::SeqCst) {
-                        if let Err(e) = render_frame(&mut rterm, &mut term, tool) {
-                            debug_log("RENDER_FRAME_ERR", format!("{e:#}").as_bytes());
-                        }
+                    if applied_dims != before && !suppress_thread.load(Ordering::SeqCst) && paint_thread.load(Ordering::SeqCst) {
+                        let strip = tab_strip.lock().unwrap().clone();
+                        paint_frame(&mut rterm, &mut term, &strip);
                     }
                 }
                 Ok(ChildMsg::Bytes(data)) => {
@@ -828,10 +1731,9 @@ fn run_one(
                     // While the search overlay owns the screen, still drain
                     // the child's output (so its pty buffer never fills and
                     // blocks it) but don't paint over the overlay with it.
-                    if !suppress_thread.load(Ordering::SeqCst) {
-                        if let Err(e) = render_frame(&mut rterm, &mut term, tool) {
-                            debug_log("RENDER_FRAME_ERR", format!("{e:#}").as_bytes());
-                        }
+                    if !suppress_thread.load(Ordering::SeqCst) && paint_thread.load(Ordering::SeqCst) {
+                        let strip = tab_strip.lock().unwrap().clone();
+                        paint_frame(&mut rterm, &mut term, &strip);
                     }
                 }
                 // Mouse events pass through only if this specific child
@@ -845,94 +1747,37 @@ fn run_one(
                         let _ = w.flush();
                     }
                 }
+                Ok(ChildMsg::Wake) => {
+                    if paint_thread.load(Ordering::SeqCst) {
+                        if let Some(rt) = rterm.as_mut() {
+                            let _ = rt.clear();
+                        } else if let Ok(mut t) = RTerminal::new(CrosstermBackend::new(stdout())) {
+                            let _ = t.clear();
+                            rterm = Some(t);
+                        }
+                        let strip = tab_strip.lock().unwrap().clone();
+                        paint_frame(&mut rterm, &mut term, &strip);
+                    } else {
+                        rterm = None;
+                    }
+                }
                 Ok(ChildMsg::Eof) => break,
             }
         }
         let _ = tx_out.send(RunEvent::ChildExited(generation_id));
     });
 
-    // No initial render call here: the render thread above owns the one
-    // and only `ratatui::Terminal` instance writing to stdout, and draws
-    // the first frame (child content plus the toggle bar) itself before
-    // this function ever reaches this point. A second, independent write
-    // to stdout from here would be exactly the kind of unsynchronized
-    // cross-thread write that corrupted the bar in the old design -- see
-    // `render_frame`'s doc comment for why that whole class of bug is now
-    // structurally impossible instead of just avoided.
-
-    let outcome = loop {
-        match rx.recv() {
-            Ok(RunEvent::ChildExited(g)) if g == generation_id => break RunOutcome::Exited,
-            Ok(RunEvent::ChildExited(_)) => continue, // stale event from a prior killed child
-            Ok(RunEvent::Hop(dir)) => break RunOutcome::Hop(dir),
-            Ok(RunEvent::Resized(new_cols, new_rows)) => {
-                debug_log("MAIN_THREAD_RESIZE_RECEIVED", format!("{new_cols}x{new_rows}").as_bytes());
-                // Only forwarded here, never applied -- the parser thread
-                // is the sole owner of both the pty resize and the model
-                // resize (see the comment on `resize_tx`'s creation above).
-                let _ = resize_tx.send((new_cols, new_rows));
-                continue;
-            }
-            Ok(RunEvent::SearchResume) => {
-                match run_search_overlay(sink, &suppress) {
-                    resume::ResumeOutcome::Resume(selected) => {
-                        break RunOutcome::ResumeInto {
-                            tool: selected.tool,
-                            session_id: selected.session_id,
-                            project_path: selected.project_path,
-                        }
-                    }
-                    resume::ResumeOutcome::Cancelled => {
-                        crate::telemetry::capture("search_cancelled", serde_json::json!({ "via": "overlay" }));
-                        // Every overlay leaves `sink` parked on
-                        // `InputSink::Capture` (see its own doc comment on
-                        // why it can't restore this itself). Whenever we're
-                        // about to keep running the *same* child rather
-                        // than replacing it, that capture state has to be
-                        // explicitly swapped back to `Forward` here --
-                        // confirmed live as a real bug: without this,
-                        // every keystroke typed after cancelling an
-                        // overlay silently vanished (routed into a
-                        // channel whose receiver had already been dropped
-                        // along with the overlay's own local state)
-                        // instead of ever reaching the child again.
-                        *sink.lock().unwrap() = InputSink::Forward(writer.clone());
-                        continue;
-                    }
-                    resume::ResumeOutcome::Quit => break RunOutcome::Quit,
-                }
-            }
-            Ok(RunEvent::AgentPicker) => match run_agent_picker(sink, overlay_click_sink, &suppress, tool) {
-                Some(picked) if picked != tool => break RunOutcome::HopTo(picked),
-                _ => {
-                    // See the matching comment on `SearchResume`'s
-                    // `Cancelled` arm above -- same restoration, same
-                    // reason, for the "cancelled or re-picked the agent
-                    // already running" case here.
-                    *sink.lock().unwrap() = InputSink::Forward(writer.clone());
-                    continue;
-                }
-            },
-            Ok(RunEvent::ShowHelp) => {
-                run_help_overlay(sink, &suppress);
-                *sink.lock().unwrap() = InputSink::Forward(writer.clone());
-                continue; // always returns to this same running child
-            }
-            Err(_) => break RunOutcome::Exited,
-        }
-    };
-
-    *sink.lock().unwrap() = InputSink::Idle;
-    *mouse_sink.lock().unwrap() = None;
-
-    let t_kill = std::time::Instant::now();
-    if !matches!(outcome, RunOutcome::Exited) {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    debug_log("TIMING_CHILD_KILL_WAIT", format!("{:?}", t_kill.elapsed()).as_bytes());
-
-    Ok(outcome)
+    Ok(LiveTab {
+        id: generation_id,
+        kind,
+        project_path: project_path.to_string(),
+        writer,
+        resize_tx,
+        wake_tx,
+        paint,
+        suppress,
+        child,
+    })
 }
 
 /// Pauses the current child's output, takes over the screen with the
@@ -1127,12 +1972,27 @@ fn draw_agent_picker(out: &mut impl Write, installed: &[ToolName], selected: usi
 /// discoverable way to see this list; the toggle bar's own hint text is
 /// necessarily terse and can't fit all of it.
 const HELP_LINES: &[(&str, &str)] = &[
-    ("Ctrl+B then n", "Switch to next installed agent"),
-    ("Ctrl+B then p", "Switch to previous installed agent"),
-    ("Ctrl+B then a", "Open the agent picker (click or arrow keys + Enter)"),
+    ("Ctrl+B then n", "Hop this chat to the next agent — keeps the conversation"),
+    ("Ctrl+B then p", "Hop this chat to the previous agent"),
+    ("Ctrl+B then a", "Hop via the agent picker"),
+    ("Click the bottom bar", "Same hop picker — mouse works anywhere chrome is"),
+    ("Click a tab or +", "Focus that tab, or open a new agent in this workspace"),
+    ("Click a workspace or +", "Switch workspace, or start a new one"),
+    ("Ctrl+B then c", "New tab in this workspace"),
+    ("ah tab [agent]", "From a pane: open a new tab"),
+    ("ah hop AGENT [--tab N]", "From a pane: hop another tab (never this one)"),
+    ("ah close [--tab N]", "From a pane: close another tab"),
+    ("ah focus N", "From a pane: focus that tab"),
+    ("ah workspace [next|prev]", "From a pane: workspaces"),
+    ("Ctrl+B then w", "New workspace (folder), then pick an agent"),
+    ("Ctrl+B then ] / [", "Next / previous workspace"),
+    ("Ctrl+B then o", "Next tab in this workspace"),
+    ("Ctrl+B then i", "Previous tab in this workspace"),
+    ("Ctrl+B then 1-9", "Focus that tab"),
+    ("Ctrl+B then x", "Close this tab"),
     ("Ctrl+B then ?", "Show this help"),
-    ("Alt+\u{2191} / Alt+\u{2193}", "Switch agent (where the terminal supports it)"),
-    ("Click the bottom bar", "Open the agent picker"),
+    ("Alt+\u{2191} / Alt+\u{2193}", "Hop next / previous (where the terminal supports it)"),
+    ("ah feedback \"…\"", "Command in the shell (not a key) — send us a note"),
     ("Ctrl+R", "Search and resume a past session"),
 ];
 
@@ -1245,6 +2105,35 @@ fn draw_help_overlay(out: &mut impl Write) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_path_overlay(sink: &Arc<Mutex<InputSink>>, suppress: &Arc<AtomicBool>, default: &str) -> Option<String> {
+    suppress.store(true, Ordering::SeqCst);
+    let (key_tx, key_rx) = mpsc::channel::<Vec<u8>>();
+    *sink.lock().unwrap() = InputSink::Capture(key_tx);
+    let mut keys = ChannelKeys::new(key_rx);
+    let mut buf = default.to_string();
+    let mut out = stdout();
+    let chosen = loop {
+        if draw_path_prompt(&mut out, &buf).is_err() {
+            break None;
+        }
+        match keys.next_key() {
+            Ok(Some(resume::SearchKey::Char(c))) if !c.is_control() => buf.push(c),
+            Ok(Some(resume::SearchKey::Backspace)) => {
+                buf.pop();
+            }
+            Ok(Some(resume::SearchKey::Enter)) => break Some(buf.trim().to_string()).filter(|s| !s.is_empty()).or_else(|| Some(default.to_string())),
+            Ok(Some(resume::SearchKey::Escape)) | Ok(Some(resume::SearchKey::Quit)) | Ok(None) | Err(_) => break None,
+            Ok(Some(_)) => {}
+        }
+    };
+    suppress.store(false, Ordering::SeqCst);
+    chosen
+}
+
+fn draw_path_prompt(out: &mut impl Write, value: &str) -> anyhow::Result<()> {
+    draw_centered_message(out, "New workspace", &format!("{value}█"))
+}
+
 /// Renders one full frame: the agent's own content (from
 /// `term.renderable_content()`) plus the toggle bar composed into the same
 /// `ratatui::buffer::Buffer`, then handed to `ratatui::Terminal::draw` --
@@ -1255,7 +2144,7 @@ fn draw_help_overlay(out: &mut impl Write) -> anyhow::Result<()> {
 /// handle for it, which is what makes the whole "something else clobbered
 /// the status row" family of bugs from the previous design structurally
 /// unreachable now rather than merely mitigated.
-fn render_frame(rterm: &mut RTerminal<CrosstermBackend<Stdout>>, term: &mut vt::Terminal, tool: ToolName) -> anyhow::Result<()> {
+fn render_frame(rterm: &mut RTerminal<CrosstermBackend<Stdout>>, term: &mut vt::Terminal, kind: TabKind, strip: &TabStrip) -> anyhow::Result<()> {
     // `cursor()` is what actually triggers libghostty-vt's render-state
     // update for this frame (see its doc comment in vt.rs) -- must run
     // before `for_each_cell`, which reuses that same snapshot rather than
@@ -1265,18 +2154,31 @@ fn render_frame(rterm: &mut RTerminal<CrosstermBackend<Stdout>>, term: &mut vt::
         let area = frame.area();
         let bar_row = area.height.saturating_sub(1);
         let buf = frame.buffer_mut();
+        let side = sidebar_cols(area.width);
+
+        // Blank the child pane first. Splash and the previous tab write
+        // straight to the real terminal; ratatui then diffs. Cells the
+        // child never draws (Codex's idle middle, Claude's gutters) would
+        // otherwise keep the wordmark / old agent until something overwrote
+        // them -- confirmed as the first-frame "ENT HOP" overlay.
+        for y in TOP_BAR_ROWS..bar_row {
+            for x in side..area.width {
+                let Some(c) = buf.cell_mut((x, y)) else { continue };
+                c.set_char(' ');
+                c.fg = RColor::Reset;
+                c.bg = RColor::Reset;
+                c.modifier = RModifier::empty();
+                c.skip = false;
+            }
+        }
 
         term.for_each_cell(|x, y, cell| {
-            // The child's own coordinate space starts at 0, but its content
-            // is composited starting one row down from the real top --
-            // `TOP_BAR_ROWS` is ours, drawn separately below, never the
-            // child's to touch (its own pty is sized `rows - CHROME_ROWS`
-            // tall, so no coordinate it sends can even reach this row).
+            let real_x = x.saturating_add(side);
             let real_y = y + TOP_BAR_ROWS;
-            if x >= area.width || real_y >= bar_row {
+            if real_x >= area.width || real_y >= bar_row {
                 return;
             }
-            let Some(rc) = buf.cell_mut((x, real_y)) else { return };
+            let Some(rc) = buf.cell_mut((real_x, real_y)) else { return };
             if cell.wide_spacer {
                 rc.set_symbol("");
                 rc.skip = true;
@@ -1293,12 +2195,14 @@ fn render_frame(rterm: &mut RTerminal<CrosstermBackend<Stdout>>, term: &mut vt::
             rc.skip = false;
         });
 
-        write_top_bar(buf, area.width);
-        write_toggle_bar(buf, area.width, bar_row, tool);
+        write_top_bar(buf, area.width, side, strip);
+        write_toggle_bar(buf, area.width, bar_row, side, kind);
+        write_sidebar(buf, area.width, area.height, strip);
 
+        let cursor_real_x = cursor.x.saturating_add(side);
         let cursor_real_y = cursor.y + TOP_BAR_ROWS;
-        if cursor.visible && cursor.x < area.width && cursor_real_y < bar_row {
-            frame.set_cursor_position((cursor.x, cursor_real_y));
+        if cursor.visible && cursor_real_x < area.width && cursor_real_y < bar_row {
+            frame.set_cursor_position((cursor_real_x, cursor_real_y));
         }
     })?;
     Ok(())
@@ -1338,23 +2242,112 @@ fn render_frame(rterm: &mut RTerminal<CrosstermBackend<Stdout>>, term: &mut vt::
 /// ACK leaking into the child agent as typed input, and an intermittent
 /// real terminal scroll) -- see `write_toggle_bar`'s own "Logo history" doc
 /// comment.
-fn write_top_bar(buf: &mut Buffer, width: u16) {
-    let brand_rgb = RColor::Rgb(theme::BRAND_RGB.0, theme::BRAND_RGB.1, theme::BRAND_RGB.2);
-    for row in 0..TOP_BAR_ROWS {
-        for x in 0..width {
-            let Some(c) = buf.cell_mut((x, row)) else { continue };
+const CHROME_BG: RColor = RColor::Rgb(18, 18, 22);
+const CHROME_RAISED: RColor = RColor::Rgb(38, 38, 44);
+const CHROME_TEXT: RColor = RColor::Rgb(220, 220, 224);
+const CHROME_DIM: RColor = RColor::Rgb(120, 120, 128);
+
+const CHROME_ACCENT: RColor = RColor::Rgb(theme::BRAND_RGB.0, theme::BRAND_RGB.1, theme::BRAND_RGB.2);
+
+fn write_top_bar(buf: &mut Buffer, width: u16, side: u16, strip: &TabStrip) {
+    if side >= width {
+        return;
+    }
+    fill_rect(buf, side, 0, width.saturating_sub(side), TOP_BAR_ROWS, CHROME_BG);
+    let mid_row = TOP_BAR_ROWS / 2;
+    let mut col: u16 = side.saturating_add(1);
+    if side == 0 {
+        let ah = Span::styled("ah ", Style::default().fg(CHROME_ACCENT).bg(CHROME_BG).add_modifier(RModifier::BOLD));
+        buf.set_span(col, mid_row, &ah, 3);
+        col += 3;
+    }
+    for (i, kind) in strip.tabs.iter().enumerate() {
+        let focused = i == strip.tab_focus;
+        let label = format!(" {} ", kind.slug());
+        let style = if focused {
+            Style::default().fg(CHROME_TEXT).bg(CHROME_RAISED).add_modifier(RModifier::BOLD)
+        } else {
+            Style::default().fg(CHROME_DIM).bg(CHROME_BG)
+        };
+        let span = Span::styled(label.clone(), style);
+        let w = label.chars().count() as u16;
+        if col + w >= width {
+            break;
+        }
+        buf.set_span(col, mid_row, &span, w);
+        col += w;
+    }
+    if col + 3 < width {
+        let plus = Span::styled(" + ", Style::default().fg(CHROME_DIM).bg(CHROME_BG));
+        buf.set_span(col, mid_row, &plus, 3);
+    }
+}
+
+fn fill_rect(buf: &mut Buffer, x0: u16, y0: u16, width: u16, height: u16, bg: RColor) {
+    for y in y0..y0.saturating_add(height) {
+        for x in x0..x0.saturating_add(width) {
+            let Some(c) = buf.cell_mut((x, y)) else { continue };
             c.set_char(' ');
             c.fg = RColor::Reset;
-            c.bg = brand_rgb;
+            c.bg = bg;
             c.modifier = RModifier::empty();
             c.skip = false;
         }
     }
-    let mid_row = TOP_BAR_ROWS / 2;
-    let text = "AGENT-HOP";
-    let span = Span::styled(text, Style::default().fg(RColor::Black).bg(brand_rgb).add_modifier(RModifier::BOLD));
-    let start_col = width.saturating_sub(text.chars().count() as u16) / 2;
-    buf.set_span(start_col, mid_row, &span, text.chars().count() as u16);
+}
+
+fn write_sidebar(buf: &mut Buffer, term_width: u16, term_height: u16, strip: &TabStrip) {
+    let side = sidebar_cols(term_width);
+    if side == 0 {
+        return;
+    }
+    let bg = CHROME_BG;
+    let bg_focus = CHROME_RAISED;
+    let dim = CHROME_DIM;
+    fill_rect(buf, 0, 0, side, term_height, bg);
+
+    let header = Span::styled(" ah", Style::default().fg(CHROME_ACCENT).bg(bg).add_modifier(RModifier::BOLD));
+    buf.set_span(0, 0, &header, side);
+
+    let mut row: u16 = 1;
+    for (i, (path, n_tabs)) in strip.workspaces.iter().enumerate() {
+        if row + 1 >= term_height {
+            break;
+        }
+        let focused = i == strip.ws_focus;
+        let block_bg = if focused { bg_focus } else { bg };
+        fill_rect(buf, 0, row, side, SIDEBAR_SESSION_ROWS.min(term_height.saturating_sub(row)), block_bg);
+        let name_style = if focused {
+            Style::default().fg(CHROME_TEXT).bg(block_bg).add_modifier(RModifier::BOLD)
+        } else {
+            Style::default().fg(CHROME_TEXT).bg(block_bg)
+        };
+        let name = format!(" {}", workspace_title(path));
+        buf.set_span(0, row, &Span::styled(name, name_style), side);
+        if focused {
+            if let Some(c) = buf.cell_mut((0, row)) {
+                c.set_char('▎');
+                c.fg = CHROME_TEXT;
+                c.bg = block_bg;
+            }
+        }
+        let status = if *n_tabs == 1 { " 1 tab".to_string() } else { format!(" {n_tabs} tabs") };
+        buf.set_span(
+            0,
+            row + 1,
+            &Span::styled(status, Style::default().fg(dim).bg(block_bg)),
+            side,
+        );
+        if row + 2 < term_height {
+            let cwd = format!(" {}", shorten_path(path));
+            buf.set_span(0, row + 2, &Span::styled(cwd, Style::default().fg(dim).bg(block_bg)), side);
+        }
+        row = row.saturating_add(SIDEBAR_SESSION_ROWS);
+    }
+    if row < term_height {
+        let plus = Span::styled(" + workspace", Style::default().fg(dim).bg(bg));
+        buf.set_span(0, row, &plus, side);
+    }
 }
 
 /// Composes the status row directly into the frame buffer: agent-hop's own
@@ -1378,34 +2371,22 @@ fn write_top_bar(buf: &mut Buffer, width: u16) {
 /// aren't enough pixels for it to work. Plain colored text has neither
 /// problem, and composing it into the same buffer the agent's own content
 /// renders from means it can never be a separate, racing write.
-fn write_toggle_bar(buf: &mut Buffer, width: u16, row: u16, tool: ToolName) {
-    // Blank the row first: `set_line` below only writes as many cells as
-    // the rendered text needs, and ratatui hands back whichever of its two
-    // internal buffers held the frame from *two* draws ago, not a blank
-    // one -- any cell past the end of the text would otherwise still show
-    // whatever was there that far back.
-    for x in 0..width {
-        let Some(c) = buf.cell_mut((x, row)) else { continue };
-        c.set_char(' ');
-        c.fg = RColor::Reset;
-        c.bg = RColor::Reset;
-        c.modifier = RModifier::empty();
-        c.skip = false;
+fn write_toggle_bar(buf: &mut Buffer, width: u16, row: u16, side: u16, kind: TabKind) {
+    if side >= width {
+        return;
     }
-    let brand_style = Style::default().fg(RColor::Rgb(theme::BRAND_RGB.0, theme::BRAND_RGB.1, theme::BRAND_RGB.2)).add_modifier(RModifier::BOLD);
-    let tag_style = Style::default().fg(theme::tool_ratatui_color(tool)).add_modifier(RModifier::BOLD);
-    let hint_style = Style::default().fg(theme::GREY_RATATUI);
+    fill_rect(buf, side, row, width.saturating_sub(side), 1, CHROME_BG);
+    let tag_style = Style::default().fg(CHROME_TEXT).bg(CHROME_BG);
+    let hint_style = Style::default().fg(CHROME_DIM).bg(CHROME_BG);
     let line = RLine::from(vec![
         Span::raw(" "),
-        Span::styled("agent-hop", brand_style),
-        Span::raw(" "),
-        Span::styled("\u{25b8}", hint_style),
-        Span::raw(" "),
-        Span::styled(format!("[{}]", tool.slug()), tag_style),
+        Span::styled(format!("[{}]", kind.slug()), tag_style),
         Span::raw("  "),
-        Span::styled("Ctrl+B ? for shortcuts \u{00b7} Alt+\u{2191}/\u{2193} switch agent \u{00b7} Ctrl+R resume", hint_style),
+        Span::styled("Ctrl+B n  hop this chat to another agent", hint_style),
+        Span::raw("  "),
+        Span::styled("Ctrl+B ?  keys", hint_style),
     ]);
-    buf.set_line(0, row, &line, width);
+    buf.set_line(side, row, &line, width.saturating_sub(side));
 }
 
 /// Where raw stdin bytes currently go: forwarded straight to the active
@@ -1438,6 +2419,9 @@ enum ChildMsg {
     /// error, instead of relying on `byte_rx` disconnecting -- see that
     /// send site's own doc comment for the deadlock this replaces.
     Eof,
+    /// Focused this tab: parser thread should take the ratatui terminal
+    /// and paint, or drop it if we just lost focus.
+    Wake,
 }
 
 /// One event stream for `run_agent_picker`'s own loop, merging its two
@@ -1541,9 +2525,10 @@ enum MouseDecode {
     /// the current agent's name, so it opens the same agent list Alt+Up/Down
     /// cycles through, rather than just being silently dropped.
     OpenAgentPicker,
+    /// Left-click on our chrome (top strip or session sidebar).
+    ChromeClick { x: u16, y: u16 },
     /// A valid SGR report, but not one that means anything here (e.g. a
-    /// click on the top brand bar, or a release/motion/right-click on the
-    /// bottom bar).
+    /// release/motion/right-click on chrome).
     Ignore,
     /// Not an SGR mouse report at all -- caller should fall through to
     /// other CSI handling (Alt+Up/Down, Ctrl+R, or plain forwarding).
@@ -1597,15 +2582,32 @@ fn parse_sgr_mouse(seq: &[u8]) -> MouseDecode {
     // see `CHROME_ROWS` -- so a click landing on either doesn't have a
     // meaningful child-relative coordinate to forward.
     let real_y = py.saturating_sub(1);
-    if let Ok((_, real_rows)) = terminal::size() {
-        let on_bottom_bar = real_y + 1 == real_rows;
-        if real_y < TOP_BAR_ROWS || on_bottom_bar {
+    let real_x = px.saturating_sub(1);
+    if let Ok((term_cols, real_rows)) = terminal::size() {
+        let side = sidebar_cols(term_cols);
+        let on_bottom_bar = real_x >= side && real_y + 1 == real_rows;
+        let on_top = real_x >= side && real_y < TOP_BAR_ROWS;
+        let on_sidebar = side > 0 && real_x < side;
+        if on_top || on_bottom_bar || on_sidebar {
             let is_left_press = final_byte == b'M' && cb & 0b11 == 0 && cb & 0b0110_0000 == 0;
-            return if on_bottom_bar && is_left_press { MouseDecode::OpenAgentPicker } else { MouseDecode::Ignore };
+            return if on_bottom_bar && is_left_press {
+                MouseDecode::OpenAgentPicker
+            } else if is_left_press {
+                MouseDecode::ChromeClick { x: real_x, y: real_y }
+            } else {
+                MouseDecode::Ignore
+            };
         }
+        let x = real_x.saturating_sub(side);
+        let y = real_y.saturating_sub(TOP_BAR_ROWS);
+        return decode_child_mouse(cb, final_byte, x, y);
     }
-    let x = px.saturating_sub(1);
+    let x = real_x;
     let y = real_y.saturating_sub(TOP_BAR_ROWS);
+    decode_child_mouse(cb, final_byte, x, y)
+}
+
+fn decode_child_mouse(cb: u32, final_byte: u8, x: u16, y: u16) -> MouseDecode {
     let mods = vt::MouseMods { shift: cb & 4 != 0, alt: cb & 8 != 0, ctrl: cb & 16 != 0 };
 
     if cb & 64 != 0 {
@@ -1912,6 +2914,39 @@ fn spawn_stdin_relay(
                                     debug_log("TRIGGER_PREFIX_AGENT_PICKER", &pending[..2]);
                                     let _ = tx.send(RunEvent::AgentPicker);
                                 }
+                                b'c' | b'C' => {
+                                    debug_log("TRIGGER_PREFIX_NEW_TAB", &pending[..2]);
+                                    let _ = tx.send(RunEvent::NewTab);
+                                }
+                                b'w' | b'W' => {
+                                    debug_log("TRIGGER_PREFIX_NEW_WORKSPACE", &pending[..2]);
+                                    let _ = tx.send(RunEvent::NewWorkspace);
+                                }
+                                b']' => {
+                                    debug_log("TRIGGER_PREFIX_NEXT_WORKSPACE", &pending[..2]);
+                                    let _ = tx.send(RunEvent::NextWorkspace);
+                                }
+                                b'[' => {
+                                    debug_log("TRIGGER_PREFIX_PREV_WORKSPACE", &pending[..2]);
+                                    let _ = tx.send(RunEvent::PrevWorkspace);
+                                }
+                                b'o' | b'O' => {
+                                    debug_log("TRIGGER_PREFIX_NEXT_TAB", &pending[..2]);
+                                    let _ = tx.send(RunEvent::NextTab);
+                                }
+                                b'i' | b'I' => {
+                                    debug_log("TRIGGER_PREFIX_PREV_TAB", &pending[..2]);
+                                    let _ = tx.send(RunEvent::PrevTab);
+                                }
+                                b'x' | b'X' => {
+                                    debug_log("TRIGGER_PREFIX_CLOSE_TAB", &pending[..2]);
+                                    let _ = tx.send(RunEvent::CloseTab);
+                                }
+                                b'1'..=b'9' => {
+                                    let idx = (chord - b'1') as usize;
+                                    debug_log("TRIGGER_PREFIX_FOCUS_TAB", &pending[..2]);
+                                    let _ = tx.send(RunEvent::FocusTab(idx));
+                                }
                                 b'?' => {
                                     debug_log("TRIGGER_PREFIX_HELP", &pending[..2]);
                                     let _ = tx.send(RunEvent::ShowHelp);
@@ -2004,6 +3039,10 @@ fn spawn_stdin_relay(
                                         }
                                         MouseDecode::OpenAgentPicker => {
                                             let _ = tx.send(RunEvent::AgentPicker);
+                                            continue;
+                                        }
+                                        MouseDecode::ChromeClick { x, y } => {
+                                            let _ = tx.send(RunEvent::ChromeClick { x, y });
                                             continue;
                                         }
                                         MouseDecode::Ignore => continue,
@@ -2136,45 +3175,47 @@ mod sgr_mouse_parser_tests {
     // it feeds only ever *excludes* events near the real top/bottom edge,
     // never changes the coordinate math for one safely in the middle).
 
+    // Use a column past the session sidebar so these decode as child events
+    // when `terminal::size()` reports a wide enough terminal.
+
     #[test]
     fn left_click_press_and_release() {
-        match parse_sgr_mouse(b"\x1b[<0;10;10M") {
+        match parse_sgr_mouse(b"\x1b[<0;40;10M") {
             MouseDecode::Forward(ChildMsg::Mouse { x, y, input: vt::MouseInput::Press(vt::MouseButtonKind::Left), .. }) => {
-                // 1-indexed on the wire; 0-indexed here, then shifted up by
-                // `TOP_BAR_ROWS` to land in the child's own coordinate space.
-                assert_eq!((x, y), (9, 10 - 1 - TOP_BAR_ROWS));
+                let side = terminal::size().ok().map(|(c, _)| sidebar_cols(c)).unwrap_or(0);
+                assert_eq!((x, y), (39u16.saturating_sub(side), 10 - 1 - TOP_BAR_ROWS));
             }
             _ => panic!("expected a left press"),
         }
         assert!(matches!(
-            parse_sgr_mouse(b"\x1b[<0;10;10m"),
+            parse_sgr_mouse(b"\x1b[<0;40;10m"),
             MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::Release(vt::MouseButtonKind::Left), .. })
         ));
     }
 
     #[test]
     fn scroll_wheel_up_and_down() {
-        assert!(matches!(parse_sgr_mouse(b"\x1b[<64;5;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::ScrollUp, .. })));
-        assert!(matches!(parse_sgr_mouse(b"\x1b[<65;5;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::ScrollDown, .. })));
+        assert!(matches!(parse_sgr_mouse(b"\x1b[<64;40;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::ScrollUp, .. })));
+        assert!(matches!(parse_sgr_mouse(b"\x1b[<65;40;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::ScrollDown, .. })));
     }
 
     #[test]
     fn drag_reports_as_motion_with_button_held() {
         assert!(matches!(
-            parse_sgr_mouse(b"\x1b[<32;10;10M"),
+            parse_sgr_mouse(b"\x1b[<32;40;10M"),
             MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::Motion(Some(vt::MouseButtonKind::Left)), .. })
         ));
     }
 
     #[test]
     fn plain_hover_motion_has_no_button() {
-        assert!(matches!(parse_sgr_mouse(b"\x1b[<35;10;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::Motion(None), .. })));
+        assert!(matches!(parse_sgr_mouse(b"\x1b[<35;40;10M"), MouseDecode::Forward(ChildMsg::Mouse { input: vt::MouseInput::Motion(None), .. })));
     }
 
     #[test]
     fn modifiers_decode_from_cb_bits() {
         // 0 (left) | 4 (shift) | 8 (alt) | 16 (ctrl) = 28
-        match parse_sgr_mouse(b"\x1b[<28;1;10M") {
+        match parse_sgr_mouse(b"\x1b[<28;40;10M") {
             MouseDecode::Forward(ChildMsg::Mouse { mods, .. }) => {
                 assert!(mods.shift && mods.alt && mods.ctrl);
             }
@@ -2198,8 +3239,9 @@ mod sgr_mouse_parser_tests {
         if terminal::size().is_err() {
             return;
         }
-        let (_, rows) = terminal::size().unwrap();
-        let seq = format!("\x1b[<0;5;{rows}M");
+        let (cols, rows) = terminal::size().unwrap();
+        let px = (sidebar_cols(cols) + 8).max(5);
+        let seq = format!("\x1b[<0;{px};{rows}M");
         assert!(matches!(parse_sgr_mouse(seq.as_bytes()), MouseDecode::OpenAgentPicker));
     }
 
@@ -2230,7 +3272,7 @@ mod terminal_model_tests {
     /// filtered it out," structurally absent.
     #[test]
     fn child_screen_model_cannot_exceed_its_own_row_count() {
-        let child_rows = 26u16; // matches rows.saturating_sub(CHROME_ROWS) for a 30-row terminal
+        let child_rows = 30u16.saturating_sub(CHROME_ROWS);
         let cols = 100u16;
         let sink: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(std::io::sink())));
         let mut term = vt::Terminal::new(cols, child_rows, sink);
@@ -2265,5 +3307,61 @@ mod terminal_model_tests {
         });
         assert!((max_row_seen as usize) < child_rows as usize, "for_each_cell yielded a row outside the model's own bounds: {max_row_seen}");
         assert!(saw_any, "expected the 500 written lines to produce visible content");
+    }
+}
+
+#[cfg(test)]
+mod multiplexer_chrome_tests {
+    use super::*;
+
+    #[test]
+    fn wide_terminal_reserves_sidebar_columns() {
+        let (cols, rows) = child_pty_size(80, 30);
+        assert_eq!(cols, 80 - SIDEBAR_COLS);
+        assert_eq!(rows, 30 - CHROME_ROWS);
+    }
+
+    #[test]
+    fn narrow_terminal_hides_sidebar() {
+        let (cols, rows) = child_pty_size(60, 24);
+        assert_eq!(cols, 60);
+        assert_eq!(rows, 24 - CHROME_ROWS);
+        assert_eq!(sidebar_cols(60), 0);
+    }
+
+    #[test]
+    fn expand_tilde_workspace_path() {
+        let expanded = expand_workspace_path("~/handoff");
+        assert!(expanded.contains("handoff"), "{expanded}");
+        assert!(!expanded.starts_with('~'), "{expanded}");
+    }
+
+    #[test]
+    fn shorten_path_uses_tilde_for_home() {
+        if let Some(home) = dirs::home_dir() {
+            let nested = home.join("handoff").join("worktree");
+            let s = shorten_path(&nested.to_string_lossy());
+            assert!(s.starts_with('~') || s.contains("handoff"), "{s}");
+        }
+    }
+
+    #[test]
+    fn resolve_other_tab_omits_when_exactly_one_other() {
+        assert_eq!(resolve_other_tab_index(2, 0, None).unwrap(), 1);
+        assert_eq!(resolve_other_tab_index(2, 1, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_other_tab_refuses_self() {
+        assert!(resolve_other_tab_index(3, 1, Some(2)).is_err());
+        assert!(resolve_other_tab_index(1, 0, None).is_err());
+        assert!(resolve_other_tab_index(1, 0, Some(1)).is_err());
+    }
+
+    #[test]
+    fn resolve_other_tab_explicit_and_missing() {
+        assert_eq!(resolve_other_tab_index(3, 0, Some(3)).unwrap(), 2);
+        assert!(resolve_other_tab_index(3, 0, Some(9)).is_err());
+        assert!(resolve_other_tab_index(3, 0, None).is_err());
     }
 }

@@ -18,3 +18,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_event ON events (event);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events (device_id);
 CREATE INDEX IF NOT EXISTS idx_events_received ON events (received_at);
+
+-- Explicit user-submitted notes from `ah feedback`. Separate from aggregate
+-- events so we can read them without mixing in usage pings.
+CREATE TABLE IF NOT EXISTS feedback (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id   TEXT,
+  app_version TEXT,
+  os          TEXT,
+  arch        TEXT,
+  country     TEXT,
+  message     TEXT NOT NULL,
+  received_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_received ON feedback (received_at);

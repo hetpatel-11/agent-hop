@@ -391,9 +391,10 @@ fn turn_char_count(t: &Turn) -> usize {
 /// the budget -- they're usually tokenized far more efficiently than raw
 /// text per byte, and excluding them keeps this from over-trimming a
 /// conversation just because it happened to have a couple of screenshots.
-/// Live hops use `trim_turns_with_summary` (same cut, plus a digest of
-/// what was dropped). This is the cut-only helper, compiled in tests so
-/// the budget math can be asserted without going through the summary path.
+/// Live hops use `trim_turns_with_summary` (same cut, plus a native compact
+/// when the source harness stored one, else a digest of what was dropped).
+/// This is the cut-only helper, compiled in tests so the budget math can
+/// be asserted without going through the summary path.
 #[cfg(test)]
 pub fn trim_turns_to_budget(turns: Vec<Turn>, budget: usize) -> (Vec<Turn>, usize) {
     let mut total = 0usize;
@@ -489,18 +490,60 @@ pub fn summarize_dropped_turns(dropped: &[Turn]) -> Option<String> {
     Some(summary)
 }
 
-/// Trims to the character budget (see `trim_turns_to_budget`) and, if
-/// anything was actually dropped, prepends a synthetic summary turn (see
-/// `summarize_dropped_turns`) describing what came before -- the version
-/// of this that should actually be called wherever a session is carried
-/// from one agent's format into another's.
+/// Prefix Grok (and any other sidecar recap) uses when we inject the
+/// harness's own compact into the hop stream. Claude's compact is already
+/// a user turn starting with `CLAUDE_COMPACT_PREFIX`.
+pub const NATIVE_COMPACT_MARKER: &str = "[agent-hop native compact]";
+const CLAUDE_COMPACT_PREFIX: &str =
+    "This session is being continued from a previous conversation that ran out of context";
+
+pub fn is_native_compact_turn(t: &Turn) -> bool {
+    t.text.starts_with(NATIVE_COMPACT_MARKER) || t.text.contains(CLAUDE_COMPACT_PREFIX)
+}
+
+/// Compact/recap (and the local digest that stands in when none exists)
+/// belong in the model context of a hop, not as a transcript bubble.
+/// Writers should keep the text in the API log and omit the TUI replay
+/// event (Codex `event_msg`, Grok `user_message_chunk`) or mark it the
+/// way Claude marks its own compact (`isCompactSummary`).
+pub fn is_hop_context_only(t: &Turn) -> bool {
+    is_native_compact_turn(t) || t.text.starts_with("[agent-hop summary of earlier context]")
+}
+
+/// Trims to the character budget (see `trim_turns_to_budget`). If the
+/// source harness stored a model compact/recap, that text is reserved
+/// first (and turns already summarized by it are dropped). Anything else
+/// that still doesn't fit gets the local heuristic digest.
 pub fn trim_turns_with_summary(turns: Vec<Turn>, budget: usize) -> Vec<Turn> {
+    let last_compact = turns.iter().rposition(is_native_compact_turn);
+    let (native, rest): (Option<Turn>, Vec<Turn>) = if let Some(idx) = last_compact {
+        let native = turns[idx].clone();
+        // Claude-style: compact sits mid-log and replaces everything
+        // before it. Grok-style: we inject the recap at index 0, so
+        // "after compact" is the full remaining conversation.
+        let rest = turns.into_iter().skip(idx + 1).collect();
+        (Some(native), rest)
+    } else {
+        (None, turns)
+    };
+
+    let last_needed = rest.last().map(turn_char_count).unwrap_or(0).min(budget);
+    let mut native = native.map(|mut t| {
+        let cap = budget.saturating_sub(last_needed);
+        if turn_char_count(&t) > cap {
+            t.text = truncate_chars(&t.text, cap);
+        }
+        t
+    });
+    let reserved = native.as_ref().map(turn_char_count).unwrap_or(0);
+    let rest_budget = budget.saturating_sub(reserved);
+
     let cut_index = {
         let mut total = 0usize;
-        let mut idx = turns.len();
-        for i in (0..turns.len()).rev() {
-            total += turn_char_count(&turns[i]);
-            if total > budget {
+        let mut idx = rest.len();
+        for i in (0..rest.len()).rev() {
+            total += turn_char_count(&rest[i]);
+            if total > rest_budget {
                 idx = i + 1;
                 break;
             }
@@ -508,13 +551,22 @@ pub fn trim_turns_with_summary(turns: Vec<Turn>, budget: usize) -> Vec<Turn> {
         }
         idx
     };
-    if cut_index == 0 {
-        return turns;
+    if cut_index == 0 && native.is_none() {
+        return rest;
     }
-    let (dropped, kept) = turns.split_at(cut_index);
-    let summary = summarize_dropped_turns(dropped);
-    let mut result = Vec::with_capacity(kept.len() + 1);
-    if let Some(text) = summary {
+    let (dropped, kept) = rest.split_at(cut_index);
+    let heuristic = if native.is_none() {
+        summarize_dropped_turns(dropped)
+    } else if !dropped.is_empty() {
+        summarize_dropped_turns(dropped)
+    } else {
+        None
+    };
+    let mut result = Vec::with_capacity(kept.len() + 2);
+    if let Some(t) = native.take() {
+        result.push(t);
+    }
+    if let Some(text) = heuristic {
         result.push(Turn { role: Role::User, text, tool_calls: None, attachments: None });
     }
     result.extend_from_slice(kept);
@@ -602,6 +654,38 @@ mod tests {
     }
 
     #[test]
+    fn hop_context_only_is_compact_or_digest_not_normal_turns() {
+        let digest = Turn {
+            role: Role::User,
+            text: "[agent-hop summary of earlier context]\ncut 2 turns".into(),
+            tool_calls: None,
+            attachments: None,
+        };
+        let grok = Turn {
+            role: Role::User,
+            text: format!("{NATIVE_COMPACT_MARKER}\nrecap"),
+            tool_calls: None,
+            attachments: None,
+        };
+        let claude = Turn {
+            role: Role::User,
+            text: format!("{CLAUDE_COMPACT_PREFIX}. Summary: done."),
+            tool_calls: None,
+            attachments: None,
+        };
+        let normal = Turn {
+            role: Role::User,
+            text: "please fix the login bug".into(),
+            tool_calls: None,
+            attachments: None,
+        };
+        assert!(is_hop_context_only(&digest));
+        assert!(is_hop_context_only(&grok));
+        assert!(is_hop_context_only(&claude));
+        assert!(!is_hop_context_only(&normal));
+    }
+
+    #[test]
     fn trim_turns_to_budget_keeps_most_recent_turns() {
         let turns = vec![
             Turn { role: Role::User, text: "a".repeat(100), tool_calls: None, attachments: None },
@@ -661,6 +745,37 @@ mod tests {
         let result = trim_turns_with_summary(turns, 1000);
         assert_eq!(result.len(), 2);
         assert!(!result[0].text.contains("agent-hop summary"));
+    }
+
+    #[test]
+    fn trim_prefers_native_compact_and_drops_pre_compact_turns() {
+        let compact = format!(
+            "{CLAUDE_COMPACT_PREFIX}. The summary below covers the earlier portion of the conversation.\nSummary: built the hop budget."
+        );
+        let turns = vec![
+            Turn { role: Role::User, text: "old task that was compacted".into(), tool_calls: None, attachments: None },
+            Turn { role: Role::Assistant, text: "old reply".into(), tool_calls: None, attachments: None },
+            Turn { role: Role::User, text: compact.clone(), tool_calls: None, attachments: None },
+            Turn { role: Role::User, text: "keep going from here".into(), tool_calls: None, attachments: None },
+        ];
+        let result = trim_turns_with_summary(turns, 10_000);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].text.contains(CLAUDE_COMPACT_PREFIX));
+        assert_eq!(result[1].text, "keep going from here");
+    }
+
+    #[test]
+    fn trim_keeps_sidecar_native_compact_without_dropping_later_turns() {
+        let recap = format!("{NATIVE_COMPACT_MARKER}\nGrok recap of the session so far.");
+        let turns = vec![
+            Turn { role: Role::User, text: recap.clone(), tool_calls: None, attachments: None },
+            Turn { role: Role::User, text: "first question".into(), tool_calls: None, attachments: None },
+            Turn { role: Role::Assistant, text: "an answer".into(), tool_calls: None, attachments: None },
+        ];
+        let result = trim_turns_with_summary(turns, 10_000);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].text.starts_with(NATIVE_COMPACT_MARKER));
+        assert_eq!(result[1].text, "first question");
     }
 
     #[test]

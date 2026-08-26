@@ -18,7 +18,7 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
 - **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
-- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. When an agent exits, that tab becomes a shell instead of quitting `ah`.
+- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. When an agent exits, that tab closes. Last tab leaves `ah` — run `ah` again when you want to hop.
 - **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
@@ -130,7 +130,7 @@ ah workspace next
 ah workspace prev
 ```
 
-When the last agent in a tab exits, that tab becomes `$SHELL`. `exit` or `Ctrl+B x` closes it. Hop from a shell starts a fresh agent (no convert).
+When the last agent in a tab exits, that tab closes. If it was the last tab, `ah` exits — hop is only available while you're inside `ah`. `Ctrl+B x` closes a tab the same way.
 
 ## Architecture
 

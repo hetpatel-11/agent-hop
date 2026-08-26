@@ -18,6 +18,11 @@ use std::sync::{mpsc, Arc, Mutex};
 
 /// Unix socket path the parent `ah` listens on so a pane can run `ah tab`.
 static CONTROL_SOCK: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// One tab's render thread at a time writes stdout. A new tab used to
+/// start painting while the previous tab's last frame was still emitting,
+/// which left the chrome and child grid shifted until a workspace click
+/// forced a clear + full redraw.
+static STDOUT_PAINT: Mutex<()> = Mutex::new(());
 
 /// Resolves a `vt::Cell`'s already-libghostty-resolved color to the
 /// ratatui color that reproduces it. `None` (the cell has no explicit
@@ -155,7 +160,7 @@ struct Workspace {
     focus: usize,
 }
 
-/// One live PTY: an agent, or a leftover shell after the agent exits.
+/// One live PTY: an agent, or a shell tab (not spawned on agent exit).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TabKind {
     Agent(ToolName),
@@ -208,6 +213,9 @@ fn unpaint_all(workspaces: &[Workspace]) {
     for ws in workspaces {
         for tab in &ws.tabs {
             tab.paint.store(false, Ordering::SeqCst);
+            // Wake so the render thread drops its ratatui backend now,
+            // instead of painting one more frame after a new tab starts.
+            let _ = tab.wake_tx.send(ChildMsg::Wake);
         }
     }
 }
@@ -395,43 +403,22 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
 
         match rx.recv() {
             Ok(RunEvent::ChildExited(g)) => {
-                let mut found: Option<(usize, usize, bool)> = None;
+                let mut found: Option<(usize, usize)> = None;
                 for (wi, ws) in workspaces.iter().enumerate() {
                     if let Some(ti) = ws.tabs.iter().position(|t| t.id == g) {
-                        found = Some((wi, ti, matches!(ws.tabs[ti].kind, TabKind::Shell)));
+                        found = Some((wi, ti));
                         break;
                     }
                 }
-                if let Some((wi, ti, was_shell)) = found {
-                    let path = workspaces[wi].path.clone();
+                if let Some((wi, ti)) = found {
                     let mut dead = workspaces[wi].tabs.remove(ti);
                     let _ = dead.child.kill();
                     let _ = dead.child.wait();
-                    if !was_shell {
-                        // Agent left (Ctrl+C / its own quit). Keep the tab
-                        // and drop into a normal shell in that folder.
-                        let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                        match spawn_live_tab(
-                            TabKind::Shell,
-                            &path,
-                            Launch::Fresh,
-                            &sink,
-                            &mouse_sink,
-                            &tx,
-                            generation_id,
-                            host_colors,
-                            wi == ws_focus,
-                            tab_strip.clone(),
-                        ) {
-                            Ok(tab) => {
-                                workspaces[wi].tabs.insert(ti, tab);
-                                workspaces[wi].focus = ti;
-                                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
-                                continue;
-                            }
-                            Err(e) => debug_log("SHELL_FALLBACK_ERR", format!("{e:#}").as_bytes()),
-                        }
-                    }
+                    // Agent quit (its own /q, Ctrl+C, crash). Close the
+                    // tab rather than dropping into a shell: a leftover
+                    // prompt invites `claude` again *inside* ah, which
+                    // is not a hop-able pane. Last tab of the last
+                    // workspace leaves ah entirely — run `ah` to hop.
                     if workspaces[wi].tabs.is_empty() {
                         workspaces.remove(wi);
                         if workspaces.is_empty() {
@@ -695,13 +682,13 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                                     &tx,
                                     generation_id,
                                     host_colors,
-                                    true,
+                                    false,
                                     tab_strip.clone(),
                                 ) {
                                     Ok(tab) => {
                                         workspaces.push(Workspace { path, tabs: vec![tab], focus: 0 });
                                         ws_focus = workspaces.len() - 1;
-                                        sync_tab_strip(&tab_strip, &workspaces, ws_focus);
+                                        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
                                     }
                                     Err(e) => {
                                         focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
@@ -1079,13 +1066,13 @@ fn handle_pane_request(
                 tx,
                 generation_id,
                 host_colors,
-                true,
+                false,
                 tab_strip.clone(),
             ) {
                 Ok(tab) => {
                     workspaces.push(Workspace { path, tabs: vec![tab], focus: 0 });
                     *ws_focus = workspaces.len() - 1;
-                    sync_tab_strip(tab_strip, workspaces, *ws_focus);
+                    focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
                 }
                 Err(e) => {
                     focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
@@ -1109,9 +1096,7 @@ fn add_agent_tab(
 ) {
     let path = workspaces[ws_focus].path.clone();
     let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
-    workspaces[ws_focus].tabs[workspaces[ws_focus].focus]
-        .paint
-        .store(false, Ordering::SeqCst);
+    unpaint_all(workspaces);
     match spawn_live_tab(
         TabKind::Agent(tool),
         &path,
@@ -1121,14 +1106,14 @@ fn add_agent_tab(
         tx,
         generation_id,
         host_colors,
-        true,
+        false,
         tab_strip.clone(),
     ) {
         Ok(tab) => {
             let ws = &mut workspaces[ws_focus];
             ws.tabs.push(tab);
             ws.focus = ws.tabs.len() - 1;
-            sync_tab_strip(tab_strip, workspaces, ws_focus);
+            focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
         }
         Err(e) => {
             focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
@@ -1626,7 +1611,8 @@ fn spawn_live_tab(
         let mut term = vt::Terminal::with_host_colors(cols, child_rows, vt_writer, host_fg, host_bg);
         let mut rterm: Option<RTerminal<CrosstermBackend<Stdout>>> = None;
 
-        let paint_frame = |rterm: &mut Option<RTerminal<CrosstermBackend<Stdout>>>, term: &mut vt::Terminal, strip: &TabStrip| {
+        let paint_frame = |rterm: &mut Option<RTerminal<CrosstermBackend<Stdout>>>, term: &mut vt::Terminal, strip: &TabStrip, clear: bool| {
+            let _g = STDOUT_PAINT.lock().unwrap_or_else(|e| e.into_inner());
             let Some(rt) = (if rterm.is_none() {
                 match RTerminal::new(CrosstermBackend::new(stdout())) {
                     Ok(mut t) => {
@@ -1641,6 +1627,11 @@ fn spawn_live_tab(
                     Err(_) => None,
                 }
             } else {
+                if clear {
+                    if let Some(t) = rterm.as_mut() {
+                        let _ = t.clear();
+                    }
+                }
                 rterm.as_mut()
             }) else {
                 return;
@@ -1652,7 +1643,7 @@ fn spawn_live_tab(
 
         if paint_thread.load(Ordering::SeqCst) {
             let strip = tab_strip.lock().unwrap().clone();
-            paint_frame(&mut rterm, &mut term, &strip);
+            paint_frame(&mut rterm, &mut term, &strip, true);
         }
 
         // How often the loop wakes up even with no child data, purely to
@@ -1714,11 +1705,8 @@ fn spawn_live_tab(
                 rterm = None;
             }
             if was_suppressed && !is_suppressed && is_paint {
-                if let Some(rt) = rterm.as_mut() {
-                    let _ = rt.clear();
-                }
                 let strip = tab_strip.lock().unwrap().clone();
-                paint_frame(&mut rterm, &mut term, &strip);
+                paint_frame(&mut rterm, &mut term, &strip, true);
             }
             was_suppressed = is_suppressed;
 
@@ -1729,7 +1717,7 @@ fn spawn_live_tab(
                     apply_resize_if_pending(&mut applied_dims, &mut term);
                     if applied_dims != before && !suppress_thread.load(Ordering::SeqCst) && paint_thread.load(Ordering::SeqCst) {
                         let strip = tab_strip.lock().unwrap().clone();
-                        paint_frame(&mut rterm, &mut term, &strip);
+                        paint_frame(&mut rterm, &mut term, &strip, false);
                     }
                 }
                 Ok(ChildMsg::Bytes(data)) => {
@@ -1741,7 +1729,7 @@ fn spawn_live_tab(
                     // blocks it) but don't paint over the overlay with it.
                     if !suppress_thread.load(Ordering::SeqCst) && paint_thread.load(Ordering::SeqCst) {
                         let strip = tab_strip.lock().unwrap().clone();
-                        paint_frame(&mut rterm, &mut term, &strip);
+                        paint_frame(&mut rterm, &mut term, &strip, false);
                     }
                 }
                 // Mouse events pass through only if this specific child
@@ -1757,14 +1745,8 @@ fn spawn_live_tab(
                 }
                 Ok(ChildMsg::Wake) => {
                     if paint_thread.load(Ordering::SeqCst) {
-                        if let Some(rt) = rterm.as_mut() {
-                            let _ = rt.clear();
-                        } else if let Ok(mut t) = RTerminal::new(CrosstermBackend::new(stdout())) {
-                            let _ = t.clear();
-                            rterm = Some(t);
-                        }
                         let strip = tab_strip.lock().unwrap().clone();
-                        paint_frame(&mut rterm, &mut term, &strip);
+                        paint_frame(&mut rterm, &mut term, &strip, true);
                     } else {
                         rterm = None;
                     }

@@ -11,8 +11,11 @@
 //!
 //! Design constraints, in priority order:
 //! Events (all aggregate; never queries, paths, chat, or agent session ids):
-//!   - `app_launched` — `entry` (picker/resume/claude/…) and `installed`
-//!     (harness slugs on PATH).
+//!   - `app_launched` — `entry` (picker/restore/resume/claude/…) and
+//!     `installed` (harness slugs on PATH). Restore also sends
+//!     `workspaces` / `tabs` counts, never paths or session ids.
+//!   - `leave` — `via` (prefix / search / close_tab / agent_exit) and
+//!     workspace/tab counts. Fired when the user leaves the mux.
 //!   - `hop` — `from`/`to` slugs, `via` (next/prev/picker), `converted`.
 //!   - `resume` — `from`/`to`, `same_agent`, `via` (cli/overlay), whether
 //!     they had a query / restricted `-a` / were interactive.

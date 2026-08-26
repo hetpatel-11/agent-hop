@@ -9,6 +9,7 @@ mod fuzzy;
 mod theme;
 mod vector_index;
 mod resume;
+mod layout;
 mod telemetry;
 mod feedback;
 mod control;
@@ -198,8 +199,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Init telemetry for real user sessions only (never the detached
     // background indexer). This shows the one-time notice when enabled.
+    // Layout is loaded first so `app_launched.entry` can be `restore`.
+    let restore = if !is_background_index && cli.command.is_none() {
+        layout::load()
+    } else {
+        None
+    };
     if !is_background_index {
         telemetry::init();
+        let restoring = restore.as_ref().is_some_and(|m| !m.is_empty());
         let entry = match &cli.command {
             Some(Commands::Claude) => "claude",
             Some(Commands::Codex) => "codex",
@@ -208,15 +216,20 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Grok) => "grok",
             Some(Commands::Resume { .. }) => "resume",
             Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::BackgroundIndex) => "picker",
+            None if restoring => "restore",
             None => "picker",
         };
-        telemetry::capture(
-            "app_launched",
-            serde_json::json!({
-                "entry": entry,
-                "installed": ToolName::installed_slugs(),
-            }),
-        );
+        let mut props = serde_json::json!({
+            "entry": entry,
+            "installed": ToolName::installed_slugs(),
+        });
+        if restoring {
+            if let Some(mux) = restore.as_ref() {
+                props["workspaces"] = mux.workspaces.len().into();
+                props["tabs"] = mux.tab_count().into();
+            }
+        }
+        telemetry::capture("app_launched", props);
     }
 
     let initial_agent = match cli.command {
@@ -240,13 +253,16 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-
     let agent = match initial_agent {
         Some(a) => a,
+        None if restore.as_ref().is_some_and(|m| !m.is_empty()) => restore
+            .as_ref()
+            .and_then(|m| m.first_tool())
+            .unwrap_or(ToolName::Claude),
         None => picker::pick_agent().await?,
     };
 
-    let res = tui::run(agent, None).await;
+    let res = tui::run(agent, None, restore, true).await;
     telemetry::flush().await;
     res
 }

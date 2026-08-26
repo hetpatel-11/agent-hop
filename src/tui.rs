@@ -137,6 +137,10 @@ enum RunEvent {
     CloseTab,
     /// `PREFIX_KEY` then `1`…`9`, or a click on a tab in the top strip.
     FocusTab(usize),
+    /// `PREFIX_KEY` then `q` — same chord herdr uses to detach. We are
+    /// not a background server: layout is saved, agents stop, next `ah`
+    /// restores the same workspaces and resumes each chat.
+    Leave,
     /// Left-click on our chrome (top tab strip or session sidebar).
     ChromeClick { x: u16, y: u16 },
     /// The real terminal was resized (new cols, new rows). Not tied to any
@@ -152,6 +156,9 @@ struct TabStrip {
     ws_focus: usize,
     tabs: Vec<TabKind>,
     tab_focus: usize,
+    /// Write `~/.agent-hop/layout.json` on mux changes. Off for
+    /// one-shot `ah resume` so a search launch does not wipe the mux.
+    persist: bool,
 }
 
 struct Workspace {
@@ -188,6 +195,7 @@ struct LiveTab {
     id: u64,
     kind: TabKind,
     project_path: String,
+    session_id: Option<String>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     resize_tx: mpsc::Sender<(u16, u16)>,
     wake_tx: mpsc::Sender<ChildMsg>,
@@ -197,15 +205,133 @@ struct LiveTab {
 }
 
 fn sync_tab_strip(strip: &Arc<Mutex<TabStrip>>, workspaces: &[Workspace], ws_focus: usize) {
-    let mut s = strip.lock().unwrap();
-    s.workspaces = workspaces.iter().map(|w| (w.path.clone(), w.tabs.len())).collect();
-    s.ws_focus = ws_focus;
-    if let Some(ws) = workspaces.get(ws_focus) {
-        s.tabs = ws.tabs.iter().map(|t| t.kind).collect();
-        s.tab_focus = ws.focus;
-    } else {
-        s.tabs.clear();
-        s.tab_focus = 0;
+    let persist = {
+        let mut s = strip.lock().unwrap();
+        s.workspaces = workspaces.iter().map(|w| (w.path.clone(), w.tabs.len())).collect();
+        s.ws_focus = ws_focus;
+        if let Some(ws) = workspaces.get(ws_focus) {
+            s.tabs = ws.tabs.iter().map(|t| t.kind).collect();
+            s.tab_focus = ws.focus;
+        } else {
+            s.tabs.clear();
+            s.tab_focus = 0;
+        }
+        s.persist
+    };
+    if persist {
+        persist_mux(workspaces, ws_focus);
+    }
+}
+
+fn persist_mux(workspaces: &[Workspace], ws_focus: usize) {
+    let mut saved = crate::layout::SavedMux {
+        ws_focus,
+        workspaces: Vec::new(),
+    };
+    for ws in workspaces {
+        let mut tabs = Vec::new();
+        for tab in &ws.tabs {
+            let Some(tool) = tab.kind.tool() else { continue };
+            let session_id = tab.session_id.clone().or_else(|| {
+                crate::adapters::find_latest_session_for_path(tool, &ws.path).map(|s| s.session_id)
+            });
+            tabs.push(crate::layout::SavedTab {
+                tool: tool.slug().to_string(),
+                session_id,
+            });
+        }
+        if tabs.is_empty() {
+            continue;
+        }
+        let focus = ws.focus.min(tabs.len().saturating_sub(1));
+        saved.workspaces.push(crate::layout::SavedWorkspace {
+            path: ws.path.clone(),
+            focus,
+            tabs,
+        });
+    }
+    if saved.ws_focus >= saved.workspaces.len() && !saved.workspaces.is_empty() {
+        saved.ws_focus = saved.workspaces.len() - 1;
+    }
+    crate::layout::save(&saved);
+}
+
+fn launch_from_saved(tool: ToolName, path: &str, session_id: Option<&str>) -> Launch {
+    match crate::layout::resume_id(tool, path, session_id) {
+        Some(id) => Launch::Resume(id),
+        None => Launch::Fresh,
+    }
+}
+
+fn restore_mux(
+    saved: crate::layout::SavedMux,
+    workspaces: &mut Vec<Workspace>,
+    ws_focus: &mut usize,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+) {
+    let saved_focus = saved.ws_focus;
+    for saved_ws in saved.workspaces {
+        let mut tabs = Vec::new();
+        for saved_tab in saved_ws.tabs {
+            let Some(tool) = ToolName::from_slug(&saved_tab.tool) else { continue };
+            if !tool.is_installed() {
+                continue;
+            }
+            let launch = launch_from_saved(tool, &saved_ws.path, saved_tab.session_id.as_deref());
+            let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            match spawn_live_tab(
+                TabKind::Agent(tool),
+                &saved_ws.path,
+                launch,
+                sink,
+                mouse_sink,
+                tx,
+                generation_id,
+                host_colors,
+                false,
+                tab_strip.clone(),
+            ) {
+                Ok(tab) => tabs.push(tab),
+                Err(e) => debug_log("RESTORE_TAB_ERR", format!("{e:#}").as_bytes()),
+            }
+        }
+        if tabs.is_empty() {
+            continue;
+        }
+        let focus = saved_ws.focus.min(tabs.len().saturating_sub(1));
+        workspaces.push(Workspace { path: saved_ws.path, tabs, focus });
+    }
+    if workspaces.is_empty() {
+        return;
+    }
+    *ws_focus = saved_focus.min(workspaces.len() - 1);
+}
+
+fn capture_leave(via: &str, workspaces: &[Workspace]) {
+    let tabs: usize = workspaces.iter().map(|w| w.tabs.len()).sum();
+    crate::telemetry::capture(
+        "leave",
+        serde_json::json!({
+            "via": via,
+            "workspaces": workspaces.len(),
+            "tabs": tabs,
+        }),
+    );
+}
+
+fn leave_ah(workspaces: &mut [Workspace], ws_focus: usize, strip: &Arc<Mutex<TabStrip>>, via: &'static str) {
+    capture_leave(via, workspaces);
+    sync_tab_strip(strip, workspaces, ws_focus);
+    for ws in workspaces.iter_mut() {
+        for tab in &mut ws.tabs {
+            let _ = tab.child.kill();
+            let _ = tab.child.wait();
+        }
     }
 }
 
@@ -279,7 +405,12 @@ enum RunOutcome {
 /// persistent toggle strip (bottom row, owned by us, agent never draws into
 /// it) for switching between installed agents via Alt+Up/Down, and a
 /// search-and-resume overlay on Ctrl+R.
-pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) -> anyhow::Result<()> {
+pub async fn run(
+    initial: ToolName,
+    initial_launch: Option<(String, String)>,
+    restore: Option<crate::layout::SavedMux>,
+    persist: bool,
+) -> anyhow::Result<()> {
     let sink: Arc<Mutex<InputSink>> = Arc::new(Mutex::new(InputSink::Idle));
     let mouse_sink: Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>> = Arc::new(Mutex::new(None));
     // Set only while `run_agent_picker` is open (see its own doc comment
@@ -328,11 +459,13 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
             Launch::Fresh,
         ),
     };
+    let restoring = restore.as_ref().is_some_and(|m| !m.is_empty());
     let tab_strip: Arc<Mutex<TabStrip>> = Arc::new(Mutex::new(TabStrip {
         workspaces: vec![(project_path.clone(), 1)],
         ws_focus: 0,
         tabs: vec![TabKind::Agent(current)],
         tab_focus: 0,
+        persist,
     }));
     let mut workspaces: Vec<Workspace> = Vec::new();
     let mut ws_focus: usize = 0;
@@ -359,41 +492,63 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
     let _ = stdout().write_all(MOUSE_CAPTURE_ENABLE);
     let _ = stdout().flush();
     let splash_start = std::time::Instant::now();
-    let _ = draw_transition_splash(&mut stdout(), "Launching", current);
+    let splash_verb = if restoring { "Restoring" } else { "Launching" };
+    let _ = draw_transition_splash(&mut stdout(), splash_verb, current);
     if let Some(remaining) = SPLASH_MIN_DURATION.checked_sub(splash_start.elapsed()) {
         std::thread::sleep(remaining);
     }
     execute!(stdout(), cursor::Show).ok();
 
-    let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
-    match spawn_live_tab(
-        TabKind::Agent(current),
-        &project_path,
-        launch,
-        &sink,
-        &mouse_sink,
-        &tx,
-        generation_id,
-        host_colors,
-        true,
-        tab_strip.clone(),
-    ) {
-        Ok(tab) => {
-            workspaces.push(Workspace { path: project_path.clone(), tabs: vec![tab], focus: 0 });
-            ws_focus = 0;
-            sync_tab_strip(&tab_strip, &workspaces, ws_focus);
+    let spawn_err = |e: anyhow::Error| -> anyhow::Error {
+        let _ = stdout().write_all(MOUSE_CAPTURE_DISABLE);
+        let _ = stdout().flush();
+        execute!(stdout(), terminal::LeaveAlternateScreen).ok();
+        if let Some(path) = &control_path {
+            let _ = std::fs::remove_file(path);
+            *CONTROL_SOCK.lock().unwrap() = None;
         }
-        Err(e) => {
-            let _ = stdout().write_all(MOUSE_CAPTURE_DISABLE);
-            let _ = stdout().flush();
-            execute!(stdout(), terminal::LeaveAlternateScreen).ok();
-            if let Some(path) = &control_path {
-                let _ = std::fs::remove_file(path);
-                *CONTROL_SOCK.lock().unwrap() = None;
+        let _ = terminal::disable_raw_mode();
+        e
+    };
+
+    if restoring {
+        if let Some(saved) = restore {
+            restore_mux(
+                saved,
+                &mut workspaces,
+                &mut ws_focus,
+                &sink,
+                &mouse_sink,
+                &tx,
+                &generation,
+                host_colors,
+                &tab_strip,
+            );
+        }
+    }
+    if workspaces.is_empty() {
+        let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        match spawn_live_tab(
+            TabKind::Agent(current),
+            &project_path,
+            launch,
+            &sink,
+            &mouse_sink,
+            &tx,
+            generation_id,
+            host_colors,
+            true,
+            tab_strip.clone(),
+        ) {
+            Ok(tab) => {
+                workspaces.push(Workspace { path: project_path.clone(), tabs: vec![tab], focus: 0 });
+                ws_focus = 0;
+                sync_tab_strip(&tab_strip, &workspaces, ws_focus);
             }
-            terminal::disable_raw_mode()?;
-            return Err(e);
+            Err(e) => return Err(spawn_err(e)),
         }
+    } else {
+        focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
     }
 
     let result: anyhow::Result<()> = loop {
@@ -422,6 +577,7 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                     if workspaces[wi].tabs.is_empty() {
                         workspaces.remove(wi);
                         if workspaces.is_empty() {
+                            capture_leave("agent_exit", &workspaces);
                             break Ok(());
                         }
                         if ws_focus >= workspaces.len() {
@@ -602,12 +758,7 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                         focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
                     }
                     resume::ResumeOutcome::Quit => {
-                        for ws in &mut workspaces {
-                            for tab in &mut ws.tabs {
-                                let _ = tab.child.kill();
-                                let _ = tab.child.wait();
-                            }
-                        }
+                        leave_ah(&mut workspaces, ws_focus, &tab_strip, "search");
                         break Ok(());
                     }
                 }
@@ -731,6 +882,7 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                 let last_workspace = workspaces.len() == 1;
                 let last_tab = workspaces[ws_focus].tabs.len() == 1;
                 if last_workspace && last_tab {
+                    capture_leave("close_tab", &workspaces);
                     let mut dead = workspaces[ws_focus].tabs.remove(0);
                     let _ = dead.child.kill();
                     let _ = dead.child.wait();
@@ -755,6 +907,10 @@ pub async fn run(initial: ToolName, initial_launch: Option<(String, String)>) ->
                     workspaces[ws_focus].focus = i;
                     focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
                 }
+            }
+            Ok(RunEvent::Leave) => {
+                leave_ah(&mut workspaces, ws_focus, &tab_strip, "prefix");
+                break Ok(());
             }
             Ok(RunEvent::ChromeClick { x, y }) => {
                 let side = terminal::size().map(|(c, _)| sidebar_cols(c)).unwrap_or(0);
@@ -1536,6 +1692,10 @@ fn spawn_live_tab(
             cmd.env_remove(key);
         }
     }
+    let session_id = match &launch {
+        Launch::Resume(id) => Some(id.clone()),
+        Launch::Fresh => None,
+    };
     let child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     debug_log("TIMING_RUN_ONE_TO_SPAWN", format!("{:?}", t_run_one_start.elapsed()).as_bytes());
@@ -1818,6 +1978,7 @@ fn spawn_live_tab(
         id: generation_id,
         kind,
         project_path: project_path.to_string(),
+        session_id,
         writer,
         resize_tx,
         wake_tx,
@@ -2037,6 +2198,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Ctrl+B then i", "Previous tab in this workspace"),
     ("Ctrl+B then 1-9", "Focus that tab"),
     ("Ctrl+B then x", "Close this tab"),
+    ("Ctrl+B then q", "Leave ah — same workspaces and chats when you run ah again"),
     ("Ctrl+B then ?", "Show this help"),
     ("Alt+\u{2191} / Alt+\u{2193}", "Hop next / previous (where the terminal supports it)"),
     ("ah feedback \"…\"", "Command in the shell (not a key) — send us a note"),
@@ -2429,7 +2591,9 @@ fn write_toggle_bar(buf: &mut Buffer, width: u16, row: u16, side: u16, kind: Tab
         Span::raw(" "),
         Span::styled(format!("[{}]", kind.slug()), tag_style),
         Span::raw("  "),
-        Span::styled("Ctrl+B n  hop this chat to another agent", hint_style),
+        Span::styled("Ctrl+B n  hop", hint_style),
+        Span::raw("  "),
+        Span::styled("Ctrl+B q  leave", hint_style),
         Span::raw("  "),
         Span::styled("Ctrl+B ?  keys", hint_style),
     ]);
@@ -2988,6 +3152,10 @@ fn spawn_stdin_relay(
                                 b'x' | b'X' => {
                                     debug_log("TRIGGER_PREFIX_CLOSE_TAB", &pending[..2]);
                                     let _ = tx.send(RunEvent::CloseTab);
+                                }
+                                b'q' | b'Q' => {
+                                    debug_log("TRIGGER_PREFIX_LEAVE", &pending[..2]);
+                                    let _ = tx.send(RunEvent::Leave);
                                 }
                                 b'1'..=b'9' => {
                                     let idx = (chord - b'1') as usize;

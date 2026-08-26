@@ -18,7 +18,7 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
 - **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
-- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. When an agent exits, that tab closes. Last tab leaves `ah` — run `ah` again when you want to hop.
+- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. `Ctrl+B q` leaves `ah`; the next `ah` restores those workspaces and resumes each chat. When an agent exits, that tab closes. Last tab also leaves `ah`.
 - **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
@@ -33,7 +33,7 @@ macOS or Linux, no Node required:
 curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.2`.
+That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.3`.
 
 Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
 
@@ -59,7 +59,7 @@ Anonymous usage telemetry is on by default (no queries, paths, or chat content).
 ah
 ```
 
-Start the runtime, pick a harness, then work as usual. That harness is a child process; `ah` wraps it:
+Reopens the workspaces and tabs from last time, each on that harness's own resume of the chat. First run — or after you start with `ah claude` / `ah resume` — you pick a harness. That harness is a child process; `ah` wraps it:
 
 | Shortcut | What it does |
 |---|---|
@@ -71,6 +71,7 @@ Start the runtime, pick a harness, then work as usual. That harness is a child p
 | `Ctrl+B` then `[` / `]` | Previous / next workspace |
 | `Ctrl+B` then `1`–`9` | Focus that tab |
 | `Ctrl+B` then `x` | Close this tab |
+| `Ctrl+B` then `q` | Leave `ah`. Next `ah` restores these workspaces and chats |
 | `Ctrl+B` then `?` | Show every `ah` shortcut |
 | `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
 | `Ctrl+R` | Search local history and resume a session in the **same** agent |
@@ -130,7 +131,7 @@ ah workspace next
 ah workspace prev
 ```
 
-When the last agent in a tab exits, that tab closes. If it was the last tab, `ah` exits — hop is only available while you're inside `ah`. `Ctrl+B x` closes a tab the same way.
+`Ctrl+B q` leaves `ah` the way herdr's `prefix+q` does. Agents are not kept running in the background: the layout is saved, and the next `ah` reopens those folders and resumes each chat. When the last agent in a tab exits, that tab closes. If it was the last tab, `ah` exits. `Ctrl+B x` closes a tab the same way.
 
 ## Architecture
 

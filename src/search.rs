@@ -721,7 +721,7 @@ pub async fn run_standalone_resume(
         }
     }
 
-    crate::tui::run(target_tool, Some((session_id, project_path))).await
+    crate::tui::run(target_tool, Some((session_id, project_path)), None, false).await
 }
 
 #[cfg(test)]

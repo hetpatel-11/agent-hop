@@ -1,6 +1,6 @@
-https://github.com/hetpatel-11/agent-hop/releases/download/v0.1.3/agent-hop.mp4
+https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
-*In demo: `ah` restores the last workspaces and tabs, then hop moves the live chat across agents.
+*In demo: hopping Claude Code → Grok → Pi → OpenCode → Codex.
 
 **A runtime for coding-agent harnesses.** Run Claude Code, Codex, OpenCode, Pi, and Grok inside one terminal, hop a live session between them, and search or resume any local chat.
 

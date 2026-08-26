@@ -1380,14 +1380,71 @@ const MOUSE_CAPTURE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 /// brand as the thing doing the handing-off.
 fn draw_transition_splash(out: &mut impl Write, verb: &str, tool: ToolName) -> anyhow::Result<()> {
     let (cols, rows) = terminal::size()?;
+    // `cursor::MoveTo(0, 0)` in the same batch as `Hide` is deliberate, not
+    // just belt-and-suspenders: `Hide` stops the cursor from *blinking*,
+    // but doesn't relocate it -- it stays wherever the just-exited agent
+    // last left it. Confirmed live as a real, visible glitch: a hidden
+    // cursor can still cause a one-frame flash of misplaced/deformed
+    // content right as the terminal repaints, if the real terminal's own
+    // redraw happens to race with `Hide` taking effect. Parking it at the
+    // origin removes any chance of that flash landing somewhere that looks
+    // wrong, regardless of timing.
     execute!(out, terminal::Clear(terminal::ClearType::All), cursor::Hide, cursor::MoveTo(0, 0))?;
-    let line1 = "ah";
-    let line2 = format!("{verb} {}…", tool.display_name());
-    let row = rows.saturating_sub(3) / 2;
-    let c1 = cols.saturating_sub(line1.chars().count() as u16) / 2;
-    let c2 = cols.saturating_sub(line2.chars().count() as u16) / 2;
-    queue!(out, cursor::MoveTo(c1, row), Print(theme::grey(line1)))?;
-    queue!(out, cursor::MoveTo(c2, row.saturating_add(2)), Print(theme::grey(&line2)))?;
+
+    // A brief brand-cyan bar sweeping top to bottom before the wordmark
+    // settles -- gives the transition actual motion instead of one static
+    // frame appearing and holding, which is what "switching agents" used
+    // to look like. ~100ms total, so it reads as a deliberate flourish, not
+    // a delay.
+    let sweep_frames = 6u16.min(rows.max(1));
+    for i in 0..sweep_frames {
+        let row = (u32::from(i) * u32::from(rows) / u32::from(sweep_frames)) as u16;
+        queue!(out, cursor::MoveTo(0, row), Print(theme::brand_cyan(&"\u{2588}".repeat(cols as usize))))?;
+        out.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(18));
+        queue!(out, cursor::MoveTo(0, row), Print(" ".repeat(cols as usize)))?;
+    }
+
+    let message = format!("{verb} {}...", tool.display_name());
+    let use_big = cols >= theme::BRAND_WORDMARK_WIDTH;
+
+    let wordmark_lines: Vec<&str> = if use_big {
+        theme::BRAND_WORDMARK.trim_matches('\n').lines().collect()
+    } else {
+        Vec::new()
+    };
+    let content_height = if use_big { wordmark_lines.len() as u16 + 2 } else { 2 };
+    let mut row = rows.saturating_sub(content_height) / 2;
+
+    if use_big {
+        // One shared column for every row, computed from the *widest* row --
+        // not `line.chars().count()` recomputed per row. The ANSI-Shadow
+        // letterforms are ragged on the right (e.g. "P"'s foot has no
+        // stroke on its bottom two rows), so several rows are a few
+        // characters "shorter" than the others purely because their
+        // trailing blank columns aren't part of the string at all, not
+        // because the artwork itself is narrower there. Centering each row
+        // independently by its own (different) length shifted those
+        // shorter rows rightward relative to the rest -- confirmed live as
+        // the actual cause of the wordmark looking like its last couple of
+        // rows were shifted right during the splash. Every row starts at
+        // the same left edge; the raggedness is purely on the right, where
+        // it belongs.
+        let wordmark_width = wordmark_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+        let wordmark_col = cols.saturating_sub(wordmark_width) / 2;
+        for line in &wordmark_lines {
+            queue!(out, cursor::MoveTo(wordmark_col, row), Print(theme::bold(&theme::brand_cyan(line))))?;
+            row += 1;
+        }
+    } else {
+        let compact = "agent-hop";
+        let col = cols.saturating_sub(compact.chars().count() as u16) / 2;
+        queue!(out, cursor::MoveTo(col, row), Print(theme::brand()))?;
+        row += 1;
+    }
+    row += 1;
+    let col = cols.saturating_sub(message.chars().count() as u16) / 2;
+    queue!(out, cursor::MoveTo(col, row), Print(theme::tool_color(tool, &message)))?;
     out.flush()?;
     Ok(())
 }

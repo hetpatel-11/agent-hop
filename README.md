@@ -1,6 +1,6 @@
 https://github.com/user-attachments/assets/a508a303-5405-4420-aa8a-b86600e83cf1
 
-*In demo: hopping Claude Code → Grok → Pi → OpenCode → Codex.
+demo
 
 **A runtime for coding-agent harnesses.** Run Claude Code, Codex, OpenCode, Pi, and Grok inside one terminal, hop a live session between them, and search or resume any local chat.
 

@@ -201,15 +201,12 @@ fn pick_update_now_or_later(info: &UpdateInfo) -> anyhow::Result<bool> {
 /// case is "update now" silently does nothing and they're no worse off
 /// than before. Ported from the TS `runUpdate`.
 fn run_update() {
-    let npm_ok = std::process::Command::new("npm")
-        .args(["install", "-g", "agent-hop@latest"])
+    let npm_ok = crate::agents::std_command_bin("npm", &["install", "-g", "agent-hop@latest"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !npm_ok {
-        let _ = std::process::Command::new("bun")
-            .args(["install", "-g", "agent-hop@latest"])
-            .status();
+        let _ = crate::agents::std_command_bin("bun", &["install", "-g", "agent-hop@latest"]).status();
     }
 }
 

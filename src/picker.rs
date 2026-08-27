@@ -93,7 +93,9 @@ pub async fn pick_agent() -> anyhow::Result<ToolName> {
 fn install(tool: ToolName) -> anyhow::Result<()> {
     let (cmd, args) = tool.install_command();
     println!("Installing {}...", tool.slug());
-    let status = std::process::Command::new(cmd).args(args).status()?;
+    let mut argv = vec![cmd.to_string()];
+    argv.extend(args.iter().map(|s| (*s).to_string()));
+    let status = crate::agents::std_command(&argv).status()?;
     if !status.success() {
         anyhow::bail!("failed to install {} (exit {status})", tool.slug());
     }

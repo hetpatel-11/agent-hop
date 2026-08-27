@@ -1647,15 +1647,17 @@ fn spawn_live_tab(
                 });
             CommandBuilder::new(shell)
         }
-        TabKind::Agent(tool) => match &launch {
-            Launch::Fresh => CommandBuilder::new(tool.binary()),
-            Launch::Resume(session_id) => {
-                let argv = adapter_for(tool).resume_cmd(session_id, project_path);
-                let mut cmd = CommandBuilder::new(&argv[0]);
-                cmd.args(&argv[1..]);
-                cmd
-            }
-        },
+        TabKind::Agent(tool) => {
+            let argv = match &launch {
+                Launch::Fresh => crate::agents::spawn_argv(&[tool.binary().to_string()]),
+                Launch::Resume(session_id) => {
+                    crate::agents::spawn_argv(&adapter_for(tool).resume_cmd(session_id, project_path))
+                }
+            };
+            let mut cmd = CommandBuilder::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            cmd
+        }
     };
     cmd.cwd(project_path);
     if let Some(sock) = CONTROL_SOCK.lock().unwrap().as_ref() {

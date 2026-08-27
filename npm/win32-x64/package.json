@@ -1,6 +1,6 @@
 {
   "name": "agent-hop-windows-x64",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "agent-hop native binary for Windows (x64). Not meant to be installed directly -- installed automatically as an optionalDependency of the `agent-hop` package.",
   "license": "MIT",
   "os": ["win32"],

@@ -374,6 +374,44 @@ pub fn to_tool_input_object(input: &str) -> Value {
 // substantial, useful slice of recent conversation.
 pub const CONVERSION_CHAR_BUDGET: usize = 200_000;
 
+/// Strip Windows verbatim prefixes (`\\?\C:\...`, `\\?\UNC\server\share`)
+/// that `std::fs::canonicalize` injects. Claude/Pi/Grok encode the cwd
+/// into a directory name; they never see the `\\?\` form, so leaving it
+/// on makes hop write into a folder the harness will not read.
+pub fn strip_verbatim_prefix(s: &str) -> String {
+    let s = s
+        .strip_prefix(r"\\?\")
+        .or_else(|| s.strip_prefix("//?/"))
+        .unwrap_or(s);
+    if let Some(rest) = s.strip_prefix(r"UNC\").or_else(|| s.strip_prefix("UNC/")) {
+        format!(r"\\{rest}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Canonicalize if the path exists, otherwise keep the input. Always
+/// strips a Windows verbatim prefix so hop encodings match the harness.
+pub fn canonicalize_display(path: &str) -> String {
+    strip_verbatim_prefix(
+        &std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string()),
+    )
+}
+
+/// Canonicalize, creating the directory if needed (write-side hop).
+pub fn canonicalize_create(path: &str) -> std::io::Result<String> {
+    let p = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => {
+            std::fs::create_dir_all(path)?;
+            std::fs::canonicalize(path)?
+        }
+    };
+    Ok(strip_verbatim_prefix(&p.to_string_lossy()))
+}
+
 fn turn_char_count(t: &Turn) -> usize {
     let mut n = t.text.chars().count();
     if let Some(tcs) = &t.tool_calls {
@@ -785,5 +823,13 @@ mod tests {
         s.append("world");
         assert_eq!(s.value(), "hello world ");
         assert!(!s.has_head());
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_drops_windows_extended_path() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\Users\test"), r"C:\Users\test");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\server\share"), r"\\server\share");
+        assert_eq!(strip_verbatim_prefix("//?/C:/Users/test"), "C:/Users/test");
+        assert_eq!(strip_verbatim_prefix("/Users/test"), "/Users/test");
     }
 }

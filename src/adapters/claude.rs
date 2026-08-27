@@ -28,7 +28,7 @@ fn projects_dir() -> PathBuf {
 /// auditing this). Falls back to a generic placeholder if claude isn't on
 /// PATH, which would fail write() well before this matters in practice.
 fn claude_cli_version() -> String {
-    match std::process::Command::new("claude").arg("--version").output() {
+    match crate::agents::std_command_bin("claude", &["--version"]).output() {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             extract_semver(&text).unwrap_or_else(|| "0.0.0".to_string())
@@ -52,9 +52,7 @@ fn extract_semver(s: &str) -> Option<String> {
 }
 
 fn encode_dir(cwd: &str) -> String {
-    let real = std::fs::canonicalize(cwd)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| cwd.to_string());
+    let real = crate::util::canonicalize_display(cwd);
     // Claude Code replaces every non-alphanumeric character with "-", not just "/".
     real.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -514,13 +512,7 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
 }
 
 fn real_cwd(project_path: &str) -> anyhow::Result<String> {
-    match std::fs::canonicalize(project_path) {
-        Ok(p) => Ok(p.to_string_lossy().to_string()),
-        Err(_) => {
-            std::fs::create_dir_all(project_path)?;
-            Ok(std::fs::canonicalize(project_path)?.to_string_lossy().to_string())
-        }
-    }
+    Ok(crate::util::canonicalize_create(project_path)?)
 }
 
 fn short_id(prefix: &str) -> String {
@@ -761,4 +753,18 @@ fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
         raw: Some(json!({ "file": latest.to_string_lossy() })),
         match_snippet: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_dir_strips_windows_verbatim_prefix() {
+        let from_verbatim = encode_dir(r"\\?\C:\Users\test\src");
+        let from_plain = encode_dir(r"C:\Users\test\src");
+        assert_eq!(from_verbatim, from_plain);
+        assert_eq!(from_plain, "C--Users-test-src");
+        assert!(!from_verbatim.contains('?'), "verbatim prefix leaked: {from_verbatim}");
+    }
 }

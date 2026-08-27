@@ -707,8 +707,9 @@ pub async fn run_standalone_resume(
             home
         };
         let cmd = crate::adapters::adapter_for(target_tool).resume_cmd(&session_id, &project_dir);
-        println!("Launching: {}", cmd.join(" "));
-        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).current_dir(&project_dir).status();
+        let argv = crate::agents::spawn_argv(&cmd);
+        println!("Launching: {}", argv.join(" "));
+        let status = crate::agents::std_command(&cmd).current_dir(&project_dir).status();
         // Drain queued telemetry before the hard exit swallows it (process::exit
         // skips the flush the caller runs after this fn returns).
         crate::telemetry::flush().await;

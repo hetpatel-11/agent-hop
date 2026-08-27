@@ -10,18 +10,48 @@ use crate::agents::{which, ToolName};
 use crate::util::{clean_title, truncate, to_tool_input_object, MAX_TOOL_OUTPUT_CHARS};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use uuid::Uuid;
 
 fn db_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".local").join("share").join("opencode").join("opencode.db")
+    if let Ok(p) = std::env::var("OPENCODE_DB") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|p| PathBuf::from(p).join("opencode"))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local").join("share").join("opencode"));
+    data.join("opencode.db")
+}
+
+fn open_db_ro(path: &std::path::Path) -> Option<rusqlite::Connection> {
+    if !path.is_file() {
+        return None;
+    }
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
+
+fn session_ids_from(path: &std::path::Path, limit: usize) -> Vec<String> {
+    let Some(conn) = open_db_ro(path) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id FROM session LIMIT ?1") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([limit as i64], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
 }
 
 /// The real installed opencode version, e.g. "1.18.15" -- a hardcoded guess
 /// here goes stale the moment opencode updates itself. Falls back to a
 /// generic placeholder if opencode isn't on PATH.
 fn opencode_cli_version() -> String {
-    match Command::new("opencode").arg("--version").output() {
+    match crate::agents::std_command_bin("opencode", &["--version"]).output() {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             extract_semver(&text).unwrap_or_else(|| "0.0.0".to_string())
@@ -58,11 +88,21 @@ fn uid() -> String {
 /// that would mean one subprocess spawn per session just to list, far too
 /// slow at scale). Still pure SQL, so this stays fast.
 fn list_sessions() -> anyhow::Result<Vec<SessionRef>> {
-    if !db_path().exists() || !has_opencode() {
+    if !has_opencode() {
         return Ok(Vec::new());
     }
+    Ok(list_sessions_from(&db_path()))
+}
 
-    let query = format!(
+/// List OpenCode sessions by reading the sqlite db directly. Used to live
+/// in a `sqlite3 -json` subprocess, which is missing on most Windows
+/// installs and also broke on `file:C:\...` URIs (the colon). Bundled
+/// rusqlite opens the path as a file, no CLI, no URI.
+fn list_sessions_from(path: &std::path::Path) -> Vec<SessionRef> {
+    let Some(conn) = open_db_ro(path) else {
+        return Vec::new();
+    };
+    let sql = format!(
         "SELECT s.id, s.directory, s.title, s.time_updated, \
          SUBSTR(GROUP_CONCAT(json_extract(p.data, '$.text'), ' '), 1, {MAX_BODY_CHARS}) AS body \
          FROM session s \
@@ -72,52 +112,49 @@ fn list_sessions() -> anyhow::Result<Vec<SessionRef>> {
          ORDER BY s.time_updated DESC \
          LIMIT 500"
     );
-    let db_uri = format!("file:{}?mode=ro", db_path().to_string_lossy());
-    let out = match Command::new("sqlite3").args(["-json", &db_uri, &query]).output() {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return Ok(Vec::new()),
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out).to_string();
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<Value> = match serde_json::from_str(&text) {
-        Ok(r) => r,
-        Err(_) => return Ok(Vec::new()),
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        ))
+    }) else {
+        return Vec::new();
     };
 
     let mut out_refs = Vec::new();
-    for row in rows {
-        let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
-        let Some(directory) = row.get("directory").and_then(|v| v.as_str()) else { continue };
-        let raw_title = row.get("title").and_then(|v| v.as_str());
-        let body = row.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let time_updated = row.get("time_updated").and_then(|v| v.as_i64());
+    for row in rows.flatten() {
+        let (id, directory, raw_title, time_updated, body) = row;
 
         // OpenCode's own placeholder before it auto-generates a real title --
         // useless for search/display, prefer real body content when we have it.
-        let is_placeholder = raw_title.is_none() || is_new_session_placeholder(raw_title.unwrap());
+        let is_placeholder = raw_title.as_deref().is_none_or(is_new_session_placeholder);
         let body_first_line: String = body.trim().split_whitespace().take(20).collect::<Vec<_>>().join(" ");
         let title_source = if is_placeholder && !body_first_line.is_empty() {
             body_first_line
         } else {
-            raw_title.unwrap_or("(untitled)").to_string()
+            raw_title.clone().unwrap_or_else(|| "(untitled)".to_string())
         };
         let title = clean_title(&title_source);
         let title = if title.is_empty() { "(untitled)".to_string() } else { title };
         out_refs.push(SessionRef {
             tool: ToolName::OpenCode,
-            session_id: id.to_string(),
-            project_path: directory.to_string(),
+            session_id: id,
+            project_path: directory,
             snippet: title.chars().take(200).collect(),
             title,
-            body: Some(if body.is_empty() { raw_title.unwrap_or("").to_string() } else { body }),
+            body: Some(if body.is_empty() { raw_title.unwrap_or_default() } else { body }),
             updated_at: time_updated.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
             raw: Some(json!({})),
             match_snippet: None,
         });
     }
-    Ok(out_refs)
+    out_refs
 }
 
 fn is_new_session_placeholder(title: &str) -> bool {
@@ -143,8 +180,7 @@ fn export_session(session_id: &str) -> Option<Value> {
     let tmp_path = std::env::temp_dir().join(format!("agent-hop-opencode-export-{}.json", Uuid::new_v4()));
     let result = (|| -> anyhow::Result<Value> {
         let file = std::fs::File::create(&tmp_path)?;
-        let status = Command::new("opencode")
-            .args(["export", session_id])
+        let status = crate::agents::std_command_bin("opencode", &["export", session_id])
             .stdin(Stdio::null())
             .stdout(Stdio::from(file))
             .stderr(Stdio::null())
@@ -279,20 +315,10 @@ pub fn prewarm_export_template_cache() {
 }
 
 fn real_export_template_uncached() -> Option<(Value, Value)> {
-    let db_uri = format!("file:{}?mode=ro", db_path().to_string_lossy());
-    let out = Command::new("sqlite3")
-        .args(["-json", &db_uri, "SELECT id FROM session LIMIT 20"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    if text.trim().is_empty() {
-        return None;
-    }
-    let rows: Vec<Value> = serde_json::from_str(&text).ok()?;
-    for row in rows {
-        let id = row.get("id").and_then(|v| v.as_str())?;
-        let Some(data) = export_session(id) else { continue };
-        let messages = data.get("messages").and_then(|v| v.as_array())?;
+    let ids = session_ids_from(&db_path(), 20);
+    for id in ids {
+        let Some(data) = export_session(&id) else { continue };
+        let Some(messages) = data.get("messages").and_then(|v| v.as_array()) else { continue };
         let user_info = messages
             .iter()
             .find(|m| m.get("info").and_then(|i| i.get("role")).and_then(|v| v.as_str()) == Some("user"))
@@ -438,8 +464,8 @@ fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {
     } else {
         dirs::home_dir().unwrap_or_default().to_string_lossy().to_string()
     };
-    let result = Command::new("opencode")
-        .args(["import", &tmp_file.to_string_lossy()])
+    let tmp_str = tmp_file.to_string_lossy();
+    let result = crate::agents::std_command_bin("opencode", &["import", tmp_str.as_ref()])
         .current_dir(&import_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -476,5 +502,70 @@ impl Adapter for OpenCodeAdapter {
     }
     fn resume_cmd(&self, session_id: &str, project_path: &str) -> Vec<String> {
         resume_cmd_impl(session_id, project_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_fixture_db(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (id TEXT, directory TEXT, title TEXT, time_updated INTEGER);
+            CREATE TABLE part (session_id TEXT, data TEXT);
+            INSERT INTO session VALUES ('ses_keep', '/tmp/proj', 'New session - 2026-08-27', 200);
+            INSERT INTO part VALUES ('ses_keep', '{"type":"text","text":"fix the windows spawn"}');
+            INSERT INTO session VALUES ('ses_named', '/tmp/other', 'real title', 100);
+            INSERT INTO part VALUES ('ses_named', '{"type":"text","text":"hello"}');
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_sessions_reads_sqlite_without_cli() {
+        let dir = std::env::temp_dir().join(format!("agent-hop-opencode-db-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        write_fixture_db(&db);
+
+        let sessions = list_sessions_from(&db);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "ses_keep");
+        assert_eq!(sessions[0].project_path, "/tmp/proj");
+        assert!(
+            sessions[0].title.contains("fix") || sessions[0].body.as_deref().unwrap_or("").contains("windows spawn"),
+            "placeholder title should fall back to body, got title={:?} body={:?}",
+            sessions[0].title,
+            sessions[0].body
+        );
+        assert_eq!(session_ids_from(&db, 20), vec!["ses_keep".to_string(), "ses_named".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_sessions_missing_db_is_empty_not_an_error() {
+        let missing = std::env::temp_dir().join("agent-hop-no-such-opencode.db");
+        let _ = std::fs::remove_file(&missing);
+        assert!(list_sessions_from(&missing).is_empty());
+        assert!(session_ids_from(&missing, 20).is_empty());
+    }
+
+    #[test]
+    fn list_sessions_reads_real_opencode_db_if_present() {
+        let path = dirs::home_dir().unwrap_or_default().join(".local").join("share").join("opencode").join("opencode.db");
+        if !path.is_file() {
+            return;
+        }
+        let sessions = list_sessions_from(&path);
+        assert!(
+            !sessions.is_empty(),
+            "bundled rusqlite should list sessions from the real OpenCode db at {}",
+            path.display()
+        );
+        assert!(sessions.iter().all(|s| !s.session_id.is_empty() && !s.project_path.is_empty()));
     }
 }

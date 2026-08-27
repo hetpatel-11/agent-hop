@@ -108,7 +108,7 @@ pub fn adapter_for(tool: ToolName) -> Box<dyn Adapter> {
 }
 
 fn canonical_or_self(path: &str) -> String {
-    std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| path.to_string())
+    crate::util::canonicalize_display(path)
 }
 
 /// Finds the most-recently-updated session a given tool has for a given

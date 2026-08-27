@@ -32,12 +32,13 @@ fn sessions_dir() -> PathBuf {
 }
 
 fn encode_dir(cwd: &str) -> String {
-    let real = std::fs::canonicalize(cwd).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| cwd.to_string());
+    let real = crate::util::canonicalize_display(cwd);
     // Splitting on a literal "/" left a Windows path (e.g. C:\Users\test\src)
     // as one untouched component, including the ":" and "\" -- both illegal
     // in a Windows directory name. Strip one leading separator (either
     // style), then flatten every remaining "/", "\", and ":" to "-" so the
-    // result is a single safe component on both platforms.
+    // result is a single safe component on both platforms. Also strip the
+    // `\\?\` prefix canonicalize adds on Windows — Pi never uses that form.
     let stripped = real.strip_prefix('/').or_else(|| real.strip_prefix('\\')).unwrap_or(&real);
     let flattened: String = stripped.chars().map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c }).collect();
     format!("--{flattened}--")
@@ -280,13 +281,7 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
 }
 
 fn real_cwd(project_path: &str) -> anyhow::Result<String> {
-    match std::fs::canonicalize(project_path) {
-        Ok(p) => Ok(p.to_string_lossy().to_string()),
-        Err(_) => {
-            std::fs::create_dir_all(project_path)?;
-            Ok(std::fs::canonicalize(project_path)?.to_string_lossy().to_string())
-        }
-    }
+    Ok(crate::util::canonicalize_create(project_path)?)
 }
 
 fn short_hex(n: usize) -> String {
@@ -520,5 +515,14 @@ mod tests {
     fn encode_dir_flattens_unix_paths() {
         let encoded = encode_dir("/Users/test/src/demo");
         assert_eq!(encoded, "--Users-test-src-demo--");
+    }
+
+    #[test]
+    fn encode_dir_strips_windows_verbatim_prefix() {
+        let from_verbatim = encode_dir(r"\\?\C:\Users\test\src\demo");
+        let from_plain = encode_dir(r"C:\Users\test\src\demo");
+        assert_eq!(from_verbatim, from_plain);
+        assert!(!from_verbatim.contains('?'), "verbatim prefix leaked: {from_verbatim}");
+        assert_eq!(from_plain, "--C--Users-test-src-demo--");
     }
 }

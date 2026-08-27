@@ -347,13 +347,7 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
 }
 
 fn real_cwd(project_path: &str) -> anyhow::Result<String> {
-    match std::fs::canonicalize(project_path) {
-        Ok(p) => Ok(p.to_string_lossy().to_string()),
-        Err(_) => {
-            std::fs::create_dir_all(project_path)?;
-            Ok(std::fs::canonicalize(project_path)?.to_string_lossy().to_string())
-        }
-    }
+    Ok(crate::util::canonicalize_create(project_path)?)
 }
 
 fn write_impl(turns: &[Turn], project_path: &str) -> anyhow::Result<String> {

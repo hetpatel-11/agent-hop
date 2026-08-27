@@ -27,7 +27,7 @@ fn sessions_dir() -> PathBuf {
 /// generic placeholder if codex isn't on PATH (write() would fail on the
 /// missing binary long before this matters in practice).
 fn codex_cli_version() -> String {
-    match std::process::Command::new("codex").arg("--version").output() {
+    match crate::agents::std_command_bin("codex", &["--version"]).output() {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             extract_semver(&text).unwrap_or_else(|| "0.0.0".to_string())
@@ -378,13 +378,7 @@ fn read_impl(session_ref: &SessionRef) -> anyhow::Result<Vec<Turn>> {
 }
 
 fn real_cwd(project_path: &str) -> anyhow::Result<String> {
-    match std::fs::canonicalize(project_path) {
-        Ok(p) => Ok(p.to_string_lossy().to_string()),
-        Err(_) => {
-            std::fs::create_dir_all(project_path)?;
-            Ok(std::fs::canonicalize(project_path)?.to_string_lossy().to_string())
-        }
-    }
+    Ok(crate::util::canonicalize_create(project_path)?)
 }
 
 fn call_id() -> String {
@@ -535,7 +529,7 @@ impl Adapter for CodexAdapter {
 /// realistically reads one line from one or a few files, not the whole
 /// history.
 fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
-    let target = std::fs::canonicalize(project_path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| project_path.to_string());
+    let target = crate::util::canonicalize_display(project_path);
     let dir = sessions_dir();
     let mut files = find_files(&dir, |p| p.extension().map(|e| e == "jsonl").unwrap_or(false));
     files.sort_by_key(|f| std::cmp::Reverse(std::fs::metadata(f).and_then(|m| m.modified()).ok()));
@@ -548,7 +542,7 @@ fn find_latest_for_path_impl(project_path: &str) -> Option<SessionRef> {
         }
         let Some(payload) = obj.get("payload").and_then(|v| v.as_object()) else { continue };
         let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-        let canon_cwd = std::fs::canonicalize(cwd).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| cwd.to_string());
+        let canon_cwd = crate::util::canonicalize_display(cwd);
         if canon_cwd != target {
             continue;
         }

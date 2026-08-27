@@ -114,7 +114,10 @@ pub fn which(bin: &str) -> Option<std::path::PathBuf> {
 /// shim, a `*.cmd` batch wrapper, and a `*.ps1`. `CreateProcessW` cannot
 /// run the shim (os error 193: not a valid Win32 application) or a batch
 /// file by itself. Resolve via [`which`] (which prefers `.cmd` over the
-/// shim) and route `*.cmd`/`*.bat` through `cmd.exe /d /s /c`.
+/// shim) and route `*.cmd`/`*.bat` through `cmd.exe /d /s /c`. Reported
+/// and patched in that form by @UnknownUser03393 in
+/// https://github.com/hetpatel-11/agent-hop/pull/3 — 0.1.4 applies the
+/// same wrap at every harness spawn, not only the live pty.
 pub fn spawn_argv(command: &[String]) -> Vec<String> {
     spawn_argv_for(command, cfg!(windows), which)
 }

@@ -1648,9 +1648,14 @@ fn spawn_live_tab(
             CommandBuilder::new(shell)
         }
         TabKind::Agent(tool) => match &launch {
-            Launch::Fresh => CommandBuilder::new(tool.binary()),
+            Launch::Fresh => {
+                let argv = crate::agents::spawn_argv(&[tool.binary().to_string()]);
+                let mut cmd = CommandBuilder::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                cmd
+            }
             Launch::Resume(session_id) => {
-                let argv = adapter_for(tool).resume_cmd(session_id, project_path);
+                let argv = crate::agents::spawn_argv(&adapter_for(tool).resume_cmd(session_id, project_path));
                 let mut cmd = CommandBuilder::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 cmd

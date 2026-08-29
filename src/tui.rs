@@ -37,6 +37,23 @@ fn resolve_color(color: Option<vt::CellColor>) -> RColor {
     }
 }
 
+/// Default cell colors when the child left a cell unset. `Reset` would
+/// punch through to the host terminal theme (often a white xfce/Terminal.app
+/// default), so the pane canvas matches our dark chrome instead.
+fn pane_fg(color: Option<vt::CellColor>) -> RColor {
+    match resolve_color(color) {
+        RColor::Reset => CHROME_TEXT,
+        other => other,
+    }
+}
+
+fn pane_bg(color: Option<vt::CellColor>) -> RColor {
+    match resolve_color(color) {
+        RColor::Reset => CHROME_BG,
+        other => other,
+    }
+}
+
 fn cell_modifier(cell: &vt::Cell) -> RModifier {
     let mut m = RModifier::empty();
     if cell.bold {
@@ -2544,7 +2561,8 @@ fn spawn_live_tab(
                             paint_frame(&mut rterm, &mut term, &strip, false);
                         }
                     } else if !paint_thread.load(Ordering::SeqCst) {
-                        wake_compositor(&tab_strip);
+                        // Idle poll: do not poke the compositor. The old
+                        // every-120ms Wake+clear is what made a split flicker.
                     }
                 }
                 Ok(ChildMsg::Bytes(data)) => {
@@ -2583,6 +2601,12 @@ fn spawn_live_tab(
                         rterm = None;
                     }
                 }
+                Ok(ChildMsg::PeerPaint) => {
+                    if paint_thread.load(Ordering::SeqCst) && !suppress_thread.load(Ordering::SeqCst) {
+                        let strip = tab_strip.lock().unwrap().clone();
+                        paint_frame(&mut rterm, &mut term, &strip, false);
+                    }
+                }
                 Ok(ChildMsg::Eof) => break,
             }
         }
@@ -2612,7 +2636,7 @@ fn wake_compositor(tab_strip: &Arc<Mutex<TabStrip>>) {
         return;
     }
     if let Some(wake) = &strip.compositor_wake {
-        let _ = wake.send(ChildMsg::Wake);
+        let _ = wake.send(ChildMsg::PeerPaint);
     }
 }
 
@@ -3011,8 +3035,8 @@ fn render_frame(rterm: &mut RTerminal<crate::attach::AttachBackend>, term: &mut 
             for x in side..area.width {
                 let Some(c) = buf.cell_mut((x, y)) else { continue };
                 c.set_char(' ');
-                c.fg = RColor::Reset;
-                c.bg = RColor::Reset;
+                c.fg = CHROME_TEXT;
+                c.bg = CHROME_BG;
                 c.modifier = RModifier::empty();
                 c.skip = false;
             }
@@ -3051,8 +3075,8 @@ fn render_frame(rterm: &mut RTerminal<crate::attach::AttachBackend>, term: &mut 
             } else {
                 rc.set_symbol(&cell.text);
             }
-            rc.fg = resolve_color(cell.fg);
-            rc.bg = resolve_color(cell.bg);
+            rc.fg = pane_fg(cell.fg);
+            rc.bg = pane_bg(cell.bg);
             rc.modifier = cell_modifier(&cell);
             rc.skip = false;
         });
@@ -3174,7 +3198,7 @@ fn paint_peer_lines(
             if let Some(c) = buf.cell_mut((col, y)) {
                 c.set_char(ch);
                 c.fg = dim;
-                c.bg = RColor::Reset;
+                c.bg = CHROME_BG;
                 c.modifier = RModifier::empty();
                 c.skip = false;
             }
@@ -3414,8 +3438,12 @@ enum ChildMsg {
     /// send site's own doc comment for the deadlock this replaces.
     Eof,
     /// Focused this tab: parser thread should take the ratatui terminal
-    /// and paint, or drop it if we just lost focus.
+    /// and paint, or drop it if we just lost focus. Clears first.
     Wake,
+    /// The other pane in a split changed. Redraw without `Terminal::clear`
+    /// — a full clear flashes the host terminal's default background
+    /// (white on a light theme) between every peer frame.
+    PeerPaint,
 }
 
 /// One event stream for `run_agent_picker`'s own loop, merging its two
@@ -4440,6 +4468,13 @@ mod terminal_model_tests {
 #[cfg(test)]
 mod multiplexer_chrome_tests {
     use super::*;
+
+    #[test]
+    fn unset_cell_colors_use_dark_chrome_not_host_reset() {
+        assert_eq!(pane_bg(None), CHROME_BG);
+        assert_eq!(pane_fg(None), CHROME_TEXT);
+        assert_eq!(pane_bg(Some(vt::CellColor::Rgb(vt::Rgb { r: 1, g: 2, b: 3 }))), RColor::Rgb(1, 2, 3));
+    }
 
     #[test]
     fn wide_terminal_reserves_sidebar_columns() {

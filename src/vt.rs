@@ -10,11 +10,7 @@
 //! doesn't specifically implement. That's not a bug to patch, it's the
 //! structural ceiling of "a model built by someone other than the terminal
 //! whose behavior you're trying to match." Ghostty's own engine has no such
-//! ceiling for anything Ghostty itself understands. herdr (a real, shipping
-//! AI-agent terminal multiplexer solving this exact problem) hit the same
-//! wall with its own original `vt100`-based backend and migrated to this
-//! same engine for the same reason -- see its CHANGELOG v0.2.2/v0.2.3
-//! entries for the specific Codex scrollback/cursor bugs that motivated it.
+//! ceiling for anything Ghostty itself understands.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -181,10 +177,9 @@ pub struct Terminal {
     /// `GHOSTTY_STYLE_COLOR_NONE` for cells libghostty-vt hadn't marked
     /// dirty on *this* update -- their color data isn't necessarily
     /// (re)computed for a cell outside the dirty-tracked path at all.
-    /// herdr's own renderer only ever reads a row when
-    /// `GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY` is true and otherwise keeps
-    /// what it already had; this mirrors that, updating `grid[y]` only for
-    /// dirty rows and serving every other row from cache.
+    /// Only re-read a row when `GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY` is
+    /// true; otherwise keep what we already had. `grid[y]` updates only
+    /// for dirty rows; every other row is served from cache.
     grid: Vec<Vec<Cell>>,
     cols: u16,
     rows: u16,
@@ -506,7 +501,7 @@ impl Terminal {
             // every row unconditionally (what this used to do) came back
             // with empty style data for cells outside the dirty-tracked
             // path. Rows that aren't dirty just re-emit last frame's
-            // cached content below, same as herdr's own renderer.
+            // cached content below.
             let mut dirty = false;
             unsafe {
                 ffi::ghostty_render_state_row_get(self.row_iter, ffi::GhosttyRenderStateRowData::GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &mut dirty as *mut _ as *mut c_void);
@@ -538,9 +533,8 @@ impl Terminal {
 
             let mut x: u16 = 0;
             while unsafe { ffi::ghostty_render_state_row_cells_next(self.row_cells) } {
-                // Fetched together in a single batched call, matching
-                // herdr's own `basic_data()` exactly -- confirmed live as
-                // the actual fix: querying `RAW`/`STYLE`/`GRAPHEMES_LEN`
+                // Fetched together in a single batched call -- confirmed
+                // live as the actual fix: querying `RAW`/`STYLE`/`GRAPHEMES_LEN`
                 // as separate sequential `ghostty_render_state_row_cells_get`
                 // calls (what this used to do) silently returned a
                 // zeroed/default `GhosttyStyle` for cells populated purely
@@ -596,10 +590,9 @@ impl Terminal {
                     }
                 };
 
-                // Priority order matches herdr's own resolution chain
-                // exactly (verified against its source): explicit content
-                // tag first, then the raw style color, then the
-                // pre-flattened convenience query as a last resort.
+                // Priority: explicit content tag first, then the raw
+                // style color, then the pre-flattened convenience query
+                // as a last resort.
                 let fg = style_color(style.fg_color).or_else(|| {
                     let mut rgb = Rgb::default();
                     let res = unsafe {
@@ -617,10 +610,9 @@ impl Terminal {
                 // "content tag" on the raw cell (`BG_COLOR_PALETTE` /
                 // `BG_COLOR_RGB`), not through the style struct. The
                 // row-cells convenience query below documents itself as
-                // already flattening this in, but confirmed live (via
-                // herdr's own source, which reads this explicitly first as
-                // insurance) that isn't reliable in every case, so this
-                // checks the raw content tag itself before falling back.
+                // already flattening this in, but that isn't reliable in
+                // every case, so this checks the raw content tag itself
+                // before falling back.
                 let bg = if matches!(raw_res, ffi::GhosttyResult::GHOSTTY_SUCCESS) {
                     let mut tag = ffi::GhosttyCellContentTag::GHOSTTY_CELL_CONTENT_CODEPOINT;
                     unsafe {
@@ -680,8 +672,7 @@ impl Terminal {
             }
             // Clear the row's dirty flag now that it's been fully read and
             // cached -- otherwise every row would look dirty forever and
-            // this would never actually skip re-reading anything. Matches
-            // herdr's own `clear_dirty()` call after processing a row.
+            // this would never actually skip re-reading anything.
             let clean = false;
             unsafe {
                 ffi::ghostty_render_state_row_set(self.row_iter, ffi::GhosttyRenderStateRowOption::GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean as *const _ as *const c_void);

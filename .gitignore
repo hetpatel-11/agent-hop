@@ -7,7 +7,6 @@ dist/
 # Added by cargo
 
 /target
-/.herdr-reference
 # Zig build/package caches for libghostty-vt, kept outside target/ so CI's
 # Rust cache never archives them (see build.rs for why they must stay fresh).
 /.zig-cache-ah

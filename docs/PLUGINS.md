@@ -44,4 +44,4 @@ contains = "conversation ended"
 
 Statuses: `idle`, `working`, `blocked`, `done`, `unknown`.
 
-Herdr-style remote manifests are also read from `~/.local/state/agent-hop/agent-detection/remote/` if present. Override the search path with `AH_DETECT_DIR`.
+Remote detection manifests are also read from `~/.local/state/agent-hop/agent-detection/remote/` if present. Override the search path with `AH_DETECT_DIR`.

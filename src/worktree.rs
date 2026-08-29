@@ -1,4 +1,4 @@
-//! First-class `git worktree` workspaces, matching herdr's worktree UX.
+//! First-class `git worktree` workspaces.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -1,5 +1,4 @@
 //! Thin remote: local `ah` is the client; SSH starts `ah` on the host.
-//! Same idea as `herdr remote user@host` / `herdr --remote`.
 
 use std::process::Command;
 

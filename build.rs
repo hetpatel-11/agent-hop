@@ -1,7 +1,6 @@
 //! Fetches, builds, and links `libghostty-vt` -- Ghostty's own embeddable
-//! terminal-state engine -- pinned to the exact commit herdr (a real,
-//! shipping AI-agent terminal multiplexer solving this same problem) vendors
-//! as of this writing. See src/vt.rs's module doc for why this replaced
+//! terminal-state engine -- pinned to a known Ghostty commit so the VT
+//! ABI stays stable across builds. See src/vt.rs's module doc for why this replaced
 //! alacritty_terminal: alacritty_terminal doesn't implement OSC 133
 //! (semantic prompt marking), which is what a real Codex session uses to
 //! mark its input line -- and that's a fundamental "the model doesn't
@@ -24,9 +23,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Exact commit herdr's own vendor/libghostty-vt.vendor.json pins as of the
-/// version whose CHANGELOG documents the vt100 -> Ghostty migration this
-/// mirrors.
+/// Pinned Ghostty commit for the libghostty-vt build.
 const GHOSTTY_COMMIT: &str = "c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3";
 
 fn zig_target(target: &str) -> &str {
@@ -181,8 +178,7 @@ fn main() {
         // confirmed live (the built binary failed at runtime looking for
         // `@rpath/libghostty-vt.dylib`, meaning it linked dynamically
         // despite the hint). Passing the archive's exact path as a raw
-        // linker argument, same as herdr's own build.rs does, leaves the
-        // linker no name to re-resolve.
+        // linker argument leaves the linker no name to re-resolve.
         let static_lib = lib_dir.join("libghostty-vt.a");
         println!("cargo:rustc-link-arg={}", static_lib.display());
         println!("cargo:rustc-link-lib=c++");

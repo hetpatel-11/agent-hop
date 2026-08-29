@@ -18,7 +18,7 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
 - **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
-- **Tabs, splits, and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x/%/"/h/j/k/l/z`) or click the sidebar and tab strip. `Ctrl+B %` / `"` split a workspace the way tmux/herdr do. `Ctrl+B q` detaches; the daemon keeps PTYs alive. `ah` reattaches. `ah server stop` kills them.
+- **Tabs, splits, and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x/%/"/h/j/k/l/z`) or click the sidebar and tab strip. `Ctrl+B %` / `"` split a workspace the way tmux does. `Ctrl+B q` detaches; the daemon keeps PTYs alive. `ah` reattaches. `ah server stop` kills them.
 - **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close). `ah agent list|wait|prompt|read` works from any terminal.
 - **Thin remote** — `ah remote user@host` or `ah --remote user@host` is `ssh -t` plus `ah` on the far side.
 - **Worktrees** — `ah worktree list|add|remove` wraps `git worktree` so a folder is a first-class workspace.
@@ -151,7 +151,7 @@ ah workspace next
 ah workspace prev
 ```
 
-`Ctrl+B q` detaches the way herdr's `prefix+q` does. The mux stays up (`ah server status`). The next `ah` reattaches. `ah server stop` kills the agents. Sidebar status is idle / working / blocked / done / unknown (TOML overlays in `~/.agent-hop/detect/`). When the last agent in a tab exits, that tab closes. If it was the last tab, the daemon stops. `Ctrl+B x` closes a tab the same way.
+`Ctrl+B q` detaches. The mux stays up (`ah server status`). The next `ah` reattaches. `ah server stop` kills the agents. Sidebar status is idle / working / blocked / done / unknown (TOML overlays in `~/.agent-hop/detect/`). When the last agent in a tab exits, that tab closes. If it was the last tab, the daemon stops. `Ctrl+B x` closes a tab the same way.
 
 Plugins and extra detection rules: [docs/PLUGINS.md](docs/PLUGINS.md).
 

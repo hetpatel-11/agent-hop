@@ -116,7 +116,7 @@ enum Commands {
     },
     /// Rename the focused agent (or `--name` / `--tab`) in the live mux.
     Rename {
-        /// New display name, herdr-style (`security-droid`).
+        /// New display name (e.g. `security-droid`).
         name: String,
         #[arg(long)]
         tab: Option<u32>,

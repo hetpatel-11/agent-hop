@@ -134,10 +134,8 @@ enum RunEvent {
     /// Alt+Up/Down cycles through, so a user can jump straight to a
     /// specific agent instead of only stepping next/prev.
     AgentPicker,
-    /// `PREFIX_KEY` then `?` -- matches herdr's own `prefix+?` convention
-    /// exactly (its docs: "Press prefix+? at any time to see every active
-    /// binding"). Shows every ah shortcut in one place, since none of them
-    /// are otherwise discoverable except by reading the toggle bar's own
+    /// `PREFIX_KEY` then `?` — show every ah shortcut. None of them are
+    /// otherwise discoverable except by reading the toggle bar's own
     /// (necessarily terse) hint text.
     ShowHelp,
     /// `PREFIX_KEY` then `c` -- new tab: another live agent PTY, current
@@ -154,9 +152,8 @@ enum RunEvent {
     CloseTab,
     /// `PREFIX_KEY` then `1`…`9`, or a click on a tab in the top strip.
     FocusTab(usize),
-    /// `PREFIX_KEY` then `q` — same chord herdr uses to detach. We are
-    /// not a background server: layout is saved, agents stop, next `ah`
-    /// restores the same workspaces and resumes each chat.
+    /// `PREFIX_KEY` then `q` — detach. Layout is saved; the daemon keeps
+    /// agents. Next `ah` reattaches.
     Leave,
     /// Client attached to the daemon (stream + size).
     ClientAttach { cols: u16, rows: u16, stream: std::os::unix::net::UnixStream },
@@ -164,9 +161,9 @@ enum RunEvent {
     ClientGone,
     /// `ah server stop` — kill agents and exit the daemon.
     Stop,
-    /// `PREFIX_KEY` then `r` — rename the focused agent (herdr: named panes).
+    /// `PREFIX_KEY` then `r` — rename the focused agent.
     RenameAgent,
-    /// `PREFIX_KEY` then `%` / `"` — split this workspace (tmux/herdr).
+    /// `PREFIX_KEY` then `%` / `"` — split this workspace (tmux-style).
     Split(crate::layout::SplitDir),
     /// `PREFIX_KEY` then `h`/`j`/`k`/`l` — other pane in a split.
     NextPane,
@@ -201,7 +198,7 @@ struct AgentChrome {
 #[derive(Clone)]
 struct TabStrip {
     workspaces: Vec<WsChrome>,
-    /// Every live agent across every workspace, herdr-style.
+    /// Every live agent across every workspace.
     agents: Vec<AgentChrome>,
     ws_focus: usize,
     tabs: Vec<TabKind>,
@@ -1270,7 +1267,7 @@ enum SidebarHit {
 
 /// Same row map `write_sidebar` uses, so a click lands on the row that
 /// was actually drawn. Workspaces under the "ah" header; agents of the
-/// focused workspace below, herdr-style (name + idle/working).
+/// focused workspace below (name + idle/working).
 fn hit_test_sidebar(n_workspaces: usize, n_agents: usize, y: u16, height: u16) -> SidebarHit {
     if y >= height {
         return SidebarHit::Miss;
@@ -1959,7 +1956,7 @@ const CHROME_ROWS: u16 = TOP_BAR_ROWS + 1;
 const SIDEBAR_COLS: u16 = 24;
 const SIDEBAR_MIN_TERM_COLS: u16 = 72;
 const SIDEBAR_SESSION_ROWS: u16 = 3;
-/// Name + idle/working/blocked line, matching herdr's agent rows.
+/// Name + idle/working/blocked line.
 const SIDEBAR_AGENT_ROWS: u16 = 2;
 
 fn snapshot_tab_statuses(strip: &TabStrip) -> Vec<AgentStatus> {
@@ -2095,8 +2092,8 @@ fn apply_split(
     focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
 }
 
-/// ah's own tmux/herdr-style prefix key -- Ctrl+B (0x02), matching herdr's
-/// own default exactly. Alt+Up/Down and clicking the toggle bar both
+/// ah's own tmux-style prefix key -- Ctrl+B (0x02). Alt+Up/Down and
+/// clicking the toggle bar both
 /// already switch agents, but neither is universal: Alt+Up/Down depends on
 /// the terminal transmitting a CSI modifier code for the held Option/Alt
 /// key, which macOS Terminal.app's default configuration simply doesn't do
@@ -2427,11 +2424,9 @@ fn spawn_live_tab(
         // marking, full color/attribute semantics, wide-character
         // handling) were each confirmed live as real corruption/fidelity
         // bugs. Using Ghostty's own engine means anything Ghostty itself
-        // understands, this understands too -- the same reasoning herdr
-        // (a real, shipping AI-agent terminal multiplexer) documented in
-        // its own CHANGELOG when it migrated off a `vt100` backend for the
-        // same class of bug. `ratatui`'s own `Terminal` owns the actual
-        // diff-and-emit step (the same battle-tested code path used by
+        // understands, this understands too. `ratatui`'s own `Terminal`
+        // owns the actual diff-and-emit step (the same battle-tested
+        // code path used by
         // every ratatui app), so nothing in this file re-implements
         // terminal *rendering* by hand -- only the read side, from
         // libghostty-vt's own render-state API.
@@ -2827,10 +2822,8 @@ fn draw_agent_picker(out: &mut impl Write, installed: &[ToolName], selected: usi
 /// (session is from X)` — lets a session recorded in one tool be resumed
 /// in any other installed tool via `adapters::convert_session`, mirroring
 /// Every shortcut ah itself binds, in the order shown by the help overlay.
-/// `Ctrl+B ?` (matching herdr's own `prefix+?` exactly -- its docs:
-/// "Press prefix+? at any time to see every active binding") is the one
-/// discoverable way to see this list; the toggle bar's own hint text is
-/// necessarily terse and can't fit all of it.
+/// `Ctrl+B ?` is the discoverable way to see this list; the toggle bar's
+/// own hint text is necessarily terse and can't fit all of it.
 const HELP_LINES: &[(&str, &str)] = &[
     ("Ctrl+B then n", "Hop this chat to the next agent — keeps the conversation"),
     ("Ctrl+B then p", "Hop this chat to the previous agent"),
@@ -3920,7 +3913,7 @@ fn spawn_input_decoder(
         let mut pending: Vec<u8> = Vec::new();
         loop {
             let is_lone_esc = pending == [0x1b];
-            // `0x02` is Ctrl+B -- ah's own tmux/herdr-style prefix key (see
+            // `0x02` is Ctrl+B -- ah's own tmux-style prefix key (see
             // `PREFIX_CHORD_TIMEOUT`'s doc comment for why this exists at
             // all). Unlike ESC, a lone Ctrl+B is never the start of a
             // legitimate multi-byte escape sequence -- it's a single,
@@ -3987,9 +3980,7 @@ fn spawn_input_decoder(
                             continue;
                         }
                         // ah's own prefix chord: Ctrl+B (0x02) then a
-                        // single plain letter, matching herdr's own default
-                        // prefix key and its N/P next/previous-tab
-                        // convention exactly -- picked specifically because
+                        // single plain letter -- picked specifically because
                         // it's the only kind of signal guaranteed to
                         // transmit identically on every terminal, every OS
                         // (a raw single-byte ASCII control code, unlike

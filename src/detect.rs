@@ -1,8 +1,8 @@
-//! Screen-matching agent status, same shape as herdr's per-agent manifests:
-//! look at the live VT snapshot (visible lines + OSC title/progress) and
-//! decide idle / working / blocked / done / unknown. Not a silence timer.
+//! Screen-matching agent status: look at the live VT snapshot (visible
+//! lines + OSC title/progress) and decide idle / working / blocked / done
+//! / unknown. Not a silence timer.
 //!
-//! User TOML under `~/.agent-hop/detect/*.toml` (and herdr-style
+//! User TOML under `~/.agent-hop/detect/*.toml` (and
 //! `~/.local/state/agent-hop/agent-detection/remote/`) runs first.
 
 use crate::agents::ToolName;
@@ -71,7 +71,7 @@ impl AgentStatus {
     }
 }
 
-/// Visible child screen plus OSC extras herdr's rules also read.
+/// Visible child screen plus OSC title and progress.
 #[derive(Clone, Debug, Default)]
 pub struct Screen {
     pub lines: Vec<String>,
@@ -430,8 +430,8 @@ fn claude_working(s: &Screen) -> bool {
     if s.contains_ci("mcp") && s.contains_ci("still running") {
         return true;
     }
-    // Herdr `live_turn_working`: a status mark + ellipsis, even when the
-    // prompt box (❯) is still drawn and "esc to interrupt" is absent.
+    // A status mark + ellipsis means a live turn, even when the prompt
+    // box (❯) is still drawn and "esc to interrupt" is absent.
     s.any_line(claude_turn_line)
 }
 
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn claude_spinner_ellipsis_is_working_even_with_prompt() {
-        // Claude keeps the ❯ box on screen during a turn. Herdr ranks the
+        // Claude keeps the ❯ box on screen during a turn. Rank the
         // spinner+ellipsis line above the prompt-box idle rule; we used to
         // miss that line (no "esc to interrupt") and snap to idle.
         let s = screen(&["* Crystallizing…", "❯ "]);
@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_manifest_parses_herdr_style_rules() {
+    fn toml_manifest_parses_status_rules() {
         let text = r#"
 agent = "cursor"
 version = 1

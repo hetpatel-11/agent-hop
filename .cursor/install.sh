@@ -30,13 +30,20 @@ sudo_if apt-get install -y --no-install-recommends \
   nodejs \
   npm
 
-if ! command -v rustup >/dev/null 2>&1; then
+if ! command -v rustup >/dev/null 2>&1 && ! command -v rustc >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 fi
+# Image rustup may live in /usr/local/cargo with no ~/.cargo/env.
 # shellcheck disable=SC1091
-. "${HOME}/.cargo/env"
-rustup toolchain install stable
-rustup default stable
+if [ -f "${HOME}/.cargo/env" ]; then
+  . "${HOME}/.cargo/env"
+elif [ -d /usr/local/cargo/bin ]; then
+  export PATH="/usr/local/cargo/bin:${PATH}"
+fi
+if command -v rustup >/dev/null 2>&1; then
+  rustup toolchain install stable
+  rustup default stable
+fi
 
 # edition = "2024" needs rustc >= 1.85
 rustc --version

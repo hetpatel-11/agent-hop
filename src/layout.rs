@@ -15,6 +15,8 @@ pub struct SavedTab {
     pub tool: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,14 +106,14 @@ mod tests {
                 SavedWorkspace {
                     path: "/tmp/a".into(),
                     focus: 0,
-                    tabs: vec![SavedTab { tool: "claude".into(), session_id: Some("s1".into()) }],
+                    tabs: vec![SavedTab { tool: "claude".into(), session_id: Some("s1".into()), name: None }],
                 },
                 SavedWorkspace {
                     path: "/tmp/b".into(),
                     focus: 1,
                     tabs: vec![
-                        SavedTab { tool: "codex".into(), session_id: None },
-                        SavedTab { tool: "grok".into(), session_id: Some("g".into()) },
+                        SavedTab { tool: "codex".into(), session_id: None, name: None },
+                        SavedTab { tool: "grok".into(), session_id: Some("g".into()), name: Some("security-droid".into()) },
                     ],
                 },
             ],

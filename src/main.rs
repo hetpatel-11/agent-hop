@@ -15,6 +15,9 @@ mod feedback;
 mod control;
 mod update_check;
 mod vt;
+mod detect;
+mod attach;
+mod server;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
@@ -91,12 +94,88 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Drive a live agent (list / wait / prompt / read / send-keys / rename).
+    /// Works from any terminal while `ah` is running.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCmd,
+    },
+    /// Rename the focused agent (or `--name` / `--tab`) in the live mux.
+    Rename {
+        /// New display name, herdr-style (`security-droid`).
+        name: String,
+        #[arg(long)]
+        tab: Option<u32>,
+        /// Current name of the agent to rename.
+        #[arg(long)]
+        current: Option<String>,
+    },
+    /// Start, stop, or show the background mux (`status` default).
+    Server {
+        action: Option<String>,
+    },
+    /// Hidden: the background mux. Started by `ah`, not by hand.
+    #[command(hide = true, name = "__daemon")]
+    Daemon {
+        #[arg(long)]
+        tool: Option<String>,
+    },
     /// Hidden: runs the semantic-index build in-process. Never invoked
     /// directly by a user -- search.rs spawns this detached from the
     /// interactive CLI whenever there's unindexed content, so indexing
     /// survives after the parent process exits.
     #[command(hide = true, name = "__background-index")]
     BackgroundIndex,
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// List live agents and their idle/working/blocked status.
+    List,
+    /// Block until an agent reaches a status (`idle`, `working`, `blocked`).
+    Wait {
+        #[arg(long, default_value = "idle,blocked")]
+        until: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        tab: Option<u32>,
+        /// Seconds to wait (default: no limit).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Type a prompt into an agent and submit it.
+    Prompt {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        tab: Option<u32>,
+    },
+    /// Print the agent's visible screen.
+    Read {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        tab: Option<u32>,
+    },
+    /// Send raw keys (`y\\r`, `\\t`, …).
+    SendKeys {
+        keys: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        tab: Option<u32>,
+    },
+    /// Rename an agent and persist it in layout.json.
+    Rename {
+        name: String,
+        #[arg(long)]
+        tab: Option<u32>,
+        #[arg(long)]
+        current: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -121,6 +200,10 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Close { .. }
                     | Commands::Focus { .. }
                     | Commands::Workspace { .. }
+                    | Commands::Agent { .. }
+                    | Commands::Rename { .. }
+                    | Commands::Server { .. }
+                    | Commands::Daemon { .. }
             )
         );
     if !skip_update {
@@ -182,6 +265,36 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Rename { name, tab, current }) = &cli.command {
+        control::request_ex("rename", None, *tab, None, current.as_deref(), None, None, Some(name))?;
+        println!("Renamed to {name}.");
+        return Ok(());
+    }
+
+    if let Some(Commands::Agent { command }) = &cli.command {
+        return run_agent_cmd(command);
+    }
+
+    if let Some(Commands::Server { action }) = &cli.command {
+        match action.as_deref() {
+            Some("stop") | Some("kill") => return server::stop(),
+            _ => {
+                server::status();
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(Commands::Daemon { tool }) = cli.command {
+        let restore = layout::load();
+        let agent = tool
+            .as_deref()
+            .and_then(ToolName::from_slug)
+            .or_else(|| restore.as_ref().and_then(|m| m.first_tool()))
+            .unwrap_or(ToolName::Claude);
+        return tui::run_daemon(agent, restore);
+    }
+
     if let Some(Commands::Feedback { message }) = cli.command {
         match feedback::collect_message(message) {
             Ok(text) if text.trim().is_empty() => {
@@ -215,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Pi) => "pi",
             Some(Commands::Grok) => "grok",
             Some(Commands::Resume { .. }) => "resume",
-            Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::BackgroundIndex) => "picker",
+            Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. } | Commands::BackgroundIndex) => "picker",
             None if restoring => "restore",
             None => "picker",
         };
@@ -245,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         // Handled and returned above; kept for match exhaustiveness.
-        Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. }) => unreachable!(),
+        Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. }) => unreachable!(),
         Some(Commands::BackgroundIndex) => {
             let sessions = search::collect_sessions(&ToolName::ALL);
             vector_index::build_index(&sessions).await?;
@@ -253,6 +366,13 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+
+    if server::is_running() {
+        attach::run_client()?;
+        telemetry::flush().await;
+        return Ok(());
+    }
+
     let agent = match initial_agent {
         Some(a) => a,
         None if restore.as_ref().is_some_and(|m| !m.is_empty()) => restore
@@ -262,9 +382,109 @@ async fn main() -> anyhow::Result<()> {
         None => picker::pick_agent().await?,
     };
 
-    let res = tui::run(agent, None, restore, true).await;
+    server::spawn_daemon(agent)?;
+    attach::run_client()?;
     telemetry::flush().await;
-    res
+    Ok(())
+}
+
+fn run_agent_cmd(cmd: &AgentCmd) -> anyhow::Result<()> {
+    match cmd {
+        AgentCmd::List => {
+            let live = live_mux()?;
+            if live.agents.is_empty() {
+                println!("No live agents.");
+                return Ok(());
+            }
+            for a in &live.agents {
+                let mark = if a.focused { '*' } else { ' ' };
+                println!("{mark} {:>2}  {:<22} {:<8} {}", a.index, a.name, a.status, a.tool);
+            }
+            Ok(())
+        }
+        AgentCmd::Wait { until, name, tab, timeout } => {
+            let wanted: Vec<String> = until
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if wanted.is_empty() {
+                anyhow::bail!("--until needs a status (idle, working, blocked)");
+            }
+            let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+            loop {
+                let live = live_mux()?;
+                let agent = pick_live_agent(&live, name.as_deref(), *tab)?;
+                if wanted.iter().any(|w| agent.status.eq_ignore_ascii_case(w)) {
+                    println!("{} {}", agent.name, agent.status);
+                    return Ok(());
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    anyhow::bail!("{} still {}", agent.name, agent.status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        AgentCmd::Prompt { text, name, tab } => {
+            let text = text.join(" ");
+            if text.trim().is_empty() {
+                anyhow::bail!("ah agent prompt needs text");
+            }
+            control::request_ex("prompt", None, *tab, None, name.as_deref(), Some(&text), None, None)?;
+            println!("Prompt sent.");
+            Ok(())
+        }
+        AgentCmd::Read { name, tab } => {
+            let live = live_mux()?;
+            let agent = pick_live_agent(&live, name.as_deref(), *tab)?;
+            for line in &agent.lines {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        AgentCmd::SendKeys { keys, name, tab } => {
+            control::request_ex("send-keys", None, *tab, None, name.as_deref(), None, Some(keys), None)?;
+            println!("Keys sent.");
+            Ok(())
+        }
+        AgentCmd::Rename { name, tab, current } => {
+            control::request_ex("rename", None, *tab, None, current.as_deref(), None, None, Some(name))?;
+            println!("Renamed to {name}.");
+            Ok(())
+        }
+    }
+}
+
+fn live_mux() -> anyhow::Result<control::LiveMux> {
+    control::read_live().filter(|m| !m.agents.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("no live ah session (start `ah` first)")
+    })
+}
+
+fn pick_live_agent<'a>(
+    live: &'a control::LiveMux,
+    name: Option<&str>,
+    tab: Option<u32>,
+) -> anyhow::Result<&'a control::LiveAgent> {
+    if let Some(n) = name.filter(|s| !s.is_empty()) {
+        return live
+            .agents
+            .iter()
+            .find(|a| a.name == n)
+            .ok_or_else(|| anyhow::anyhow!("no agent named {n}"));
+    }
+    if let Some(t) = tab {
+        return live
+            .agents
+            .iter()
+            .find(|a| a.index == t as usize)
+            .ok_or_else(|| anyhow::anyhow!("no such tab"));
+    }
+    live.agents
+        .iter()
+        .find(|a| a.focused)
+        .or_else(|| live.agents.first())
+        .ok_or_else(|| anyhow::anyhow!("no live agents"))
 }
 
 

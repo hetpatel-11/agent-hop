@@ -65,25 +65,6 @@ pub fn tool_tag(tool: ToolName) -> String {
     bold(&tool_color(tool, &format!("[{}]", tool.slug())))
 }
 
-/// ratatui equivalent of `tool_color`'s palette, for the toggle bar now
-/// that it's composed into a `ratatui::buffer::Buffer` frame instead of
-/// written as raw ANSI -- same underlying color codes (indexed 208/25/244
-/// match the `38;5;N` sequences `orange`/`dark_blue`/`grey` emit above),
-/// kept in one place so the two rendering paths can't drift apart.
-pub fn tool_ratatui_color(tool: ToolName) -> ratatui::style::Color {
-    use ratatui::style::Color;
-    match tool {
-        ToolName::Claude => Color::Indexed(208),
-        ToolName::Codex => Color::Indexed(25),
-        ToolName::Pi => Color::Yellow,
-        ToolName::OpenCode => Color::Indexed(244),
-        ToolName::Grok => Color::White,
-    }
-}
-
-/// ratatui equivalent of `grey()`, for the same reason as `tool_ratatui_color`.
-pub const GREY_RATATUI: ratatui::style::Color = ratatui::style::Color::Indexed(244);
-
 /// agent-hop.com's brand cyan (#22d3ee) as RGB, for `ratatui::style::Color::Rgb`.
 pub const BRAND_RGB: (u8, u8, u8) = (34, 211, 238);
 

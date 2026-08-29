@@ -460,6 +460,22 @@ impl Terminal {
         Cursor { visible: true, x, y }
     }
 
+    /// Visible rows as trimmed text, for agent-status matching. Updates
+    /// render state first so this can run even when we are not painting.
+    pub fn visible_lines(&mut self) -> Vec<String> {
+        let _ = self.cursor();
+        let mut lines = vec![String::new(); self.rows as usize];
+        self.for_each_cell(|_x, y, cell| {
+            if (y as usize) < lines.len() && !cell.wide_spacer {
+                lines[y as usize].push_str(&cell.text);
+            }
+        });
+        for line in &mut lines {
+            *line = line.trim_end().to_string();
+        }
+        lines
+    }
+
     /// Visits every visible cell, row by row, column by column. Assumes
     /// `cursor()` (or another call that updates the render state) was
     /// already called this frame -- callers always call `cursor()` first

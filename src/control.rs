@@ -7,9 +7,12 @@ use crate::agents::ToolName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 
 pub const SOCK_ENV: &str = "AH_SOCK";
 pub const TAB_ENV: &str = "AH_TAB_ID";
+
+static LIVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -22,6 +25,14 @@ struct Request {
     path: Option<String>,
     #[serde(default)]
     from_tab: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    keys: Option<String>,
+    #[serde(default)]
+    new_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -40,6 +51,10 @@ pub enum PaneOp {
     WorkspaceNew { path: Option<String>, tool: Option<ToolName> },
     WorkspaceNext,
     WorkspacePrev,
+    Prompt { tab: Option<usize>, name: Option<String>, text: String },
+    SendKeys { tab: Option<usize>, name: Option<String>, keys: String },
+    Rename { tab: Option<usize>, name: Option<String>, new_name: String },
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +69,95 @@ pub struct ControlServer {
     listener: std::os::unix::net::UnixListener,
 }
 
+pub fn mux_sock_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".agent-hop").join("mux.sock")
+}
+
+pub fn live_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".agent-hop").join("live.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveMux {
+    #[serde(default)]
+    pub agents: Vec<LiveAgent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveAgent {
+    pub id: u64,
+    pub name: String,
+    pub tool: String,
+    pub status: String,
+    pub workspace: String,
+    pub ws: usize,
+    pub tab: usize,
+    pub index: usize,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+pub fn publish_live(agents: Vec<LiveAgent>) {
+    let _g = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_live(&LiveMux { agents });
+}
+
+pub fn touch_live(id: u64, status: &str, lines: Vec<String>) {
+    let _g = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut live = read_live_unlocked().unwrap_or_default();
+    if let Some(a) = live.agents.iter_mut().find(|a| a.id == id) {
+        if a.status == status && a.lines == lines {
+            return;
+        }
+        a.status = status.to_string();
+        a.lines = lines;
+        write_live(&live);
+    }
+}
+
+pub fn read_live() -> Option<LiveMux> {
+    let _g = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    read_live_unlocked()
+}
+
+pub fn clear_live() {
+    let _g = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::fs::remove_file(live_path());
+}
+
+fn read_live_unlocked() -> Option<LiveMux> {
+    let text = std::fs::read_to_string(live_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_live(live: &LiveMux) {
+    let path = live_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(text) = serde_json::to_string_pretty(live) {
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
 #[cfg(unix)]
 pub fn bind() -> anyhow::Result<ControlServer> {
-    use std::os::unix::net::UnixListener;
-    let path = std::env::temp_dir().join(format!("ah-{}.sock", std::process::id()));
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let preferred = mux_sock_path();
+    if let Some(parent) = preferred.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let path = if UnixStream::connect(&preferred).is_ok() {
+        std::env::temp_dir().join(format!("ah-{}.sock", std::process::id()))
+    } else {
+        let _ = std::fs::remove_file(&preferred);
+        preferred
+    };
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     {
@@ -155,11 +255,31 @@ fn parse_request(req: Request) -> Result<PaneRequest, &'static str> {
         },
         "workspace-next" => PaneOp::WorkspaceNext,
         "workspace-prev" => PaneOp::WorkspacePrev,
+        "prompt" => PaneOp::Prompt {
+            tab: req.tab.map(|n| n as usize),
+            name: req.name,
+            text: req.text.unwrap_or_default(),
+        },
+        "send-keys" => PaneOp::SendKeys {
+            tab: req.tab.map(|n| n as usize),
+            name: req.name,
+            keys: req.keys.or(req.text).unwrap_or_default(),
+        },
+        "stop" => PaneOp::Stop,
+        "rename" => {
+            let new_name = req.new_name.filter(|s| !s.trim().is_empty()).ok_or("ah rename needs a name")?;
+            PaneOp::Rename {
+                tab: req.tab.map(|n| n as usize),
+                name: req.name,
+                new_name,
+            }
+        }
         _ => return Err("unknown op"),
     };
     Ok(PaneRequest { from_tab, op })
 }
 
+#[cfg(test)]
 fn parse_line(line: &str) -> Result<PaneRequest, &'static str> {
     let req: Request = serde_json::from_str(line.trim()).map_err(|_| "invalid json")?;
     parse_request(req)
@@ -191,23 +311,62 @@ pub fn request(
     anyhow::bail!("ah tab/hop/close/focus/workspace need macOS or Linux")
 }
 
+#[cfg(not(unix))]
+pub fn request_ex(
+    _op: &str,
+    _agent: Option<&str>,
+    _tab: Option<u32>,
+    _path: Option<&str>,
+    _name: Option<&str>,
+    _text: Option<&str>,
+    _keys: Option<&str>,
+    _new_name: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::bail!("ah agent commands need macOS or Linux")
+}
+
 #[cfg(unix)]
 pub fn request(op: &str, agent: Option<&str>, tab: Option<u32>, path: Option<&str>) -> anyhow::Result<()> {
-    use std::io::{BufRead, BufReader, Write};
+    request_ex(op, agent, tab, path, None, None, None, None).map(|_| ())
+}
+
+#[cfg(unix)]
+fn connect_sock() -> anyhow::Result<std::os::unix::net::UnixStream> {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
-    let sock = std::env::var(SOCK_ENV).map_err(|_| {
-        anyhow::anyhow!("this command only works inside a live ah pane")
-    })?;
+    if let Ok(sock) = std::env::var(SOCK_ENV) {
+        if let Ok(stream) = UnixStream::connect(Path::new(&sock)) {
+            return Ok(stream);
+        }
+    }
+    UnixStream::connect(mux_sock_path())
+        .map_err(|_| anyhow::anyhow!("no live ah session (start `ah` first)"))
+}
+
+#[cfg(unix)]
+pub fn request_ex(
+    op: &str,
+    agent: Option<&str>,
+    tab: Option<u32>,
+    path: Option<&str>,
+    name: Option<&str>,
+    text: Option<&str>,
+    keys: Option<&str>,
+    new_name: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
     let from_tab: Option<u64> = std::env::var(TAB_ENV).ok().and_then(|s| s.parse().ok());
-    let mut stream = UnixStream::connect(Path::new(&sock))
-        .map_err(|_| anyhow::anyhow!("could not reach the parent ah session"))?;
+    let mut stream = connect_sock()?;
     let req = serde_json::json!({
         "op": op,
         "agent": agent,
         "tab": tab,
         "path": path,
         "from_tab": from_tab,
+        "name": name,
+        "text": text,
+        "keys": keys,
+        "new_name": new_name,
     });
     writeln!(stream, "{req}")?;
     stream.flush()?;
@@ -215,7 +374,7 @@ pub fn request(op: &str, agent: Option<&str>, tab: Option<u32>, path: Option<&st
     BufReader::new(stream).read_line(&mut line)?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or(serde_json::json!({}));
     if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
-        Ok(())
+        Ok(v)
     } else {
         let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("request failed");
         anyhow::bail!("{err}")
@@ -279,5 +438,37 @@ mod tests {
         assert!(parse_line(r#"{"op":"explode"}"#).is_err());
         assert!(parse_line(r#"{"op":"tab","agent":"not-an-agent"}"#).is_err());
         assert!(parse_line("not json").is_err());
+    }
+
+    #[test]
+    fn parse_prompt_send_rename() {
+        let r = parse_line(r#"{"op":"prompt","text":"hello","from_tab":1}"#).unwrap();
+        assert_eq!(
+            r.op,
+            PaneOp::Prompt {
+                tab: None,
+                name: None,
+                text: "hello".into()
+            }
+        );
+        let r = parse_line(r#"{"op":"send-keys","keys":"y\\r","tab":2}"#).unwrap();
+        assert_eq!(
+            r.op,
+            PaneOp::SendKeys {
+                tab: Some(2),
+                name: None,
+                keys: "y\\r".into()
+            }
+        );
+        let r = parse_line(r#"{"op":"rename","new_name":"security-droid","name":"handoff-claude"}"#).unwrap();
+        assert_eq!(
+            r.op,
+            PaneOp::Rename {
+                tab: None,
+                name: Some("handoff-claude".into()),
+                new_name: "security-droid".into()
+            }
+        );
+        assert!(parse_line(r#"{"op":"rename"}"#).is_err());
     }
 }

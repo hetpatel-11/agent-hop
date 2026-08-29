@@ -1,0 +1,12 @@
+{
+  "name": "agent-hop",
+  "install": "bash .cursor/install.sh",
+  "agentCanUpdateSnapshot": true,
+  "terminals": [
+    {
+      "name": "repo",
+      "command": "bash -lc 'export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; export ZIG=\"$HOME/.local/bin/zig\"; export CLOUDFLARE_ACCOUNT_ID=\"${CLOUDFLARE_ACCOUNT_ID:-f45021db74a97feaafae2e3e131d4d82}\"; [ -f \"$HOME/.cargo/env\" ] && . \"$HOME/.cargo/env\"; rustc --version; zig version; wrangler --version || true; echo; echo \"D1: cd telemetry && wrangler d1 execute agent-hop-telemetry --remote --json --command \\\"SELECT COUNT(*) AS events, COUNT(DISTINCT device_id) AS devices FROM events;\\\"\"; exec bash'",
+      "description": "Shared repo shell with Rust, Zig, and wrangler. Use this from the phone to build, test, and query telemetry."
+    }
+  ]
+}

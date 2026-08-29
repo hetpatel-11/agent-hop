@@ -149,6 +149,14 @@ enum RunEvent {
     Stop,
     /// `PREFIX_KEY` then `r` — rename the focused agent (herdr: named panes).
     RenameAgent,
+    /// `PREFIX_KEY` then `%` / `"` — split this workspace (tmux/herdr).
+    Split(crate::layout::SplitDir),
+    /// `PREFIX_KEY` then `h`/`j`/`k`/`l` — other pane in a split.
+    NextPane,
+    /// `PREFIX_KEY` then `z` — zoom (leave split, keep both tabs).
+    Zoom,
+    /// Plugin `[[bind]] shell = "..."` after Ctrl+B.
+    PluginShell(String),
     /// Left-click on our chrome (top tab strip or session sidebar).
     ChromeClick { x: u16, y: u16 },
     /// The real terminal was resized (new cols, new rows). Not tied to any
@@ -189,6 +197,9 @@ struct TabStrip {
     /// Write `~/.agent-hop/layout.json` on mux changes. Off for
     /// one-shot `ah resume` so a search launch does not wipe the mux.
     persist: bool,
+    split: Option<crate::layout::SavedSplit>,
+    peer_lines: Vec<String>,
+    compositor_wake: Option<mpsc::Sender<ChildMsg>>,
 }
 
 struct Workspace {
@@ -196,12 +207,27 @@ struct Workspace {
     branch: Option<String>,
     tabs: Vec<LiveTab>,
     focus: usize,
+    split: Option<crate::layout::SavedSplit>,
 }
 
 impl Workspace {
     fn new(path: String, tabs: Vec<LiveTab>, focus: usize) -> Self {
         let branch = git_branch(&path);
-        Self { path, branch, tabs, focus }
+        Self { path, branch, tabs, focus, split: None }
+    }
+
+    fn forget_tab(&mut self, ti: usize) {
+        match self.split {
+            Some(sp) if sp.contains(ti) => self.split = None,
+            Some(mut sp) => {
+                if !sp.drop_tab(ti) {
+                    self.split = None;
+                } else {
+                    self.split = Some(sp);
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -239,6 +265,7 @@ struct LiveTab {
     status: Arc<AtomicU8>,
     name: Arc<Mutex<String>>,
     screen: Arc<Mutex<Vec<String>>>,
+    pane_size: Arc<Mutex<(u16, u16)>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -260,11 +287,22 @@ fn sync_tab_strip(strip: &Arc<Mutex<TabStrip>>, workspaces: &[Workspace], ws_foc
             s.tab_names = ws.tabs.iter().map(|t| t.name.lock().unwrap().clone()).collect();
             s.tab_status = ws.tabs.iter().map(|t| t.status.clone()).collect();
             s.tab_focus = ws.focus;
+            s.split = ws.split;
+            s.peer_lines = ws
+                .split
+                .and_then(|sp| sp.other(ws.focus))
+                .and_then(|i| ws.tabs.get(i))
+                .map(|t| t.screen.lock().unwrap().clone())
+                .unwrap_or_default();
+            s.compositor_wake = ws.tabs.get(ws.focus).map(|t| t.wake_tx.clone());
         } else {
             s.tabs.clear();
             s.tab_names.clear();
             s.tab_status.clear();
             s.tab_focus = 0;
+            s.split = None;
+            s.peer_lines.clear();
+            s.compositor_wake = None;
         }
         s.persist
     };
@@ -337,10 +375,12 @@ fn persist_mux(workspaces: &[Workspace], ws_focus: usize) {
             continue;
         }
         let focus = ws.focus.min(tabs.len().saturating_sub(1));
+        let split = ws.split.filter(|sp| sp.a < tabs.len() && sp.b < tabs.len());
         saved.workspaces.push(crate::layout::SavedWorkspace {
             path: ws.path.clone(),
             focus,
             tabs,
+            split,
         });
     }
     if saved.ws_focus >= saved.workspaces.len() && !saved.workspaces.is_empty() {
@@ -402,7 +442,13 @@ fn restore_mux(
             continue;
         }
         let focus = saved_ws.focus.min(tabs.len().saturating_sub(1));
-        workspaces.push(Workspace::new(saved_ws.path, tabs, focus));
+        let mut ws = Workspace::new(saved_ws.path, tabs, focus);
+        if let Some(sp) = saved_ws.split {
+            if sp.a < ws.tabs.len() && sp.b < ws.tabs.len() && sp.a != sp.b {
+                ws.split = Some(sp);
+            }
+        }
+        workspaces.push(ws);
     }
     if workspaces.is_empty() {
         return;
@@ -584,6 +630,9 @@ fn run_mux(
         tab_status: vec![Arc::new(AtomicU8::new(AgentStatus::Idle.as_u8()))],
         tab_focus: 0,
         persist,
+        split: None,
+        peer_lines: Vec::new(),
+        compositor_wake: None,
     }));
     let mut workspaces: Vec<Workspace> = Vec::new();
     let mut ws_focus: usize = 0;
@@ -681,6 +730,8 @@ fn run_mux(
             Err(e) => return Err(spawn_err(e)),
         }
     } else {
+        let (cols, rows) = term_size();
+        refresh_pane_sizes(&workspaces, cols, rows);
         focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
     }
 
@@ -699,6 +750,7 @@ fn run_mux(
                     }
                 }
                 if let Some((wi, ti)) = found {
+                    workspaces[wi].forget_tab(ti);
                     let mut dead = workspaces[wi].tabs.remove(ti);
                     let _ = dead.child.kill();
                     let _ = dead.child.wait();
@@ -864,11 +916,7 @@ fn run_mux(
             }
             Ok(RunEvent::Resized(new_cols, new_rows)) => {
                 crate::attach::set_size(new_cols, new_rows);
-                for ws in &workspaces {
-                    for tab in &ws.tabs {
-                        let _ = tab.resize_tx.send((new_cols, new_rows));
-                    }
-                }
+                refresh_pane_sizes(&workspaces, new_cols, new_rows);
             }
             Ok(RunEvent::SearchResume) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
@@ -1017,6 +1065,7 @@ fn run_mux(
                     break Ok(());
                 }
                 let focus = workspaces[ws_focus].focus;
+                workspaces[ws_focus].forget_tab(focus);
                 let mut dead = workspaces[ws_focus].tabs.remove(focus);
                 let _ = dead.child.kill();
                 let _ = dead.child.wait();
@@ -1055,11 +1104,7 @@ fn run_mux(
                     crate::attach::set_client(Some(Box::new(clone)), Some((cols, rows)));
                 }
                 spawn_attach_reader(stream, input_tx.clone(), tx.clone());
-                for ws in &workspaces {
-                    for tab in &ws.tabs {
-                        let _ = tab.resize_tx.send((cols, rows));
-                    }
-                }
+                refresh_pane_sizes(&workspaces, cols, rows);
                 if !workspaces.is_empty() {
                     focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
                 }
@@ -1067,6 +1112,38 @@ fn run_mux(
             Ok(RunEvent::ClientGone) => {
                 crate::attach::set_client(None, None);
                 unpaint_all(&workspaces);
+            }
+            Ok(RunEvent::Split(dir)) => {
+                apply_split(
+                    &mut workspaces,
+                    ws_focus,
+                    dir,
+                    &sink,
+                    &mouse_sink,
+                    &overlay_click_sink,
+                    &tx,
+                    &generation,
+                    host_colors,
+                    &tab_strip,
+                );
+            }
+            Ok(RunEvent::NextPane) => {
+                if let Some(sp) = workspaces[ws_focus].split {
+                    if let Some(other) = sp.other(workspaces[ws_focus].focus) {
+                        workspaces[ws_focus].focus = other;
+                    }
+                }
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::Zoom) => {
+                workspaces[ws_focus].split = None;
+                let (cols, rows) = term_size();
+                refresh_pane_sizes(&workspaces, cols, rows);
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
+            }
+            Ok(RunEvent::PluginShell(cmd)) => {
+                crate::plugin::run_shell(&cmd);
+                focus_active(&mut workspaces, ws_focus, &sink, &mouse_sink, &tab_strip);
             }
             Ok(RunEvent::RenameAgent) => {
                 let current = workspaces[ws_focus].tabs[workspaces[ws_focus].focus]
@@ -1518,6 +1595,7 @@ fn handle_pane_request(
             if workspaces.len() == 1 && workspaces[wi].tabs.len() == 1 {
                 return;
             }
+            workspaces[wi].forget_tab(ti);
             let mut dead = workspaces[wi].tabs.remove(ti);
             let _ = dead.child.kill();
             let _ = dead.child.wait();
@@ -1944,6 +2022,62 @@ fn child_pty_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
     )
 }
 
+fn refresh_pane_sizes(workspaces: &[Workspace], term_cols: u16, term_rows: u16) {
+    let body = child_pty_size(term_cols, term_rows);
+    for ws in workspaces {
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            let sz = match ws.split {
+                Some(sp) if sp.contains(i) => {
+                    let (ra, rb) = crate::layout::pane_rects(body.0, body.1, sp.dir, sp.ratio);
+                    let r = if i == sp.a { ra } else { rb };
+                    (r.2.max(8), r.3.max(3))
+                }
+                _ => body,
+            };
+            *tab.pane_size.lock().unwrap() = sz;
+            let _ = tab.resize_tx.send((term_cols, term_rows));
+            let _ = tab.wake_tx.send(ChildMsg::Wake);
+        }
+    }
+}
+
+fn apply_split(
+    workspaces: &mut Vec<Workspace>,
+    ws_focus: usize,
+    dir: crate::layout::SplitDir,
+    sink: &Arc<Mutex<InputSink>>,
+    mouse_sink: &Arc<Mutex<Option<mpsc::Sender<ChildMsg>>>>,
+    overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>,
+    tx: &mpsc::Sender<RunEvent>,
+    generation: &Arc<AtomicU64>,
+    host_colors: (Option<vt::Rgb>, Option<vt::Rgb>),
+    tab_strip: &Arc<Mutex<TabStrip>>,
+) {
+    if workspaces[ws_focus].tabs.len() < 2 {
+        let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
+        let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
+        match run_agent_picker(sink, overlay_click_sink, &suppress, current_tool) {
+            Some(picked) => add_agent_tab(
+                workspaces, ws_focus, picked, sink, mouse_sink, tx, generation, host_colors, tab_strip,
+            ),
+            None => {
+                focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
+                return;
+            }
+        }
+    }
+    let ws = &mut workspaces[ws_focus];
+    if ws.tabs.len() < 2 {
+        return;
+    }
+    let a = ws.focus;
+    let b = if a + 1 < ws.tabs.len() { a + 1 } else { 0 };
+    ws.split = Some(crate::layout::SavedSplit { dir, ratio: 50, a, b });
+    let (cols, rows) = term_size();
+    refresh_pane_sizes(workspaces, cols, rows);
+    focus_active(workspaces, ws_focus, sink, mouse_sink, tab_strip);
+}
+
 /// ah's own tmux/herdr-style prefix key -- Ctrl+B (0x02), matching herdr's
 /// own default exactly. Alt+Up/Down and clicking the toggle bar both
 /// already switch agents, but neither is universal: Alt+Up/Down depends on
@@ -2168,6 +2302,8 @@ fn spawn_live_tab(
     let name_thread = name.clone();
     let screen = Arc::new(Mutex::new(Vec::new()));
     let screen_thread = screen.clone();
+    let pane_size = Arc::new(Mutex::new((cols, child_rows)));
+    let pane_size_thread = pane_size.clone();
     // Resize requests are forwarded here rather than applied where they're
     // received (the main loop below, on the caller's thread). The pty
     // resize (which is what actually sends the child a real SIGWINCH) and
@@ -2283,6 +2419,7 @@ fn spawn_live_tab(
         // terminal *rendering* by hand -- only the read side, from
         // libghostty-vt's own render-state API.
         let mut applied_dims = (term_cols, term_rows);
+        let mut applied_pty = (cols, child_rows);
         let mut term = vt::Terminal::with_host_colors(cols, child_rows, vt_writer, host_fg, host_bg);
         let mut rterm: Option<RTerminal<crate::attach::AttachBackend>> = None;
 
@@ -2331,7 +2468,7 @@ fn spawn_live_tab(
         let tool = kind.tool();
         let mut last_statuses = snapshot_tab_statuses(&tab_strip.lock().unwrap());
 
-        let apply_resize_if_pending = |applied_dims: &mut (u16, u16), term: &mut vt::Terminal| {
+        let apply_resize_if_pending = |applied_dims: &mut (u16, u16), applied_pty: &mut (u16, u16), term: &mut vt::Terminal| {
             // Drain the whole backlog and keep only the newest -- if
             // several sizes queued up while this thread was busy, every
             // one but the last is already stale by definition.
@@ -2339,10 +2476,12 @@ fn spawn_live_tab(
             while let Ok(size) = resize_rx.try_recv() {
                 current_dims = size;
             }
-            if current_dims != *applied_dims {
-                debug_log("RESIZE_APPLIED_TO_MODEL", format!("{applied_dims:?} -> {current_dims:?}").as_bytes());
-                *applied_dims = current_dims;
-                let (new_cols, new_child_rows) = child_pty_size(current_dims.0, current_dims.1);
+            *applied_dims = current_dims;
+            let wanted = *pane_size_thread.lock().unwrap();
+            if wanted != *applied_pty {
+                debug_log("RESIZE_APPLIED_TO_MODEL", format!("{applied_pty:?} -> {wanted:?}").as_bytes());
+                *applied_pty = wanted;
+                let (new_cols, new_child_rows) = wanted;
                 // The pty resize (which is what actually delivers SIGWINCH
                 // to the child) and the model resize below happen back to
                 // back on this one thread, with nothing else able to run
@@ -2392,23 +2531,26 @@ fn spawn_live_tab(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let before = applied_dims;
-                    apply_resize_if_pending(&mut applied_dims, &mut term);
+                    let before_pty = applied_pty;
+                    apply_resize_if_pending(&mut applied_dims, &mut applied_pty, &mut term);
                     classify_tab(generation_id, tool, &mut term, &osc, &status_thread, &screen_thread, &name_thread);
                     if !suppress_thread.load(Ordering::SeqCst) && paint_thread.load(Ordering::SeqCst) {
                         let strip = tab_strip.lock().unwrap().clone();
                         let statuses = snapshot_tab_statuses(&strip);
-                        let resized = applied_dims != before;
+                        let resized = applied_dims != before || applied_pty != before_pty;
                         let status_changed = statuses != last_statuses;
                         if resized || status_changed {
                             last_statuses = statuses;
                             paint_frame(&mut rterm, &mut term, &strip, false);
                         }
+                    } else if !paint_thread.load(Ordering::SeqCst) {
+                        wake_compositor(&tab_strip);
                     }
                 }
                 Ok(ChildMsg::Bytes(data)) => {
                     osc.feed(&data);
                     debug_log("CHILD_RAW", &data);
-                    apply_resize_if_pending(&mut applied_dims, &mut term);
+                    apply_resize_if_pending(&mut applied_dims, &mut applied_pty, &mut term);
                     term.write(&data);
                     classify_tab(generation_id, tool, &mut term, &osc, &status_thread, &screen_thread, &name_thread);
                     // While the search overlay owns the screen, still drain
@@ -2418,6 +2560,8 @@ fn spawn_live_tab(
                         let strip = tab_strip.lock().unwrap().clone();
                         last_statuses = snapshot_tab_statuses(&strip);
                         paint_frame(&mut rterm, &mut term, &strip, false);
+                    } else if !paint_thread.load(Ordering::SeqCst) {
+                        wake_compositor(&tab_strip);
                     }
                 }
                 // Mouse events pass through only if this specific child
@@ -2457,8 +2601,19 @@ fn spawn_live_tab(
         status,
         name,
         screen,
+        pane_size,
         child,
     })
+}
+
+fn wake_compositor(tab_strip: &Arc<Mutex<TabStrip>>) {
+    let strip = tab_strip.lock().unwrap();
+    if strip.split.is_none() {
+        return;
+    }
+    if let Some(wake) = &strip.compositor_wake {
+        let _ = wake.send(ChildMsg::Wake);
+    }
 }
 
 /// Pauses the current child's output, takes over the screen with the
@@ -2672,6 +2827,10 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Ctrl+B then 1-9", "Focus that tab"),
     ("Ctrl+B then x", "Close this tab"),
     ("Ctrl+B then r", "Rename this agent"),
+    ("Ctrl+B then %", "Split this workspace vertically (two agents side by side)"),
+    ("Ctrl+B then \"", "Split this workspace horizontally (stacked)"),
+    ("Ctrl+B then h/j/k/l", "Focus the other pane in a split"),
+    ("Ctrl+B then z", "Zoom — leave the split, keep both tabs"),
     ("Ctrl+B then q", "Detach — agents keep running. `ah` reattaches. `ah server stop` kills them"),
     ("Ctrl+B then ?", "Show this help"),
     ("ah agent list", "From any terminal: list live agents and status"),
@@ -2859,10 +3018,26 @@ fn render_frame(rterm: &mut RTerminal<crate::attach::AttachBackend>, term: &mut 
             }
         }
 
+        let body_x = side;
+        let body_y = TOP_BAR_ROWS;
+        let body_w = area.width.saturating_sub(side);
+        let body_h = bar_row.saturating_sub(TOP_BAR_ROWS);
+        let (focus_x, focus_y, focus_w, focus_h) = match strip.split {
+            Some(sp) if strip.tabs.len() > sp.a.max(sp.b) => {
+                let (ra, rb) = crate::layout::pane_rects(body_w, body_h, sp.dir, sp.ratio);
+                let mine = if strip.tab_focus == sp.b { rb } else { ra };
+                let other = if strip.tab_focus == sp.b { ra } else { rb };
+                paint_peer_lines(buf, body_x + other.0, body_y + other.1, other.2, other.3, &strip.peer_lines, bar_row, area.width);
+                paint_split_divider(buf, body_x, body_y, body_w, body_h, sp.dir, ra, rb, bar_row, area.width);
+                (body_x + mine.0, body_y + mine.1, mine.2, mine.3)
+            }
+            _ => (body_x, body_y, body_w, body_h),
+        };
+
         term.for_each_cell(|x, y, cell| {
-            let real_x = x.saturating_add(side);
-            let real_y = y + TOP_BAR_ROWS;
-            if real_x >= area.width || real_y >= bar_row {
+            let real_x = focus_x.saturating_add(x);
+            let real_y = focus_y.saturating_add(y);
+            if x >= focus_w || y >= focus_h || real_x >= area.width || real_y >= bar_row {
                 return;
             }
             let Some(rc) = buf.cell_mut((real_x, real_y)) else { return };
@@ -2886,9 +3061,9 @@ fn render_frame(rterm: &mut RTerminal<crate::attach::AttachBackend>, term: &mut 
         write_toggle_bar(buf, area.width, bar_row, side, kind);
         write_sidebar(buf, area.width, area.height, strip);
 
-        let cursor_real_x = cursor.x.saturating_add(side);
-        let cursor_real_y = cursor.y + TOP_BAR_ROWS;
-        if cursor.visible && cursor_real_x < area.width && cursor_real_y < bar_row {
+        let cursor_real_x = focus_x.saturating_add(cursor.x);
+        let cursor_real_y = focus_y.saturating_add(cursor.y);
+        if cursor.visible && cursor.x < focus_w && cursor.y < focus_h && cursor_real_x < area.width && cursor_real_y < bar_row {
             frame.set_cursor_position((cursor_real_x, cursor_real_y));
         }
     })?;
@@ -2972,6 +3147,83 @@ fn write_top_bar(buf: &mut Buffer, width: u16, side: u16, strip: &TabStrip) {
     if col + 3 < width {
         let plus = Span::styled(" + ", Style::default().fg(CHROME_DIM).bg(CHROME_BG));
         buf.set_span(col, mid_row, &plus, 3);
+    }
+}
+
+fn paint_peer_lines(
+    buf: &mut Buffer,
+    x0: u16,
+    y0: u16,
+    width: u16,
+    height: u16,
+    lines: &[String],
+    bar_row: u16,
+    term_width: u16,
+) {
+    let dim = CHROME_DIM;
+    for (i, line) in lines.iter().enumerate() {
+        let y = y0.saturating_add(i as u16);
+        if y >= y0.saturating_add(height) || y >= bar_row {
+            break;
+        }
+        let mut col = x0;
+        for ch in line.chars() {
+            if col >= x0.saturating_add(width) || col >= term_width {
+                break;
+            }
+            if let Some(c) = buf.cell_mut((col, y)) {
+                c.set_char(ch);
+                c.fg = dim;
+                c.bg = RColor::Reset;
+                c.modifier = RModifier::empty();
+                c.skip = false;
+            }
+            col = col.saturating_add(1);
+        }
+    }
+}
+
+fn paint_split_divider(
+    buf: &mut Buffer,
+    body_x: u16,
+    body_y: u16,
+    _body_w: u16,
+    body_h: u16,
+    dir: crate::layout::SplitDir,
+    a: (u16, u16, u16, u16),
+    _b: (u16, u16, u16, u16),
+    bar_row: u16,
+    term_width: u16,
+) {
+    match dir {
+        crate::layout::SplitDir::Vertical => {
+            let x = body_x.saturating_add(a.2);
+            if x >= term_width {
+                return;
+            }
+            for y in body_y..body_y.saturating_add(body_h).min(bar_row) {
+                if let Some(c) = buf.cell_mut((x, y)) {
+                    c.set_char('│');
+                    c.fg = CHROME_DIM;
+                    c.bg = CHROME_BG;
+                    c.skip = false;
+                }
+            }
+        }
+        crate::layout::SplitDir::Horizontal => {
+            let y = body_y.saturating_add(a.3);
+            if y >= bar_row {
+                return;
+            }
+            for x in body_x..term_width {
+                if let Some(c) = buf.cell_mut((x, y)) {
+                    c.set_char('─');
+                    c.fg = CHROME_DIM;
+                    c.bg = CHROME_BG;
+                    c.skip = false;
+                }
+            }
+        }
     }
 }
 
@@ -3064,6 +3316,8 @@ fn write_sidebar(buf: &mut Buffer, term_width: u16, term_height: u16, strip: &Ta
             AgentStatus::Idle => STATUS_IDLE,
             AgentStatus::Working => CHROME_ACCENT,
             AgentStatus::Blocked => STATUS_BLOCKED,
+            AgentStatus::Done => STATUS_IDLE,
+            AgentStatus::Unknown => CHROME_DIM,
         };
         let name_style = if focused {
             Style::default().fg(CHROME_TEXT).bg(block_bg).add_modifier(RModifier::BOLD)
@@ -3784,7 +4038,47 @@ fn spawn_input_decoder(
                                     debug_log("TRIGGER_PREFIX_HELP", &pending[..2]);
                                     let _ = tx.send(RunEvent::ShowHelp);
                                 }
-                                _ => {}
+                                b'%' => {
+                                    debug_log("TRIGGER_PREFIX_SPLIT_V", &pending[..2]);
+                                    let _ = tx.send(RunEvent::Split(crate::layout::SplitDir::Vertical));
+                                }
+                                b'"' => {
+                                    debug_log("TRIGGER_PREFIX_SPLIT_H", &pending[..2]);
+                                    let _ = tx.send(RunEvent::Split(crate::layout::SplitDir::Horizontal));
+                                }
+                                b'h' | b'H' | b'j' | b'J' | b'k' | b'K' | b'l' | b'L' => {
+                                    debug_log("TRIGGER_PREFIX_NEXT_PANE", &pending[..2]);
+                                    let _ = tx.send(RunEvent::NextPane);
+                                }
+                                b'z' | b'Z' => {
+                                    debug_log("TRIGGER_PREFIX_ZOOM", &pending[..2]);
+                                    let _ = tx.send(RunEvent::Zoom);
+                                }
+                                other => {
+                                    if let Some(action) = crate::plugin::action_for(
+                                        &crate::plugin::load_all(),
+                                        other,
+                                        crate::plugin::reserved_chords(),
+                                    ) {
+                                        match action {
+                                            crate::plugin::PluginAction::SplitVertical => {
+                                                let _ = tx.send(RunEvent::Split(crate::layout::SplitDir::Vertical));
+                                            }
+                                            crate::plugin::PluginAction::SplitHorizontal => {
+                                                let _ = tx.send(RunEvent::Split(crate::layout::SplitDir::Horizontal));
+                                            }
+                                            crate::plugin::PluginAction::NextPane => {
+                                                let _ = tx.send(RunEvent::NextPane);
+                                            }
+                                            crate::plugin::PluginAction::Zoom => {
+                                                let _ = tx.send(RunEvent::Zoom);
+                                            }
+                                            crate::plugin::PluginAction::Shell(cmd) => {
+                                                let _ = tx.send(RunEvent::PluginShell(cmd));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             pending.drain(..2);
                             continue;

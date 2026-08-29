@@ -19,12 +19,82 @@ pub struct SavedTab {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDir {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedSplit {
+    pub dir: SplitDir,
+    #[serde(default = "default_ratio")]
+    pub ratio: u16,
+    pub a: usize,
+    pub b: usize,
+}
+
+fn default_ratio() -> u16 {
+    50
+}
+
+impl SavedSplit {
+    pub fn contains(self, i: usize) -> bool {
+        self.a == i || self.b == i
+    }
+
+    pub fn other(self, i: usize) -> Option<usize> {
+        if self.a == i {
+            Some(self.b)
+        } else if self.b == i {
+            Some(self.a)
+        } else {
+            None
+        }
+    }
+
+    pub fn drop_tab(&mut self, ti: usize) -> bool {
+        if self.contains(ti) {
+            return false;
+        }
+        if self.a > ti {
+            self.a -= 1;
+        }
+        if self.b > ti {
+            self.b -= 1;
+        }
+        true
+    }
+}
+
+/// Body-relative pane rects `(x, y, w, h)` plus a 1-cell divider.
+pub fn pane_rects(width: u16, height: u16, dir: SplitDir, ratio: u16) -> ((u16, u16, u16, u16), (u16, u16, u16, u16)) {
+    let ratio = ratio.clamp(20, 80) as u32;
+    match dir {
+        SplitDir::Vertical => {
+            let inner = width.saturating_sub(1);
+            let left = ((inner as u32) * ratio / 100) as u16;
+            let right = inner.saturating_sub(left);
+            ((0, 0, left.max(8), height), (left.saturating_add(1), 0, right.max(8), height))
+        }
+        SplitDir::Horizontal => {
+            let inner = height.saturating_sub(1);
+            let top = ((inner as u32) * ratio / 100) as u16;
+            let bottom = inner.saturating_sub(top);
+            ((0, 0, width, top.max(3)), (0, top.saturating_add(1), width, bottom.max(3)))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedWorkspace {
     pub path: String,
     #[serde(default)]
     pub focus: usize,
     pub tabs: Vec<SavedTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SavedSplit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -107,6 +177,7 @@ mod tests {
                     path: "/tmp/a".into(),
                     focus: 0,
                     tabs: vec![SavedTab { tool: "claude".into(), session_id: Some("s1".into()), name: None }],
+                    split: None,
                 },
                 SavedWorkspace {
                     path: "/tmp/b".into(),
@@ -115,6 +186,7 @@ mod tests {
                         SavedTab { tool: "codex".into(), session_id: None, name: None },
                         SavedTab { tool: "grok".into(), session_id: Some("g".into()), name: Some("security-droid".into()) },
                     ],
+                    split: Some(SavedSplit { dir: SplitDir::Vertical, ratio: 50, a: 0, b: 1 }),
                 },
             ],
         };
@@ -127,5 +199,16 @@ mod tests {
     #[test]
     fn empty_mux_is_empty() {
         assert!(SavedMux::default().is_empty());
+    }
+
+    #[test]
+    fn pane_rects_leave_a_divider() {
+        let (a, b) = pane_rects(81, 24, SplitDir::Vertical, 50);
+        assert_eq!(a, (0, 0, 40, 24));
+        assert_eq!(b, (41, 0, 40, 24));
+        let (a, b) = pane_rects(80, 21, SplitDir::Horizontal, 50);
+        assert_eq!(a.3 + b.3 + 1, 21);
+        assert_eq!(a.1, 0);
+        assert_eq!(b.1, a.3 + 1);
     }
 }

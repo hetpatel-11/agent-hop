@@ -2,13 +2,13 @@ https://github.com/user-attachments/assets/f37e5ffa-fec3-46bd-8354-2353e2a2d8ad
 
 demo
 
-**A runtime for coding-agent harnesses.** Run Claude Code, Codex, OpenCode, Pi, and Grok inside one terminal, hop a live session between them, and search or resume any local chat.
+**A runtime for coding-agent harnesses.** Run Claude Code, Codex, OpenCode, Pi, Grok, Cursor, Copilot, Gemini, and Droid inside one terminal, hop a live session between them, and search or resume any local chat.
 
 # agent-hop
 
 `ah` is the process you start. The harness runs inside it.
 
-Claude Code, Codex, OpenCode, Pi, and Grok each have their own CLI, their own session files, and their own idea of "resume." None of them can take over a conversation another one just had. `agent-hop` is the runtime around those harnesses: a native Rust binary that opens the real agent in a pty, keeps a strip of chrome `ah` owns, and can move the live thread into the next harness without you leaving the terminal or starting over.
+Claude Code, Codex, OpenCode, Pi, Grok, Cursor, Copilot, Gemini, and Droid each have their own CLI, their own session files, and their own idea of "resume." None of them can take over a conversation another one just had. `agent-hop` is the runtime around those harnesses: a native Rust binary that opens the real agent in a pty, keeps a strip of chrome `ah` owns, and can move the live thread into the next harness without you leaving the terminal or starting over.
 
 You work the way you already do. `claude` is still `claude`. Codex is still Codex. `ah` does not reimplement them, proxy their APIs, or invent a new agent. It is the runtime around them — PTY, Ghostty's VT engine, hop, search.
 
@@ -18,8 +18,11 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
 - **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
-- **Tabs and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x`) or click the sidebar and tab strip. `Ctrl+B q` leaves `ah`; the next `ah` restores those workspaces and resumes each chat. When an agent exits, that tab closes. Last tab also leaves `ah`.
-- **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
+- **Tabs, splits, and workspaces** — several agents in one `ah` process. Prefix chords (`Ctrl+B c/w/o/i/[ /]/1–9/x/%/"/h/j/k/l/z`) or click the sidebar and tab strip. `Ctrl+B %` / `"` split a workspace the way tmux/herdr do. `Ctrl+B q` detaches; the daemon keeps PTYs alive. `ah` reattaches. `ah server stop` kills them.
+- **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close). `ah agent list|wait|prompt|read` works from any terminal.
+- **Thin remote** — `ah remote user@host` or `ah --remote user@host` is `ssh -t` plus `ah` on the far side.
+- **Worktrees** — `ah worktree list|add|remove` wraps `git worktree` so a folder is a first-class workspace.
+- **Plugins** — `~/.agent-hop/plugins/<name>/plugin.toml` adds prefix chords and detection files. `ah plugin list`.
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
 - **Interactive or scripted** — humans stay in the TUI. Agents and CI call `ah resume` without a picker.
@@ -35,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.
 
 That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.4`.
 
-Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
+Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`. Native Windows notes (sockets / detach): [docs/WINDOWS.md](docs/WINDOWS.md).
 
 Or via npm / bun, if you already use them:
 
@@ -71,7 +74,10 @@ Reopens the workspaces and tabs from last time, each on that harness's own resum
 | `Ctrl+B` then `[` / `]` | Previous / next workspace |
 | `Ctrl+B` then `1`–`9` | Focus that tab |
 | `Ctrl+B` then `x` | Close this tab |
-| `Ctrl+B` then `q` | Leave `ah`. Next `ah` restores these workspaces and chats |
+| `Ctrl+B` then `%` / `"` | Split this workspace vertically / horizontally |
+| `Ctrl+B` then `h` `j` `k` `l` | Other pane in a split |
+| `Ctrl+B` then `z` | Zoom — leave the split, keep both tabs |
+| `Ctrl+B` then `q` | Detach. Agents keep running. Next `ah` reattaches |
 | `Ctrl+B` then `?` | Show every `ah` shortcut |
 | `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
 | `Ctrl+R` | Search local history and resume a session in the **same** agent |
@@ -84,6 +90,20 @@ ah codex
 ah opencode
 ah pi
 ah grok
+ah cursor
+ah copilot
+ah gemini
+ah droid
+```
+
+Remote, worktrees, plugins:
+
+```bash
+ah remote user@host
+ah --remote user@host
+ah worktree list
+ah worktree add hotfix --branch fix/login
+ah plugin list
 ```
 
 Search and resume outside the live TUI:
@@ -131,7 +151,9 @@ ah workspace next
 ah workspace prev
 ```
 
-`Ctrl+B q` leaves `ah` the way herdr's `prefix+q` does. Agents are not kept running in the background: the layout is saved, and the next `ah` reopens those folders and resumes each chat. When the last agent in a tab exits, that tab closes. If it was the last tab, `ah` exits. `Ctrl+B x` closes a tab the same way.
+`Ctrl+B q` detaches the way herdr's `prefix+q` does. The mux stays up (`ah server status`). The next `ah` reattaches. `ah server stop` kills the agents. Sidebar status is idle / working / blocked / done / unknown (TOML overlays in `~/.agent-hop/detect/`). When the last agent in a tab exits, that tab closes. If it was the last tab, the daemon stops. `Ctrl+B x` closes a tab the same way.
+
+Plugins and extra detection rules: [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ## Architecture
 
@@ -140,7 +162,7 @@ ah workspace prev
 ```
 you ──► ah (picker / TUI chrome)
           │
-          ├─ portable-pty ──► claude | codex | opencode | pi | grok
+          ├─ portable-pty ──► claude | codex | opencode | pi | grok | cursor | copilot | gemini | droid
           │                      ▲
           │                      │ native resume command
           │
@@ -210,6 +232,10 @@ Long threads are cut to the most recent slice that fits (`CONVERSION_CHAR_BUDGET
 | OpenCode | yes | yes |
 | Pi | yes | yes |
 | Grok | yes | yes |
+| Cursor Agent | spawn only | no (fresh launch) |
+| GitHub Copilot | spawn only | no (fresh launch) |
+| Gemini CLI | spawn only | no (fresh launch) |
+| Droid | spawn only | no (fresh launch) |
 
 ## Development
 

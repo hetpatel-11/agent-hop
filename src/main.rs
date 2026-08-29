@@ -18,13 +18,19 @@ mod vt;
 mod detect;
 mod attach;
 mod server;
+mod worktree;
+mod plugin;
+mod remote;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ah", version, about = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session.")]
+#[command(name = "ah", version, about = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, Grok, Cursor, Copilot, Gemini, and Droid in one terminal; hop live between them; search and resume any local session.")]
 struct Cli {
+    /// Thin remote: `ssh -t HOST -- ah` (same as `ah remote HOST`).
+    #[arg(long)]
+    remote: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -41,11 +47,19 @@ enum Commands {
     Pi,
     /// Launch straight into Grok
     Grok,
+    /// Launch straight into Cursor Agent (`cursor-agent` / `agent`)
+    Cursor,
+    /// Launch straight into GitHub Copilot CLI
+    Copilot,
+    /// Launch straight into Gemini CLI
+    Gemini,
+    /// Launch straight into Droid
+    Droid,
     /// Search and resume a past session (standalone, outside the TUI)
     Resume {
         /// Search query (omitted = interactive prompt)
         query: Option<String>,
-        /// Restrict search to one agent (claude|codex|opencode|pi|grok)
+        /// Restrict search to one agent (claude|codex|opencode|pi|grok|cursor|copilot|gemini|droid)
         #[arg(short, long)]
         agent: Option<String>,
         /// Resume the picked session in this agent (default: same tool)
@@ -67,11 +81,11 @@ enum Commands {
     /// (`AH_SOCK` is set). Same idea as cmux: the agent runs a command, the
     /// multiplexer opens the panel. `ah tab codex` skips the picker.
     Tab {
-        /// Agent slug (claude|codex|opencode|pi|grok). Omit to use the picker.
+        /// Agent slug. Omit to use the picker.
         agent: Option<String>,
     },
     Hop {
-        /// Target agent (claude|codex|opencode|pi|grok). Hops another tab, never this pane.
+        /// Target agent. Hops another tab, never this pane.
         agent: String,
         /// 1-based tab in this workspace. Omit if there is exactly one other tab.
         #[arg(long)]
@@ -126,13 +140,59 @@ enum Commands {
     /// survives after the parent process exits.
     #[command(hide = true, name = "__background-index")]
     BackgroundIndex,
+    /// SSH to a host and attach to `ah` there (thin remote).
+    Remote {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        ssh: Vec<String>,
+    },
+    /// Git worktrees as first-class workspace folders.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCmd,
+    },
+    /// List local plugins (`~/.agent-hop/plugins`).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// `git worktree list` for this repo (or `--path`).
+    List {
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// `git worktree add` a sibling folder named `<repo>-<name>`.
+    Add {
+        name: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        dest: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Remove a worktree by path (or name under the default sibling layout).
+    Remove {
+        target: String,
+        #[arg(long)]
+        path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Show installed plugins and their Ctrl+B chords.
+    List,
 }
 
 #[derive(Subcommand)]
 enum AgentCmd {
     /// List live agents and their idle/working/blocked status.
     List,
-    /// Block until an agent reaches a status (`idle`, `working`, `blocked`).
+    /// Block until an agent reaches a status (`idle`, `working`, `blocked`, `done`, `unknown`).
     Wait {
         #[arg(long, default_value = "idle,blocked")]
         until: String,
@@ -182,6 +242,10 @@ enum AgentCmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if let Some(host) = cli.remote.as_deref() {
+        return remote::run(&[host.to_string()]);
+    }
+
     // Skipped for the hidden background-index command (runs silently,
     // detached, with no one to read a message anyway) and whenever
     // stdin/stdout aren't both real terminals (a script/another agent
@@ -204,6 +268,9 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Rename { .. }
                     | Commands::Server { .. }
                     | Commands::Daemon { .. }
+                    | Commands::Remote { .. }
+                    | Commands::Worktree { .. }
+                    | Commands::Plugin { .. }
             )
         );
     if !skip_update {
@@ -275,6 +342,23 @@ async fn main() -> anyhow::Result<()> {
         return run_agent_cmd(command);
     }
 
+    if let Some(Commands::Remote { ssh }) = &cli.command {
+        return remote::run(ssh);
+    }
+
+    if let Some(Commands::Worktree { command }) = &cli.command {
+        return run_worktree_cmd(command);
+    }
+
+    if let Some(Commands::Plugin { command }) = &cli.command {
+        match command {
+            PluginCmd::List => {
+                plugin::print_list();
+                return Ok(());
+            }
+        }
+    }
+
     if let Some(Commands::Server { action }) = &cli.command {
         match action.as_deref() {
             Some("stop") | Some("kill") => return server::stop(),
@@ -327,8 +411,12 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Opencode) => "opencode",
             Some(Commands::Pi) => "pi",
             Some(Commands::Grok) => "grok",
+            Some(Commands::Cursor) => "cursor",
+            Some(Commands::Copilot) => "copilot",
+            Some(Commands::Gemini) => "gemini",
+            Some(Commands::Droid) => "droid",
             Some(Commands::Resume { .. }) => "resume",
-            Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. } | Commands::BackgroundIndex) => "picker",
+            Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. } | Commands::BackgroundIndex | Commands::Remote { .. } | Commands::Worktree { .. } | Commands::Plugin { .. }) => "picker",
             None if restoring => "restore",
             None => "picker",
         };
@@ -351,6 +439,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Opencode) => Some(ToolName::OpenCode),
         Some(Commands::Pi) => Some(ToolName::Pi),
         Some(Commands::Grok) => Some(ToolName::Grok),
+        Some(Commands::Cursor) => Some(ToolName::Cursor),
+        Some(Commands::Copilot) => Some(ToolName::Copilot),
+        Some(Commands::Gemini) => Some(ToolName::Gemini),
+        Some(Commands::Droid) => Some(ToolName::Droid),
         Some(Commands::Resume { query, agent, resume_in }) => {
             let res = search::run_standalone_resume(query, agent, resume_in).await;
             telemetry::flush().await;
@@ -358,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         // Handled and returned above; kept for match exhaustiveness.
-        Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. }) => unreachable!(),
+        Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::Agent { .. } | Commands::Rename { .. } | Commands::Server { .. } | Commands::Daemon { .. } | Commands::Remote { .. } | Commands::Worktree { .. } | Commands::Plugin { .. }) => unreachable!(),
         Some(Commands::BackgroundIndex) => {
             let sessions = search::collect_sessions(&ToolName::ALL);
             vector_index::build_index(&sessions).await?;
@@ -409,7 +501,7 @@ fn run_agent_cmd(cmd: &AgentCmd) -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             if wanted.is_empty() {
-                anyhow::bail!("--until needs a status (idle, working, blocked)");
+                anyhow::bail!("--until needs a status (idle, working, blocked, done, unknown)");
             }
             let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
             loop {
@@ -450,6 +542,40 @@ fn run_agent_cmd(cmd: &AgentCmd) -> anyhow::Result<()> {
         AgentCmd::Rename { name, tab, current } => {
             control::request_ex("rename", None, *tab, None, current.as_deref(), None, None, Some(name))?;
             println!("Renamed to {name}.");
+            Ok(())
+        }
+    }
+}
+
+fn repo_cwd(path: Option<&str>) -> String {
+    path.filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| ".".into())
+}
+
+fn run_worktree_cmd(cmd: &WorktreeCmd) -> anyhow::Result<()> {
+    match cmd {
+        WorktreeCmd::List { path } => worktree::print_list(&repo_cwd(path.as_deref())),
+        WorktreeCmd::Add { name, branch, dest, path } => {
+            let dest = worktree::add(&repo_cwd(path.as_deref()), name, branch.as_deref(), dest.as_deref())?;
+            println!("{}", dest.display());
+            eprintln!("Open it with: ah workspace --path {}", dest.display());
+            Ok(())
+        }
+        WorktreeCmd::Remove { target, path } => {
+            let repo = repo_cwd(path.as_deref());
+            let resolved = if std::path::Path::new(target).exists() {
+                target.clone()
+            } else {
+                worktree::list(&repo)?
+                    .into_iter()
+                    .find(|t| t.path.ends_with(target) || t.branch.as_deref() == Some(target))
+                    .map(|t| t.path)
+                    .unwrap_or_else(|| target.clone())
+            };
+            worktree::remove(&repo, &resolved)?;
+            println!("Removed {resolved}");
             Ok(())
         }
     }

@@ -1,0 +1,14 @@
+agent = "cursor"
+version = 1
+
+[[rule]]
+status = "working"
+contains = "esc to interrupt"
+
+[[rule]]
+status = "blocked"
+contains = "allow this"
+
+[[rule]]
+status = "done"
+contains = "conversation ended"

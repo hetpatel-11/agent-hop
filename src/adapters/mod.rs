@@ -45,6 +45,7 @@ pub mod codex;
 pub mod opencode;
 pub mod pi;
 pub mod grok;
+pub mod generic;
 
 /// Port of the TS `SessionRef` -- what `listSessions()` returns, and what
 /// `read()` is given back so it can get at adapter-specific extra data
@@ -104,6 +105,7 @@ pub fn adapter_for(tool: ToolName) -> Box<dyn Adapter> {
         ToolName::OpenCode => Box::new(opencode::OpenCodeAdapter),
         ToolName::Pi => Box::new(pi::PiAdapter),
         ToolName::Grok => Box::new(grok::GrokAdapter),
+        other => Box::new(generic::GenericAdapter { tool: other }),
     }
 }
 

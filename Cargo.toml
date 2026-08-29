@@ -2,7 +2,7 @@
 name = "agent-hop"
 version = "0.1.4"
 edition = "2024"
-description = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session."
+description = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, Grok, Cursor, Copilot, Gemini, and Droid in one terminal; hop live between them; search and resume any local session."
 
 [[bin]]
 name = "ah"
@@ -16,6 +16,7 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 anyhow = "1"
 dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }

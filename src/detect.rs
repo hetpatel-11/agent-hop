@@ -1,14 +1,21 @@
 //! Screen-matching agent status, same shape as herdr's per-agent manifests:
 //! look at the live VT snapshot (visible lines + OSC title/progress) and
-//! decide idle / working / blocked. Not a silence timer.
+//! decide idle / working / blocked / done / unknown. Not a silence timer.
+//!
+//! User TOML under `~/.agent-hop/detect/*.toml` (and herdr-style
+//! `~/.local/state/agent-hop/agent-detection/remote/`) runs first.
 
 use crate::agents::ToolName;
+use serde::Deserialize;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
     Idle,
     Working,
     Blocked,
+    Done,
+    Unknown,
 }
 
 impl AgentStatus {
@@ -17,6 +24,19 @@ impl AgentStatus {
             AgentStatus::Idle => "idle",
             AgentStatus::Working => "working",
             AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "idle" => Some(Self::Idle),
+            "working" => Some(Self::Working),
+            "blocked" => Some(Self::Blocked),
+            "done" => Some(Self::Done),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
         }
     }
 
@@ -25,6 +45,8 @@ impl AgentStatus {
             AgentStatus::Idle => '✓',
             AgentStatus::Working => '…',
             AgentStatus::Blocked => '∗',
+            AgentStatus::Done => '■',
+            AgentStatus::Unknown => '?',
         }
     }
 
@@ -33,6 +55,8 @@ impl AgentStatus {
             AgentStatus::Idle => 0,
             AgentStatus::Working => 1,
             AgentStatus::Blocked => 2,
+            AgentStatus::Done => 3,
+            AgentStatus::Unknown => 4,
         }
     }
 
@@ -40,6 +64,8 @@ impl AgentStatus {
         match v {
             1 => AgentStatus::Working,
             2 => AgentStatus::Blocked,
+            3 => AgentStatus::Done,
+            4 => AgentStatus::Unknown,
             _ => AgentStatus::Idle,
         }
     }
@@ -168,13 +194,194 @@ pub fn detect(tool: ToolName, screen: &Screen, previous: AgentStatus) -> AgentSt
     if is_overlay(tool, screen) {
         return previous;
     }
-    match tool {
-        ToolName::Claude => detect_claude(screen).unwrap_or(previous),
-        ToolName::Codex => detect_codex(screen).unwrap_or(previous),
-        ToolName::Grok => detect_grok(screen).unwrap_or(previous),
-        ToolName::OpenCode => detect_opencode(screen).unwrap_or(AgentStatus::Idle),
-        ToolName::Pi => detect_pi(screen).unwrap_or(AgentStatus::Idle),
+    if let Some(from_toml) = match_manifests(tool, screen) {
+        return from_toml;
     }
+    if let Some(status) = detect_done(screen) {
+        return status;
+    }
+    let built_in = match tool {
+        ToolName::Claude => detect_claude(screen),
+        ToolName::Codex => detect_codex(screen),
+        ToolName::Grok => detect_grok(screen),
+        ToolName::OpenCode => detect_opencode(screen),
+        ToolName::Pi => detect_pi(screen),
+        _ => detect_generic(screen),
+    };
+    if let Some(status) = built_in {
+        return status;
+    }
+    match tool {
+        ToolName::OpenCode | ToolName::Pi => AgentStatus::Idle,
+        ToolName::Claude | ToolName::Codex | ToolName::Grok => previous,
+        _ => {
+            if previous == AgentStatus::Unknown {
+                AgentStatus::Unknown
+            } else {
+                previous
+            }
+        }
+    }
+}
+
+fn detect_done(s: &Screen) -> Option<AgentStatus> {
+    if s.contains_ci("no conversation found")
+        || s.contains_ci("session ended")
+        || s.contains_ci("conversation ended")
+        || s.contains_ci("agent has finished")
+    {
+        return Some(AgentStatus::Done);
+    }
+    None
+}
+
+fn detect_generic(s: &Screen) -> Option<AgentStatus> {
+    if detect_done(s).is_some() {
+        return Some(AgentStatus::Done);
+    }
+    if s.contains_ci("esc to interrupt")
+        || s.contains_ci("ctrl+c to interrupt")
+        || s.contains_ci("working...")
+        || s.contains_ci("thinking...")
+    {
+        return Some(AgentStatus::Working);
+    }
+    if s.contains_ci("allow command")
+        || s.contains_ci("permission required")
+        || s.contains_ci("do you want to")
+        || s.contains_ci("[y/n]")
+    {
+        return Some(AgentStatus::Blocked);
+    }
+    if s.any_line(|l| {
+        let t = l.trim();
+        t == ">" || t == "❯" || t.starts_with("> ") || t.starts_with("❯ ")
+    }) {
+        return Some(AgentStatus::Idle);
+    }
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestFile {
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    rule: Vec<ManifestRule>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ManifestRule {
+    status: String,
+    #[serde(default)]
+    contains: Option<String>,
+    #[serde(default)]
+    title_contains: Option<String>,
+}
+
+#[derive(Default)]
+struct ManifestSet {
+    rules: Vec<(String, ManifestRule)>,
+}
+
+fn manifests() -> &'static ManifestSet {
+    static SET: OnceLock<ManifestSet> = OnceLock::new();
+    SET.get_or_init(load_manifests)
+}
+
+fn detect_dirs() -> Vec<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("AH_DETECT_DIR") {
+        return vec![std::path::PathBuf::from(dir)];
+    }
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".agent-hop").join("detect"));
+        dirs.push(home.join(".local").join("state").join("agent-hop").join("agent-detection").join("remote"));
+        dirs.push(home.join(".agent-hop").join("plugins"));
+    }
+    dirs
+}
+
+fn load_manifests() -> ManifestSet {
+    let mut set = ManifestSet::default();
+    for dir in detect_dirs() {
+        load_manifest_dir(&dir, &mut set);
+    }
+    set
+}
+
+fn load_manifest_dir(dir: &std::path::Path, set: &mut ManifestSet) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let nested = path.join("detect.toml");
+            if nested.is_file() {
+                load_manifest_file(&nested, set);
+            }
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+            load_manifest_file(&path, set);
+        }
+    }
+}
+
+fn load_manifest_file(path: &std::path::Path, set: &mut ManifestSet) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    ingest_manifest(&text, set);
+}
+
+fn ingest_manifest(text: &str, set: &mut ManifestSet) {
+    let Ok(file) = toml::from_str::<ManifestFile>(text) else { return };
+    let agent = file.agent.trim().to_ascii_lowercase();
+    if agent.is_empty() {
+        return;
+    }
+    for rule in file.rule {
+        set.rules.push((agent.clone(), rule));
+    }
+}
+
+fn match_manifests(tool: ToolName, screen: &Screen) -> Option<AgentStatus> {
+    let slug = tool.slug();
+    for (agent, rule) in &manifests().rules {
+        if agent != slug {
+            continue;
+        }
+        let status = AgentStatus::from_label(&rule.status)?;
+        let mut hit = false;
+        if let Some(needle) = rule.contains.as_deref() {
+            if screen.contains_ci(needle) {
+                hit = true;
+            }
+        }
+        if let Some(needle) = rule.title_contains.as_deref() {
+            if screen.osc_title.as_deref().is_some_and(|t| t.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())) {
+                hit = true;
+            }
+        }
+        if rule.contains.is_none() && rule.title_contains.is_none() {
+            continue;
+        }
+        if hit {
+            return Some(status);
+        }
+    }
+    None
+}
+
+/// Parse a single TOML snippet (tests / `ah` docs). Not used at runtime.
+#[cfg(test)]
+pub fn parse_manifest_rules(text: &str) -> Option<(String, Vec<(AgentStatus, String)>)> {
+    let file: ManifestFile = toml::from_str(text).ok()?;
+    let mut out = Vec::new();
+    for r in file.rule {
+        let status = AgentStatus::from_label(&r.status)?;
+        let needle = r.contains.or(r.title_contains)?;
+        out.push((status, needle));
+    }
+    Some((file.agent, out))
 }
 
 fn is_overlay(tool: ToolName, s: &Screen) -> bool {
@@ -506,5 +713,52 @@ mod tests {
         assert_eq!(p.title(), Some("claude"));
         p.feed(b"\x1b]9;4;1;-1\x1b\\");
         assert_eq!(p.progress(), Some("4;1;-1"));
+    }
+
+    #[test]
+    fn five_status_labels_roundtrip() {
+        for s in [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Blocked, AgentStatus::Done, AgentStatus::Unknown] {
+            assert_eq!(AgentStatus::from_u8(s.as_u8()), s);
+            assert_eq!(AgentStatus::from_label(s.label()), Some(s));
+        }
+    }
+
+    #[test]
+    fn session_ended_is_done() {
+        let s = screen(&["No conversation found"]);
+        assert_eq!(detect(ToolName::Claude, &s, AgentStatus::Working), AgentStatus::Done);
+    }
+
+    #[test]
+    fn generic_cursor_prompt_is_idle() {
+        let s = screen(&["> "]);
+        assert_eq!(detect(ToolName::Cursor, &s, AgentStatus::Unknown), AgentStatus::Idle);
+        let s = screen(&["esc to interrupt"]);
+        assert_eq!(detect(ToolName::Gemini, &s, AgentStatus::Idle), AgentStatus::Working);
+    }
+
+    #[test]
+    fn unmatched_new_harness_holds_previous() {
+        let s = screen(&["streaming tokens"]);
+        assert_eq!(detect(ToolName::Droid, &s, AgentStatus::Working), AgentStatus::Working);
+        assert_eq!(detect(ToolName::Copilot, &s, AgentStatus::Unknown), AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn toml_manifest_parses_herdr_style_rules() {
+        let text = r#"
+agent = "cursor"
+version = 1
+[[rule]]
+status = "working"
+contains = "Generating"
+[[rule]]
+status = "done"
+contains = "conversation ended"
+"#;
+        let (agent, rules) = parse_manifest_rules(text).unwrap();
+        assert_eq!(agent, "cursor");
+        assert_eq!(rules[0].0, AgentStatus::Working);
+        assert_eq!(rules[1].0, AgentStatus::Done);
     }
 }

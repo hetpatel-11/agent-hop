@@ -57,6 +57,10 @@ pub fn tool_color(tool: ToolName, s: &str) -> String {
         ToolName::Pi => yellow(s),
         ToolName::OpenCode => grey(s),
         ToolName::Grok => white(s),
+        ToolName::Cursor => magenta(s),
+        ToolName::Copilot => dark_blue(s),
+        ToolName::Gemini => yellow(s),
+        ToolName::Droid => orange(s),
     }
 }
 

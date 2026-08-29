@@ -9,15 +9,33 @@ pub enum ToolName {
     OpenCode,
     Pi,
     Grok,
+    Cursor,
+    Copilot,
+    Gemini,
+    Droid,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 5] = [
+    /// Original five — hop/search adapters and the PATH smoke test.
+    #[allow(dead_code)]
+    pub const CORE: [ToolName; 5] = [
         ToolName::Claude,
         ToolName::Codex,
         ToolName::OpenCode,
         ToolName::Pi,
         ToolName::Grok,
+    ];
+
+    pub const ALL: [ToolName; 9] = [
+        ToolName::Claude,
+        ToolName::Codex,
+        ToolName::OpenCode,
+        ToolName::Pi,
+        ToolName::Grok,
+        ToolName::Cursor,
+        ToolName::Copilot,
+        ToolName::Gemini,
+        ToolName::Droid,
     ];
 
     pub fn slug(&self) -> &'static str {
@@ -27,6 +45,10 @@ impl ToolName {
             ToolName::OpenCode => "opencode",
             ToolName::Pi => "pi",
             ToolName::Grok => "grok",
+            ToolName::Cursor => "cursor",
+            ToolName::Copilot => "copilot",
+            ToolName::Gemini => "gemini",
+            ToolName::Droid => "droid",
         }
     }
 
@@ -40,17 +62,33 @@ impl ToolName {
             ToolName::OpenCode => "OpenCode",
             ToolName::Pi => "Pi",
             ToolName::Grok => "Grok",
+            ToolName::Cursor => "Cursor Agent",
+            ToolName::Copilot => "GitHub Copilot",
+            ToolName::Gemini => "Gemini CLI",
+            ToolName::Droid => "Droid",
+        }
+    }
+
+    pub fn binaries(&self) -> &'static [&'static str] {
+        match self {
+            ToolName::Claude => &["claude"],
+            ToolName::Codex => &["codex"],
+            ToolName::OpenCode => &["opencode"],
+            ToolName::Pi => &["pi"],
+            ToolName::Grok => &["grok"],
+            ToolName::Cursor => &["cursor-agent", "agent"],
+            ToolName::Copilot => &["copilot"],
+            ToolName::Gemini => &["gemini"],
+            ToolName::Droid => &["droid"],
         }
     }
 
     pub fn binary(&self) -> &'static str {
-        match self {
-            ToolName::Claude => "claude",
-            ToolName::Codex => "codex",
-            ToolName::OpenCode => "opencode",
-            ToolName::Pi => "pi",
-            ToolName::Grok => "grok",
-        }
+        self.binaries()
+            .iter()
+            .copied()
+            .find(|b| which(b).is_some())
+            .unwrap_or(self.binaries()[0])
     }
 
     pub fn install_command(&self) -> (&'static str, &'static [&'static str]) {
@@ -60,15 +98,26 @@ impl ToolName {
             ToolName::OpenCode => ("npm", &["install", "-g", "opencode-ai"]),
             ToolName::Pi => ("npm", &["install", "-g", "@heypi/cli"]),
             ToolName::Grok => ("npm", &["install", "-g", "@vibe-kit/grok-cli"]),
+            ToolName::Cursor => ("npm", &["install", "-g", "@cursor/agent"]),
+            ToolName::Copilot => ("npm", &["install", "-g", "@github/copilot"]),
+            ToolName::Gemini => ("npm", &["install", "-g", "@google/gemini-cli"]),
+            ToolName::Droid => ("npm", &["install", "-g", "@factory/droid"]),
         }
     }
 
     pub fn from_slug(s: &str) -> Option<ToolName> {
-        ToolName::ALL.into_iter().find(|t| t.slug() == s)
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "cursor-agent" | "cursor" => Some(ToolName::Cursor),
+            "github-copilot" | "copilot" => Some(ToolName::Copilot),
+            "gemini-cli" | "gemini" => Some(ToolName::Gemini),
+            "factory" | "droid" => Some(ToolName::Droid),
+            _ => ToolName::ALL.into_iter().find(|t| t.slug() == s),
+        }
     }
 
     pub fn is_installed(&self) -> bool {
-        which(self.binary()).is_some()
+        self.binaries().iter().any(|b| which(b).is_some())
     }
 
     /// Slugs of harnesses currently on PATH. Aggregate-only — used by
@@ -168,10 +217,19 @@ mod tests {
 
     #[test]
     fn which_finds_installed_agents() {
-        for tool in ToolName::ALL {
-            let found = which(tool.binary());
-            assert!(found.is_some(), "expected {} on PATH for this smoke test", tool.slug());
+        let found: Vec<_> = ToolName::CORE.into_iter().filter(ToolName::is_installed).collect();
+        assert!(!found.is_empty(), "expected at least one CORE agent on PATH");
+        for tool in found {
+            assert!(which(tool.binary()).is_some(), "expected {} on PATH", tool.slug());
         }
+    }
+
+    #[test]
+    fn extra_harness_slugs_resolve() {
+        assert_eq!(ToolName::from_slug("cursor-agent"), Some(ToolName::Cursor));
+        assert_eq!(ToolName::from_slug("gemini-cli"), Some(ToolName::Gemini));
+        assert_eq!(ToolName::from_slug("droid").unwrap().binary(), "droid");
+        assert_eq!(ToolName::ALL.len(), 9);
     }
 
     #[test]

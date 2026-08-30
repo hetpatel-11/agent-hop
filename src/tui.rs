@@ -955,7 +955,7 @@ fn run_mux(
             Ok(RunEvent::AgentPicker) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
                 let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
-                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool, false) {
                     Some(picked) if workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool() != picked => {
                         let _ = tx.send(RunEvent::HopTo(picked));
                     }
@@ -972,7 +972,7 @@ fn run_mux(
             Ok(RunEvent::NewTab) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
                 let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
-                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool, true) {
                     Some(picked) => add_agent_tab(
                         &mut workspaces,
                         ws_focus,
@@ -1009,7 +1009,7 @@ fn run_mux(
                 match run_path_overlay(&sink, &suppress, &default_path) {
                     Some(path) => {
                         let path = expand_workspace_path(&path);
-                        match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
+                        match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool, true) {
                             Some(picked) => {
                                 unpaint_all(&workspaces);
                                 let generation_id = generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1667,7 +1667,7 @@ fn handle_pane_request(
                 None => {
                     let suppress = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].suppress.clone();
                     let current = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].kind.tool();
-                    match run_agent_picker(sink, overlay_click_sink, &suppress, current) {
+                    match run_agent_picker(sink, overlay_click_sink, &suppress, current, true) {
                         Some(t) => t,
                         None => {
                             focus_active(workspaces, *ws_focus, sink, mouse_sink, tab_strip);
@@ -2070,7 +2070,7 @@ fn apply_split(
     if workspaces[ws_focus].tabs.len() < 2 {
         let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
         let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
-        match run_agent_picker(sink, overlay_click_sink, &suppress, current_tool) {
+        match run_agent_picker(sink, overlay_click_sink, &suppress, current_tool, true) {
             Some(picked) => add_agent_tab(
                 workspaces, ws_focus, picked, sink, mouse_sink, tx, generation, host_colors, tab_strip,
             ),
@@ -2695,16 +2695,14 @@ fn picker_geometry(installed: &[ToolName], cols: u16, rows: u16) -> PickerGeomet
 /// driven menu works -- there's no reason to make a user click once to
 /// highlight and again to confirm when they've already pointed at exactly
 /// the row they want.
-fn run_agent_picker(sink: &Arc<Mutex<InputSink>>, overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>, suppress: &Arc<AtomicBool>, current: ToolName) -> Option<ToolName> {
+fn run_agent_picker(sink: &Arc<Mutex<InputSink>>, overlay_click_sink: &Arc<Mutex<Option<mpsc::Sender<(u16, u16)>>>>, suppress: &Arc<AtomicBool>, current: ToolName, same_ok: bool) -> Option<ToolName> {
     let installed: Vec<ToolName> = ToolName::ALL.into_iter().filter(|t| t.is_installed()).collect();
-    // The tool currently running is necessarily installed (it's running),
-    // so `installed` can never truly be empty in practice -- but the real
-    // version of this edge case, a fresh machine with only one agent ever
-    // installed, is entirely plausible: there's nothing else to switch to.
-    // Silently doing nothing on a click or `Ctrl+B a` in that case used to
-    // be indistinguishable from the feature being broken; a brief message
-    // makes it clear this is expected, not a bug.
+    // Hop needs a *different* installed agent. New tab / split / workspace
+    // can open another pane of the same harness (OpenCode + OpenCode).
     if installed.iter().all(|t| *t == current) {
+        if same_ok {
+            return installed.first().copied();
+        }
         run_help_style_message(sink, suppress, "No other agents installed", "install another agent to switch to it");
         return None;
     }

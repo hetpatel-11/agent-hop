@@ -160,6 +160,7 @@ fn parse_request(req: Request) -> Result<PaneRequest, &'static str> {
     Ok(PaneRequest { from_tab, op })
 }
 
+#[cfg(test)]
 fn parse_line(line: &str) -> Result<PaneRequest, &'static str> {
     let req: Request = serde_json::from_str(line.trim()).map_err(|_| "invalid json")?;
     parse_request(req)

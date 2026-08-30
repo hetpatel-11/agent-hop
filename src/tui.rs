@@ -167,25 +167,20 @@ struct Workspace {
     focus: usize,
 }
 
-/// One live PTY: an agent, or a shell tab (not spawned on agent exit).
+/// One live agent PTY. Switching tabs never kills this; hop/close/exit does.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TabKind {
     Agent(ToolName),
-    Shell,
 }
 
 impl TabKind {
     fn slug(self) -> &'static str {
-        match self {
-            TabKind::Agent(t) => t.slug(),
-            TabKind::Shell => "term",
-        }
+        self.tool().slug()
     }
 
-    fn tool(self) -> Option<ToolName> {
+    fn tool(self) -> ToolName {
         match self {
-            TabKind::Agent(t) => Some(t),
-            TabKind::Shell => None,
+            TabKind::Agent(t) => t,
         }
     }
 }
@@ -194,7 +189,6 @@ impl TabKind {
 struct LiveTab {
     id: u64,
     kind: TabKind,
-    project_path: String,
     session_id: Option<String>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     resize_tx: mpsc::Sender<(u16, u16)>,
@@ -231,7 +225,7 @@ fn persist_mux(workspaces: &[Workspace], ws_focus: usize) {
     for ws in workspaces {
         let mut tabs = Vec::new();
         for tab in &ws.tabs {
-            let Some(tool) = tab.kind.tool() else { continue };
+            let tool = tab.kind.tool();
             let session_id = tab.session_id.clone().or_else(|| {
                 crate::adapters::find_latest_session_for_path(tool, &ws.path).map(|s| s.session_id)
             });
@@ -385,20 +379,6 @@ fn focus_tab(
 enum Launch {
     Fresh,
     Resume(String),
-}
-
-/// Outcome of running one agent to completion.
-enum RunOutcome {
-    #[allow(dead_code)]
-    Exited,
-    #[allow(dead_code)]
-    Quit,
-    #[allow(dead_code)]
-    Hop(HopDirection),
-    #[allow(dead_code)]
-    HopTo(ToolName),
-    #[allow(dead_code)]
-    ResumeInto { tool: ToolName, session_id: String, project_path: String },
 }
 
 /// Single-pane TUI shell: one agent's real pty rendered full-pane, with a
@@ -596,7 +576,7 @@ pub async fn run(
             Ok(RunEvent::Hop(dir)) => {
                 let ws = &workspaces[ws_focus];
                 let tab = &ws.tabs[ws.focus];
-                current = tab.kind.tool().unwrap_or_else(|| next_installed(ToolName::Claude, 1));
+                current = tab.kind.tool();
                 project_path = ws.path.clone();
                 let via = match dir {
                     HopDirection::Next => "next",
@@ -606,10 +586,7 @@ pub async fn run(
                     HopDirection::Next => next_installed(current, 1),
                     HopDirection::Prev => next_installed(current, -1),
                 };
-                launch = match workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind {
-                    TabKind::Shell => Launch::Fresh,
-                    TabKind::Agent(_) => hop_to(current, next, &project_path, &rx, true),
-                };
+                launch = hop_to(current, next, &project_path, &rx, true);
                 telemetry::capture(
                     "hop",
                     serde_json::json!({
@@ -635,17 +612,13 @@ pub async fn run(
                     Ok(()) => sync_tab_strip(&tab_strip, &workspaces, ws_focus),
                     Err(e) => break Err(e),
                 }
-                current = next;
             }
             Ok(RunEvent::HopTo(next)) => {
                 let ws = &workspaces[ws_focus];
                 let tab = &ws.tabs[ws.focus];
-                current = tab.kind.tool().unwrap_or_else(|| next_installed(ToolName::Claude, 1));
+                current = tab.kind.tool();
                 project_path = ws.path.clone();
-                launch = match workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind {
-                    TabKind::Shell => Launch::Fresh,
-                    TabKind::Agent(_) => hop_to(current, next, &project_path, &rx, true),
-                };
+                launch = hop_to(current, next, &project_path, &rx, true);
                 telemetry::capture(
                     "hop",
                     serde_json::json!({
@@ -671,10 +644,9 @@ pub async fn run(
                     Ok(()) => sync_tab_strip(&tab_strip, &workspaces, ws_focus),
                     Err(e) => break Err(e),
                 }
-                current = next;
             }
             Ok(RunEvent::ResumeInto { tool, session_id, project_path: new_path }) => {
-                let from = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                let from = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
                 telemetry::capture(
                     "resume",
                     serde_json::json!({
@@ -765,9 +737,9 @@ pub async fn run(
             }
             Ok(RunEvent::AgentPicker) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
-                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
                 match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
-                    Some(picked) if workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool() != Some(picked) => {
+                    Some(picked) if workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool() != picked => {
                         let _ = tx.send(RunEvent::HopTo(picked));
                     }
                     _ => {
@@ -782,7 +754,7 @@ pub async fn run(
             }
             Ok(RunEvent::NewTab) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
-                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
                 match run_agent_picker(&sink, &overlay_click_sink, &suppress, current_tool) {
                     Some(picked) => add_agent_tab(
                         &mut workspaces,
@@ -816,7 +788,7 @@ pub async fn run(
             Ok(RunEvent::NewWorkspace) => {
                 let suppress = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].suppress.clone();
                 let default_path = workspaces[ws_focus].path.clone();
-                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool().unwrap_or(ToolName::Claude);
+                let current_tool = workspaces[ws_focus].tabs[workspaces[ws_focus].focus].kind.tool();
                 match run_path_overlay(&sink, &suppress, &default_path) {
                     Some(path) => {
                         let path = expand_workspace_path(&path);
@@ -1113,10 +1085,7 @@ fn handle_pane_request(
             };
             let path = workspaces[wi].path.clone();
             let from = workspaces[wi].tabs[ti].kind.tool();
-            let launch = match from {
-                None => Launch::Fresh,
-                Some(current) => hop_to(current, tool, &path, rx, false),
-            };
+            let launch = hop_to(from, tool, &path, rx, false);
             if let Err(e) = replace_tab_at(
                 &mut workspaces[wi],
                 ti,
@@ -1198,10 +1167,7 @@ fn handle_pane_request(
                 Some(t) => t,
                 None => {
                     let suppress = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].suppress.clone();
-                    let current = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus]
-                        .kind
-                        .tool()
-                        .unwrap_or(ToolName::Claude);
+                    let current = workspaces[*ws_focus].tabs[workspaces[*ws_focus].focus].kind.tool();
                     match run_agent_picker(sink, overlay_click_sink, &suppress, current) {
                         Some(t) => t,
                         None => {
@@ -1331,7 +1297,7 @@ fn replace_focused_tab(
 }
 
 /// Shared by both hop paths -- Alt+Up/Down stepping next/prev, and picking
-/// a specific agent from the click-to-open list (see `RunOutcome::HopTo`).
+/// a specific agent from the click-to-open list (see `RunEvent::HopTo`).
 /// Draws the transition splash, translates the live conversation into
 /// `next`'s format on a background thread while still servicing `rx` (see
 /// the long-standing comment this used to carry inline, preserved in spirit
@@ -1618,10 +1584,9 @@ fn spawn_live_tab(
     initially_focused: bool,
     tab_strip: Arc<Mutex<TabStrip>>,
 ) -> anyhow::Result<LiveTab> {
-    if let TabKind::Agent(tool) = kind {
-        if !tool.is_installed() {
-            anyhow::bail!("Cannot resume in {}: \"{}\" is not installed or not on PATH.", tool.slug(), tool.binary());
-        }
+    let tool = kind.tool();
+    if !tool.is_installed() {
+        anyhow::bail!("Cannot resume in {}: \"{}\" is not installed or not on PATH.", tool.slug(), tool.binary());
     }
     let t_run_one_start = std::time::Instant::now();
     let pty_system = native_pty_system();
@@ -1634,31 +1599,14 @@ fn spawn_live_tab(
         pixel_height: 0,
     })?;
 
-    let mut cmd = match kind {
-        TabKind::Shell => {
-            let shell = std::env::var("SHELL")
-                .or_else(|_| std::env::var("COMSPEC"))
-                .unwrap_or_else(|_| {
-                    if cfg!(windows) {
-                        "cmd.exe".into()
-                    } else {
-                        "/bin/zsh".into()
-                    }
-                });
-            CommandBuilder::new(shell)
-        }
-        TabKind::Agent(tool) => {
-            let argv = match &launch {
-                Launch::Fresh => crate::agents::spawn_argv(&[tool.binary().to_string()]),
-                Launch::Resume(session_id) => {
-                    crate::agents::spawn_argv(&adapter_for(tool).resume_cmd(session_id, project_path))
-                }
-            };
-            let mut cmd = CommandBuilder::new(&argv[0]);
-            cmd.args(&argv[1..]);
-            cmd
+    let argv = match &launch {
+        Launch::Fresh => crate::agents::spawn_argv(&[tool.binary().to_string()]),
+        Launch::Resume(session_id) => {
+            crate::agents::spawn_argv(&adapter_for(tool).resume_cmd(session_id, project_path))
         }
     };
+    let mut cmd = CommandBuilder::new(&argv[0]);
+    cmd.args(&argv[1..]);
     cmd.cwd(project_path);
     if let Some(sock) = CONTROL_SOCK.lock().unwrap().as_ref() {
         cmd.env(crate::control::SOCK_ENV, sock.to_string_lossy().as_ref());
@@ -1979,7 +1927,6 @@ fn spawn_live_tab(
     Ok(LiveTab {
         id: generation_id,
         kind,
-        project_path: project_path.to_string(),
         session_id,
         writer,
         resize_tx,

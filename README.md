@@ -33,7 +33,7 @@ macOS or Linux, no Node required:
 curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.4`.
+That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.5`.
 
 Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
 

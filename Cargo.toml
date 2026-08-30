@@ -1,6 +1,6 @@
 [package]
 name = "agent-hop"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal; hop live between them; search and resume any local session."
 

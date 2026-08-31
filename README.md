@@ -14,7 +14,7 @@ You work the way you already do. `claude` is still `claude`. Codex is still Code
 
 When you hop Claude Code → Grok → Pi → OpenCode → Codex, the runtime finds the session the current harness just wrote for this project, translates the actual turns into the next harness's native format, and launches that harness's own resume command. Tool calls (shell, file edits, MCP) and attachments (images, PDFs) go with the thread. It is not a pasted summary.
 
-Search and resume are part of the same runtime, not a separate product. Every harness writes history to disk in its own shape. `ah` indexes all of it locally — BM25 as you type, MiniLM when you pause — so you can pull up a thread you remember by topic, not by which tool or folder held it. `Ctrl+R` resumes in the same harness. A hop, or `ah resume -r`, continues it in a different one.
+Search and resume are part of the same runtime, not a separate product. Every harness writes history to disk in its own shape. `ah` indexes all of it locally — BM25 as you type, MiniLM when you pause — so you can pull up a thread you remember by topic, not by which tool or folder held it. Inside the mux, `Ctrl+R` resumes in the same harness. `ah cli` (or a hop / `ah resume -r`) continues it in a different one.
 
 - **Runtime, not a wrapper UI** — you launch `ah`; it spawns the real harness in a pty and renders it with Ghostty's terminal engine. The agent is unmodified.
 - **Live hop between harnesses** — `Ctrl+B n/p/a`, `Alt+↑/↓`, or click the bottom bar. The next tool gets the real conversation in its own session format. Native compact/recap (and the local digest when a thread is cut) stay in model context, not as a chat bubble.
@@ -22,7 +22,7 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 - **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
-- **Interactive or scripted** — humans stay in the TUI. `ah cli` searches, picks, hops, and execs the real harness on inherited stdio (no mux). Agents and CI call `ah cli "query"` or `ah resume` without a PTY.
+- **Interactive or scripted** — `ah` is the mux. `ah cli` is search → pick → hop → exec on inherited stdio (no mux, no nested PTY). Agents and CI call `ah cli "query"` without a TTY.
 - **Sessions never leave disk** — hop and search read the same files the harnesses already write. Telemetry, if left on, is aggregate usage only.
 
 ## Install
@@ -55,11 +55,15 @@ Anonymous usage telemetry is on by default (no queries, paths, or chat content).
 
 ## Usage
 
+`ah` with no subcommand is the mux. `ah cli` searches every local chat, then execs the real harness — no tab bar, no nested PTY.
+
+### Mux
+
 ```bash
 ah
 ```
 
-Reopens the workspaces and tabs from last time, each on that harness's own resume of the chat. First run — or after you start with `ah claude` / `ah resume` — you pick a harness. That harness is a child process; `ah` wraps it:
+Reopens the workspaces and tabs from last time, each on that harness's own resume of the chat. First run — or after you start with `ah claude` — you pick a harness. That harness is a child process; `ah` wraps it:
 
 | Shortcut | What it does |
 |---|---|
@@ -76,14 +80,6 @@ Reopens the workspaces and tabs from last time, each on that harness's own resum
 | `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
 | `Ctrl+R` | Search local history and resume a session in the **same** agent |
 
-**`ah cli`** — search every local chat, pick one, optionally hop it into another harness, then exec that harness with inherited stdio. No mux, no nested PTY. Flags: `-a` to scope an agent, `-r` to resume in another. No TTY: pass a query and the top match is auto-picked.
-
-```bash
-ah cli
-ah cli "oauth bug"
-ah cli "oauth bug" -r grok
-```
-
 Launch straight into a tool:
 
 ```bash
@@ -94,29 +90,41 @@ ah pi
 ah grok
 ```
 
-Search and resume outside the live TUI:
+`Ctrl+R` and `ah resume` on a TTY stay in the mux and resume the same agent. Cross-agent is a hop (`Ctrl+B` / `Alt+↑↓`) or `-r` for scripts.
+
+### `ah cli`
+
+Search every local chat, pick one, optionally hop it into another harness, then exec that harness with inherited stdio.
 
 ```bash
-ah resume
-ah resume "auth migration"
-ah resume "auth migration" --agent claude
-ah resume "auth migration" --agent claude --resume-in codex
+ah cli
+ah cli "oauth bug"
+ah cli "oauth bug" -a claude
+ah cli "oauth bug" -r grok
 ```
+
+Walks you through:
+
+1. **Which agent(s) to search?** — all five, or one. `-a` skips the prompt.
+2. **Type to search** — BM25 every keystroke, MiniLM after you pause. A query on the command line prefills the box; you can keep typing.
+3. **Pick a session** — `[agent]` tag, title, date, project, hint.
+4. **Resume in which agent?** — same tool is a native resume; another tool converts first. `-r` skips the prompt.
+5. Execs that harness's own resume command (`claude --resume …`, `codex resume …`, …). You are in that CLI, not inside `ah`.
 
 | Flag | Description |
 |---|---|
 | `-a, --agent <tool>` | Only search this agent (`claude`, `codex`, `opencode`, `pi`, `grok`) |
-| `-r, --resume-in <tool>` | Convert the picked session into this agent's format, then launch it |
+| `-r, --resume-in <tool>` | Convert if needed, then launch in this agent |
 
-`Ctrl+R` and bare `ah resume` stay on the same agent. Cross-agent is the hop (`Ctrl+B` / `Alt+↑↓`) or `-r` for scripts.
-
-Without a TTY (another agent or a script), a query is required and the top match is auto-picked:
+Without a TTY (another agent or a script), a query is required, the top match is auto-picked, and the same tool is used unless you pass `-r`:
 
 ```bash
-ah resume "adobe premiere mcp setup" --agent codex --resume-in opencode
+ah cli "adobe premiere mcp setup" --agent codex --resume-in opencode
 ```
 
 Be specific. A vague query like `"adobe"` can resume the wrong chat.
+
+`ah resume` without a TTY does the same exec. On a TTY it opens the mux search instead.
 
 ```bash
 ah telemetry          # status
@@ -146,7 +154,7 @@ ah workspace prev
 `ah` is a runtime: run the real harness, search the history those harnesses already wrote, translate a live session into another harness's format, and stay out of the way.
 
 ```
-you ──► ah (picker / TUI chrome)
+you ──► ah            (mux / TUI chrome)
           │
           ├─ portable-pty ──► claude | codex | opencode | pi | grok
           │                      ▲
@@ -156,9 +164,13 @@ you ──► ah (picker / TUI chrome)
           │
           ├─ adapters ──► read/write each tool's files on disk
           │      │
-          │      └─ Turn[] (shared IR) ──► hop / ah resume -r
+          │      └─ Turn[] (shared IR) ──► hop / ah cli -r / ah resume -r
           │
           └─ search ──► BM25 + MiniLM (local ONNX) over ~/.agent-hop
+
+you ──► ah cli        (search → pick → hop → exec)
+          │
+          └─ inherited stdio ──► the harness's own resume command
 ```
 
 ### What each piece is for
@@ -189,7 +201,9 @@ Adding an agent is one new adapter. The TUI and search do not change.
 
 The incremental vector index lives under `~/.agent-hop/`. New sessions are indexed by a detached `ah __background-index` so the picker never blocks on a full rebuild.
 
-**Standalone resume (`ah resume`)** — Same ranker and picker as `Ctrl+R`, without wrapping a live agent first. `-r` hops. No TTY execs the target harness. `ah cli` is that flow even when there is a TTY (never opens the mux).
+**CLI (`src/cli_search.rs`)** — `ah cli` is search → pick → hop → exec. Same ranker and adapters as the mux. After you pick, it runs `resume_cmd` on inherited stdio and exits. No TTY: query required, top match, same tool unless `-r`.
+
+**Standalone resume (`ah resume`)** — On a TTY, same overlay as `Ctrl+R` (stays in the mux, same agent). No TTY, same exec as `ah cli`. `-r` hops.
 
 **Telemetry (`src/telemetry.rs`)** — Opt-out, self-hosted (`telemetry.agent-hop.com`). Sends aggregate usage (command, version, OS). Never queries, paths, project names, session ids, or chat content. Disabled by `AH_TELEMETRY=0`, `DO_NOT_TRACK=1`, or `ah telemetry off`.
 

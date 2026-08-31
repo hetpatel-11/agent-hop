@@ -15,6 +15,7 @@ mod feedback;
 mod control;
 mod update_check;
 mod vt;
+mod cli_search;
 
 use agents::ToolName;
 use clap::{Parser, Subcommand};
@@ -46,6 +47,17 @@ enum Commands {
         #[arg(short, long)]
         agent: Option<String>,
         /// Resume the picked session in this agent (default: same tool)
+        #[arg(short = 'r', long = "resume-in")]
+        resume_in: Option<String>,
+    },
+    /// Search every local chat, pick one, hop, exec the real harness. No mux.
+    Cli {
+        /// Search query (omitted = interactive prompt)
+        query: Option<String>,
+        /// Restrict search to one agent (claude|codex|opencode|pi|grok)
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Resume the picked session in this agent (default: ask, or same tool if no TTY)
         #[arg(short = 'r', long = "resume-in")]
         resume_in: Option<String>,
     },
@@ -215,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
             Some(Commands::Pi) => "pi",
             Some(Commands::Grok) => "grok",
             Some(Commands::Resume { .. }) => "resume",
+            Some(Commands::Cli { .. }) => "cli",
             Some(Commands::Telemetry { .. } | Commands::Feedback { .. } | Commands::Tab { .. } | Commands::Hop { .. } | Commands::Close { .. } | Commands::Focus { .. } | Commands::Workspace { .. } | Commands::BackgroundIndex) => "picker",
             None if restoring => "restore",
             None => "picker",
@@ -240,6 +253,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Grok) => Some(ToolName::Grok),
         Some(Commands::Resume { query, agent, resume_in }) => {
             let res = search::run_standalone_resume(query, agent, resume_in).await;
+            telemetry::flush().await;
+            res?;
+            return Ok(());
+        }
+        Some(Commands::Cli { query, agent, resume_in }) => {
+            let res = cli_search::run(query, agent, resume_in).await;
             telemetry::flush().await;
             res?;
             return Ok(());

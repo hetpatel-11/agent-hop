@@ -4,9 +4,11 @@
 
 use crate::adapters::SessionRef;
 use crate::embed;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 fn index_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".agent-hop")
@@ -29,19 +31,92 @@ struct ChunkEntry {
 #[derive(Serialize, Deserialize, Clone)]
 struct SessionEntry {
     key: String, // "{tool}:{sessionId}"
-    #[serde(rename = "sourceMtime")]
+    /// TypeScript wrote this as a JS number (often a float). Rejecting
+    /// those used to drop the entire index, so every semantic score was 0.
+    #[serde(rename = "sourceMtime", deserialize_with = "deserialize_mtime")]
     source_mtime: i64,
     chunks: Vec<ChunkEntry>,
+}
+
+fn deserialize_mtime<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    if let Some(i) = v.as_i64() {
+        return Ok(i);
+    }
+    if let Some(u) = v.as_u64() {
+        return Ok(u as i64);
+    }
+    if let Some(f) = v.as_f64() {
+        return Ok(f as i64);
+    }
+    Err(serde::de::Error::custom("sourceMtime must be a number"))
 }
 
 fn session_key(s: &SessionRef) -> String {
     format!("{}:{}", s.tool.slug(), s.session_id)
 }
 
-fn load_index() -> HashMap<String, SessionEntry> {
-    let Ok(text) = std::fs::read_to_string(index_path()) else { return HashMap::new() };
-    let Ok(entries) = serde_json::from_str::<Vec<SessionEntry>>(&text) else { return HashMap::new() };
-    entries.into_iter().map(|e| (e.key.clone(), e)).collect()
+fn load_index() -> Arc<HashMap<String, SessionEntry>> {
+    let path = index_path();
+    let file_mtime = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u128)
+        .unwrap_or(0);
+    let cache = INDEX_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_mtime, map)) = guard.as_ref() {
+            if *cached_mtime == file_mtime {
+                return Arc::clone(map);
+            }
+        }
+    }
+    let map = Arc::new(load_index_from_disk());
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((file_mtime, Arc::clone(&map)));
+    }
+    map
+}
+
+static INDEX_CACHE: OnceLock<Mutex<Option<(u128, Arc<HashMap<String, SessionEntry>>)>>> = OnceLock::new();
+
+fn invalidate_index_cache() {
+    if let Some(cache) = INDEX_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+fn load_index_from_disk() -> HashMap<String, SessionEntry> {
+    let Ok(text) = std::fs::read_to_string(index_path()) else {
+        return HashMap::new();
+    };
+    // Fast path: one typed parse. The Value-then-per-row fallback used to
+    // decode this 30MB file twice and made the first refine feel broken.
+    if let Ok(entries) = serde_json::from_str::<Vec<SessionEntry>>(&text) {
+        return entries.into_iter().map(|e| (e.key.clone(), e)).collect();
+    }
+    let Ok(raw) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for v in raw {
+        if let Ok(e) = serde_json::from_value::<SessionEntry>(v) {
+            out.insert(e.key.clone(), e);
+        }
+    }
+    out
+}
+
+/// Parse the on-disk index into the process cache so the first keystroke
+/// does not stall on a 30MB JSON read.
+pub fn warmup() {
+    let _ = load_index();
 }
 
 fn save_index(index: &HashMap<String, SessionEntry>) -> anyhow::Result<()> {
@@ -117,7 +192,7 @@ fn needs_embedding(s: &SessionRef, index: &HashMap<String, SessionEntry>) -> boo
 /// True if any session needs (re-)embedding since the last index build.
 pub fn has_pending_work(sessions: &[SessionRef]) -> bool {
     let index = load_index();
-    sessions.iter().any(|s| needs_embedding(s, &index))
+    sessions.iter().any(|s| needs_embedding(s, index.as_ref()))
 }
 
 fn is_lock_stale() -> bool {
@@ -152,7 +227,7 @@ pub async fn build_index(sessions: &[SessionRef]) -> anyhow::Result<()> {
     std::fs::write(lock_path(), std::process::id().to_string())?;
 
     let result = (|| async {
-        let mut index = load_index();
+        let mut index = (*load_index()).clone();
         let to_embed: Vec<&SessionRef> = sessions.iter().filter(|s| needs_embedding(s, &index)).collect();
         if to_embed.is_empty() {
             return Ok(());
@@ -178,10 +253,24 @@ pub async fn build_index(sessions: &[SessionRef]) -> anyhow::Result<()> {
         let live_keys: std::collections::HashSet<String> = sessions.iter().map(session_key).collect();
         index.retain(|k, _| live_keys.contains(k));
         save_index(&index)?;
+        invalidate_index_cache();
         Ok::<(), anyhow::Error>(())
     })()
     .await;
 
     let _ = std::fs::remove_file(lock_path());
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_typescript_float_source_mtime() {
+        let json = r#"[{"key":"claude:abc","sourceMtime":1774840584587.7583,"chunks":[{"vector":[0.1,0.2]}]}]"#;
+        let entries: Vec<SessionEntry> = serde_json::from_str(json).expect("float mtime must deserialize");
+        assert_eq!(entries[0].key, "claude:abc");
+        assert_eq!(entries[0].source_mtime, 1_774_840_584_587);
+    }
 }

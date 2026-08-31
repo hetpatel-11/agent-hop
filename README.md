@@ -22,7 +22,7 @@ Search and resume are part of the same runtime, not a separate product. Every ha
 - **Pane CLI** — from inside a live tab, `ah tab`, `ah hop`, `ah close`, `ah focus`, and `ah workspace` talk to the parent mux (never your own pane for hop/close).
 - **Search every local chat** — one picker over Claude Code, Codex, OpenCode, Pi, and Grok. Hybrid lexical + semantic search, all on your machine.
 - **Resume the real session** — same-harness resume uses that tool's own files and resume command. Cross-harness resume writes a native session the target would have written itself.
-- **Interactive or scripted** — humans stay in the TUI. Agents and CI call `ah resume` without a picker.
+- **Interactive or scripted** — humans stay in the TUI. `ah cli` searches, picks, hops, and execs the real harness on inherited stdio (no mux). Agents and CI call `ah cli "query"` or `ah resume` without a PTY.
 - **Sessions never leave disk** — hop and search read the same files the harnesses already write. Telemetry, if left on, is aggregate usage only.
 
 ## Install
@@ -33,7 +33,7 @@ macOS or Linux, no Node required:
 curl -fsSL https://raw.githubusercontent.com/hetpatel-11/agent-hop/main/install.sh | bash
 ```
 
-That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.5`.
+That pulls `ah` from the [GitHub Release](https://github.com/hetpatel-11/agent-hop/releases/latest) (npm tarball as fallback) into `~/.local/bin`. Override with `AH_BIN_DIR`. Pin a version with `AH_VERSION=0.1.6`.
 
 Or download a binary from the [releases page](https://github.com/hetpatel-11/agent-hop/releases/latest): `ah-darwin-arm64`, `ah-darwin-x64`, `ah-linux-x64`, `ah-linux-arm64`, `ah-windows-x64.exe`.
 
@@ -75,6 +75,14 @@ Reopens the workspaces and tabs from last time, each on that harness's own resum
 | `Ctrl+B` then `?` | Show every `ah` shortcut |
 | `Alt+↑` / `Alt+↓` | Hop next / previous (where the terminal sends those keys) |
 | `Ctrl+R` | Search local history and resume a session in the **same** agent |
+
+**`ah cli`** — search every local chat, pick one, optionally hop it into another harness, then exec that harness with inherited stdio. No mux, no nested PTY. Flags: `-a` to scope an agent, `-r` to resume in another. No TTY: pass a query and the top match is auto-picked.
+
+```bash
+ah cli
+ah cli "oauth bug"
+ah cli "oauth bug" -r grok
+```
 
 Launch straight into a tool:
 
@@ -181,7 +189,7 @@ Adding an agent is one new adapter. The TUI and search do not change.
 
 The incremental vector index lives under `~/.agent-hop/`. New sessions are indexed by a detached `ah __background-index` so the picker never blocks on a full rebuild.
 
-**Standalone resume (`ah resume`)** — Same ranker and picker as `Ctrl+R`, without wrapping a live agent first. `-r` is the scripted hop. Non-interactive mode skips the TUI entirely and execs the target agent's resume command with inherited stdio.
+**Standalone resume (`ah resume`)** — Same ranker and picker as `Ctrl+R`, without wrapping a live agent first. `-r` hops. No TTY execs the target harness. `ah cli` is that flow even when there is a TTY (never opens the mux).
 
 **Telemetry (`src/telemetry.rs`)** — Opt-out, self-hosted (`telemetry.agent-hop.com`). Sends aggregate usage (command, version, OS). Never queries, paths, project names, session ids, or chat content. Disabled by `AH_TELEMETRY=0`, `DO_NOT_TRACK=1`, or `ah telemetry off`.
 

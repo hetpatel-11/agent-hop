@@ -29,6 +29,15 @@ pub fn white(s: &str) -> String {
 pub fn magenta(s: &str) -> String {
     wrap("35", "39", s)
 }
+pub fn cyan(s: &str) -> String {
+    wrap("36", "39", s)
+}
+
+/// v0.0.6 `highlightDate` -- dates in the search hint are bold cyan so
+/// they read separately from the folder and the match snippet.
+pub fn highlight_date(date_str: &str) -> String {
+    bold(&cyan(date_str))
+}
 
 /// agent-hop.com's own brand accent (#22d3ee, Tailwind cyan-400) -- the
 /// dominant color across the marketing site (20 of its ~26 non-grayscale

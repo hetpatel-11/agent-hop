@@ -439,17 +439,27 @@ impl Ranker {
     /// the blend, reusing the same lexical index (no BM25 rebuild). This is
     /// stage 2: call it debounced after typing pauses.
     pub async fn refine_with_semantic(&self, query: &str, limit: usize) -> Vec<SessionRef> {
+        self.refine_with_semantic_status(query, limit).await.0
+    }
+
+    /// Same as `refine_with_semantic`, plus whether any cached vector
+    /// actually contributed. Callers must not treat an empty list as
+    /// "nothing exists" when this is false — the embedder may still be
+    /// catching up.
+    pub async fn refine_with_semantic_status(&self, query: &str, limit: usize) -> (Vec<SessionRef>, bool) {
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            return most_recent(&self.sessions, limit);
+            return (most_recent(&self.sessions, limit), false);
         }
         let (query_terms, match_terms, bm25_normalized) = lexical_scores(&self.index, &self.sessions, trimmed);
         let _ = query_terms;
 
         let mut semantic_normalized = vec![0.0; self.sessions.len()];
+        let mut used_semantic = false;
         if let Ok(()) = crate::embed::ensure_model(|_| {}).await {
             if let Ok(query_vec) = crate::embed::embed_text(trimmed) {
                 let score_map = get_cached_semantic_scores(&self.sessions, &query_vec);
+                used_semantic = score_map.values().any(|s| *s > 0.0);
                 let semantic_raw: Vec<f64> = self
                     .sessions
                     .iter()
@@ -458,13 +468,53 @@ impl Ranker {
                 semantic_normalized = min_max_normalize(&semantic_raw);
             }
         }
-        // offline on first run, disk issue, unsupported platform -- falls
-        // back to lexical-only (semantic_normalized stays all-zero) rather
-        // than failing the refine.
 
         let relevance: Vec<f64> = (0..self.sessions.len()).map(|i| BM25_WEIGHT * bm25_normalized[i] + SEMANTIC_WEIGHT * semantic_normalized[i]).collect();
-        apply_ranking_layers(&self.sessions, &match_terms, trimmed, &relevance, limit, 0.15)
+        (
+            apply_ranking_layers(&self.sessions, &match_terms, trimmed, &relevance, limit, 0.15),
+            used_semantic,
+        )
     }
+}
+
+pub fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// v0.0.6 `sessionOption` hint: bold-cyan date, folder, then the
+/// highlighted match excerpt (or conversation body). Callers must not
+/// wrap this in another color -- `match_snippet` already carries ANSI.
+pub fn session_hint(r: &SessionRef) -> String {
+    let date = chrono::DateTime::from_timestamp_millis(r.updated_at)
+        .map(|d| theme::highlight_date(&d.format("%b %-d, %Y").to_string()))
+        .unwrap_or_default();
+    let folder = std::path::Path::new(&r.project_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(r.project_path.as_str());
+    let body = r.body.as_deref().unwrap_or("").trim();
+    let fallback = if !body.is_empty() && body != r.title {
+        body
+    } else {
+        r.snippet.as_str()
+    };
+    let context = match &r.match_snippet {
+        Some(snippet) => one_line(snippet),
+        None => {
+            let raw = if fallback.is_empty() {
+                r.project_path.as_str()
+            } else {
+                fallback
+            };
+            theme::grey(&one_line(raw).chars().take(160).collect::<String>())
+        }
+    };
+    let context: String = context.chars().take(160).collect();
+    format!("{date} · {folder} · {context}")
+}
+
+pub fn session_title(r: &SessionRef, max_chars: usize) -> String {
+    one_line(&r.title).chars().take(max_chars).collect()
 }
 
 fn most_recent(sessions: &[SessionRef], limit: usize) -> Vec<SessionRef> {
@@ -560,30 +610,23 @@ fn parse_agent_arg(raw: &str) -> ToolName {
     }
 }
 
-/// Standalone `ah resume [query] [-a agent] [-r resume-in]` -- search
-/// outside the TUI (crossterm owns stdin directly here, no relay thread
-/// exists yet), then jump straight into the TUI already resumed at
-/// whatever session was picked.
-///
-/// Ported from the original CLI's non-interactive/scriptable design (see
-/// the v0.0.5 tag): a query can be given directly as an argument for a
-/// one-shot search, `-a` restricts which agent(s) to search, and `-r`
-/// resumes the picked session in a *different* agent than it was recorded
-/// in without needing to enter the live TUI and hop -- e.g. for scripting
-/// or another agent shelling out to this as a command. When stdin/stdout
-/// aren't both real terminals, there's no one to answer an interactive
-/// prompt (it would just hang), so a query is required up front and the
-/// top match is auto-picked rather than blocking forever.
+/// Standalone `ah resume` -- search, then the mux when there is a TTY
+/// (or exec the harness when there is not). `ah cli` is search-and-exec
+/// and lives in `cli_search`.
 pub async fn run_standalone_resume(
     query_arg: Option<String>,
     agent_arg: Option<String>,
     resume_in_arg: Option<String>,
 ) -> anyhow::Result<()> {
     use std::io::IsTerminal;
-    let non_interactive = !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal();
+    let no_tty = !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal();
+    let non_interactive = no_tty;
+    let plain = no_tty;
 
     if non_interactive && query_arg.is_none() {
-        eprintln!("agent-hop: running non-interactively (no TTY) -- a search query is required, e.g. `ah resume \"oauth bug\"`.");
+        eprintln!(
+            "agent-hop: running non-interactively (no TTY) -- a search query is required, e.g. `ah resume \"oauth bug\"`."
+        );
         std::process::exit(1);
     }
 
@@ -633,8 +676,6 @@ pub async fn run_standalone_resume(
             }
         }
     } else {
-        // No query yet -- the familiar live-typing overlay, re-ranking as
-        // you type.
         crossterm::terminal::enable_raw_mode()?;
         let mut keys = crate::resume::CrosstermKeys;
         let mut out = std::io::stdout();
@@ -687,18 +728,10 @@ pub async fn run_standalone_resume(
         session_ref.session_id
     };
 
-    if non_interactive {
-        // The persistent switcher TUI (`tui::run`) unconditionally needs a
-        // real controlling terminal (it puts the terminal in raw mode and
-        // manages a pty directly) -- fundamentally incompatible with "no
-        // TTY," not just an inconvenience to work around. The original
-        // (pre-switcher) design didn't have this problem because it never
-        // wrapped the target agent in anything: it directly spawned (or
-        // execve'd) the target's own native resume command with inherited
-        // stdio. Do the same here for the non-interactive path specifically
-        // -- if the target agent *itself* also needs a real terminal for
-        // its own interactive UI, that's now its own error to report, not
-        // an artifact of our own code requiring one.
+    if plain {
+        // The mux needs a real controlling terminal. No TTY: exec the
+        // target's native resume command with inherited stdio, the way
+        // the original TypeScript CLI did.
         let project_dir = if std::path::Path::new(&project_path).exists() {
             project_path
         } else {
@@ -756,5 +789,106 @@ mod ranker_tests {
             let results = ranker.rank(&query, 10);
             assert!(!results.is_empty(), "expected at least one result for query derived from a real session's own title");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refine_uses_semantic_index_and_can_reorder() {
+        let sessions = collect_sessions(&ToolName::ALL);
+        if sessions.len() < 20 {
+            eprintln!("skipping: too few sessions ({})", sessions.len());
+            return;
+        }
+        let indexed = crate::vector_index::get_cached_semantic_scores(&sessions, &vec![0.0; 384]);
+        eprintln!("sessions={} indexed_keys={}", sessions.len(), indexed.len());
+        assert!(indexed.len() > 10, "semantic index looks empty ({} keys) — refine cannot work", indexed.len());
+
+        let ranker = Ranker::new(sessions);
+        let query = "oauth bug";
+        let t0 = std::time::Instant::now();
+        let lexical = ranker.rank(query, 12);
+        let lexical_ms = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let refined = ranker.refine_with_semantic(query, 12).await;
+        let refine_ms = t1.elapsed();
+        eprintln!("rank {:?} refine {:?}", lexical_ms, refine_ms);
+        eprintln!("lexical:");
+        for (i, s) in lexical.iter().enumerate() {
+            eprintln!("  {i} [{}] {}", s.tool.slug(), s.title.chars().take(70).collect::<String>());
+        }
+        eprintln!("refined:");
+        for (i, s) in refined.iter().enumerate() {
+            eprintln!("  {i} [{}] {}", s.tool.slug(), s.title.chars().take(70).collect::<String>());
+        }
+        assert!(!refined.is_empty(), "refine returned no results");
+    }
+
+    fn titles(rows: &[SessionRef]) -> Vec<String> {
+        rows.iter()
+            .map(|s| format!("{}:{}", s.tool.slug(), s.title.chars().take(48).collect::<String>()))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedding_pipeline_debug() {
+        match crate::embed::ensure_model(|m| eprintln!("model: {m}")).await {
+            Ok(()) => eprintln!("ensure_model ok"),
+            Err(e) => panic!("ensure_model failed: {e:#}"),
+        }
+        crate::vector_index::warmup();
+        let sessions = collect_sessions(&ToolName::ALL);
+        let q = "login token expired";
+        let qv = crate::embed::embed_text(q).expect("embed_text failed");
+        eprintln!("query vec dim={} norm2={}", qv.len(), qv.iter().map(|x| x * x).sum::<f32>());
+        let scores = crate::vector_index::get_cached_semantic_scores(&sessions, &qv);
+        let mut vals: Vec<f32> = scores.values().copied().collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "score_map={} min={:?} p50={:?} max={:?}",
+            scores.len(),
+            vals.first(),
+            vals.get(vals.len() / 2),
+            vals.last()
+        );
+        assert!(!scores.is_empty(), "index produced no scores against a real query vector");
+        assert!(
+            vals.last().copied().unwrap_or(0.0) > 0.05,
+            "best cosine is too low — embeddings are not matching the corpus"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paraphrase_query_is_found_by_embeddings_not_just_bm25() {
+        let _ = crate::embed::ensure_model(|_| {}).await;
+        crate::vector_index::warmup();
+        let sessions = collect_sessions(&ToolName::ALL);
+        let ranker = Ranker::new(sessions);
+        // Phrases that should not be literal titles, but sit near real
+        // chats about auth / hopping / resume.
+        let queries = [
+            "login token expired",
+            "continue a claude chat in codex",
+            "search every agent conversation history",
+            "resume a past coding session in a different tool",
+        ];
+        let mut any_divergence = false;
+        for q in queries {
+            let lexical = ranker.rank(q, 12);
+            let (refined, used) = ranker.refine_with_semantic_status(q, 12).await;
+            let lex = titles(&lexical);
+            let sem = titles(&refined);
+            eprintln!("\nQUERY {q:?} used_semantic={used}");
+            eprintln!("  lexical ({}) {:?}", lex.len(), lex);
+            eprintln!("  refined ({}) {:?}", sem.len(), sem);
+            if used && lex != sem {
+                any_divergence = true;
+            }
+            if used && lexical.is_empty() && !refined.is_empty() {
+                any_divergence = true;
+            }
+        }
+        assert!(
+            any_divergence,
+            "embeddings never changed ranking vs BM25 on paraphrase queries — semantic is not affecting results"
+        );
     }
 }

@@ -236,7 +236,7 @@ pub fn run_resume_ui(
     // on every exit path, via the single `break`-driven loop.
     queue!(out, cursor::Hide)?;
 
-    render(out, &query, &results, selected)?;
+    paint_mux(out, &query, &results, selected)?;
 
     let outcome = loop {
         match keys.next_key()? {
@@ -253,25 +253,25 @@ pub fn run_resume_ui(
                 if selected > 0 {
                     selected -= 1;
                 }
-                render(out, &query, &results, selected)?;
+                paint_mux(out, &query, &results, selected)?;
             }
             Some(SearchKey::Down) => {
                 if selected + 1 < results.len() {
                     selected += 1;
                 }
-                render(out, &query, &results, selected)?;
+                paint_mux(out, &query, &results, selected)?;
             }
             Some(SearchKey::Backspace) => {
                 query.pop();
                 results = ranker.rank(&query, MAX_VISIBLE_RESULTS);
                 selected = 0;
-                render(out, &query, &results, selected)?;
+                paint_mux(out, &query, &results, selected)?;
             }
             Some(SearchKey::Char(c)) => {
                 query.push(c);
                 results = ranker.rank(&query, MAX_VISIBLE_RESULTS);
                 selected = 0;
-                render(out, &query, &results, selected)?;
+                paint_mux(out, &query, &results, selected)?;
             }
         }
     };
@@ -281,51 +281,244 @@ pub fn run_resume_ui(
     Ok(outcome)
 }
 
-/// Renders in Clack's visual language (the `@clack/prompts` look:
-/// diamond-headed step, a connecting spine down the left margin, hollow/
-/// filled circles for unselected/selected items) -- reimplemented directly
-/// rather than pulling in the `cliclack` crate, since that crate wants to
-/// own its own event loop and raw-mode session for a fixed set of
-/// discrete prompts, whereas this overlay is a continuously-reactive
-/// fuzzy search fed through our own custom key-routing (`ChannelKeys`)
-/// while a backgrounded agent's pty keeps draining -- the visual style
-/// carries over cleanly, the input model doesn't.
-fn render(out: &mut impl Write, query: &str, results: &[SessionRef], selected: usize) -> anyhow::Result<()> {
+pub struct SearchFrame<'a> {
+    pub title: &'a str,
+    pub query_prefix: &'a str,
+    pub query: &'a str,
+    pub results: &'a [SessionRef],
+    pub selected: usize,
+    /// Stage-2 semantic refine is still in flight for this query.
+    pub searching: bool,
+    /// Background embedder still has unindexed sessions. Used so an empty
+    /// BM25 list is not announced as "no results" while vectors are building.
+    pub index_pending: bool,
+}
+
+fn paint_mux(
+    out: &mut impl Write,
+    query: &str,
+    results: &[SessionRef],
+    selected: usize,
+) -> anyhow::Result<()> {
     queue!(out, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
-    let spine = theme::grey("\u{2502}");
-    queue!(
+    write_search_frame(
         out,
-        Print(format!("{}  {}\r\n", theme::bold(&theme::magenta("\u{25c6}")), theme::bold("Resume a session")))
-    )?;
-    queue!(out, Print(format!("{spine}\r\n")))?;
-    queue!(out, Print(format!("{spine}  {}{query}\u{2588}\r\n", theme::grey("Search  "))))?;
-    queue!(out, Print(format!("{spine}\r\n")))?;
-    if results.is_empty() {
-        queue!(out, Print(format!("{spine}  {}\r\n", theme::grey("(no results)"))))?;
-    }
-    for (i, r) in results.iter().enumerate() {
-        let tag = theme::tool_tag(r.tool);
-        let title: String = r.title.chars().take(70).collect();
-        if i == selected {
-            let marker = theme::bold(&theme::magenta("\u{25cf}"));
-            queue!(out, Print(format!("{spine}  {marker} {tag} {}\r\n", theme::bold(&title))))?;
-            if let Some(snippet) = &r.match_snippet {
-                queue!(out, Print(format!("{spine}     {}\r\n", theme::grey(snippet))))?;
-            }
-        } else {
-            let marker = theme::grey("\u{25cb}");
-            queue!(out, Print(format!("{spine}  {marker} {tag} {title}\r\n")))?;
-        }
-    }
-    queue!(out, Print(format!("{spine}\r\n")))?;
-    queue!(
-        out,
-        Print(format!(
-            "{}  {}\r\n",
-            theme::grey("\u{2514}"),
-            theme::grey("\u{2191}/\u{2193} move \u{00b7} enter resume \u{00b7} esc cancel")
-        ))
+        SearchFrame {
+            title: "Resume a session",
+            query_prefix: "Search  ",
+            query,
+            results,
+            selected,
+            searching: false,
+            index_pending: false,
+        },
     )?;
     out.flush()?;
     Ok(())
+}
+
+/// One Clack-style search frame: diamond title, typed query, color-coded
+/// `[agent]` tags, cyan date + highlighted match on the focused row.
+/// Shared by the mux overlay and `ah cli`. Returns the number of lines
+/// written so an inline (non-fullscreen) caller can MoveUp and redraw.
+fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Cut a line to `max` visible columns without breaking ANSI, so a long
+/// hint cannot wrap and throw off redraw.
+fn truncate_ansi(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if visible_len(s) <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                for c2 in chars.by_ref() {
+                    out.push(c2);
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if visible >= keep {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out.push('…');
+    out.push_str("\x1b[0m");
+    out
+}
+
+/// None = do not show an empty-state row (either there are hits, or
+/// semantic refine is still running — v0.0.6 never said "no results" then).
+pub fn empty_status(
+    query: &str,
+    results_empty: bool,
+    semantic_pending: bool,
+    index_pending: bool,
+) -> Option<&'static str> {
+    if !results_empty || query.trim().is_empty() {
+        return None;
+    }
+    if semantic_pending {
+        return None;
+    }
+    if index_pending {
+        return Some(
+            "Semantic search is still indexing sessions — try this phrase again in a moment.",
+        );
+    }
+    Some("no results found — try a different phrase")
+}
+
+fn put_line(out: &mut impl Write, s: &str, lines: &mut u16) -> anyhow::Result<()> {
+    let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+    let s = truncate_ansi(s, cols.saturating_sub(1));
+    queue!(out, Print(s), Print("\r\n"))?;
+    *lines += 1;
+    Ok(())
+}
+
+pub fn write_search_frame(out: &mut impl Write, frame: SearchFrame<'_>) -> anyhow::Result<u16> {
+    let spine = theme::grey("│");
+    let mut lines = 0u16;
+
+    put_line(
+        out,
+        &format!("{}  {}", theme::bold(&theme::magenta("◆")), theme::bold(frame.title)),
+        &mut lines,
+    )?;
+    put_line(out, &spine, &mut lines)?;
+    put_line(
+        out,
+        &format!(
+            "{spine}  {}{}{}",
+            theme::grey(frame.query_prefix),
+            frame.query,
+            theme::bold("█")
+        ),
+        &mut lines,
+    )?;
+    put_line(out, &spine, &mut lines)?;
+
+    if let Some(msg) = empty_status(
+        frame.query,
+        frame.results.is_empty(),
+        frame.searching,
+        frame.index_pending,
+    ) {
+        put_line(out, &format!("{spine}  {}", theme::grey(msg)), &mut lines)?;
+    }
+
+    for (i, r) in frame.results.iter().enumerate() {
+        let tag = theme::tool_tag(r.tool);
+        let title = crate::search::session_title(r, 70);
+        if i == frame.selected {
+            let marker = theme::bold(&theme::magenta("●"));
+            put_line(
+                out,
+                &format!("{spine}  {marker} {tag} {}", theme::bold(&title)),
+                &mut lines,
+            )?;
+            put_line(
+                out,
+                &format!("{spine}     {}", crate::search::session_hint(r)),
+                &mut lines,
+            )?;
+        } else {
+            let marker = theme::grey("○");
+            put_line(out, &format!("{spine}  {marker} {tag} {title}"), &mut lines)?;
+        }
+    }
+
+    if frame.searching {
+        put_line(
+            out,
+            &format!(
+                "{spine}  {}",
+                theme::grey("(still semantically searching for more…)")
+            ),
+            &mut lines,
+        )?;
+    }
+
+    put_line(out, &spine, &mut lines)?;
+    put_line(
+        out,
+        &format!(
+            "{}  {}",
+            theme::grey("└"),
+            theme::grey("↑/↓ move · enter pick · esc cancel")
+        ),
+        &mut lines,
+    )?;
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ansi_counts_visible_only() {
+        let colored = format!("{}hello{}", "\x1b[38;5;208m", "\x1b[39m");
+        assert_eq!(visible_len(&colored), 5);
+        let cut = truncate_ansi(&colored, 3);
+        assert_eq!(visible_len(&cut), 3);
+        assert!(cut.contains('…'));
+    }
+
+    #[test]
+    fn truncate_ansi_leaves_short_lines_alone() {
+        assert_eq!(truncate_ansi("hi", 10), "hi");
+    }
+
+    #[test]
+    fn no_results_waits_for_semantic() {
+        assert_eq!(
+            empty_status("oauth", true, true, false),
+            None,
+            "stage 2 in flight must not say no results"
+        );
+        assert_eq!(
+            empty_status("oauth", true, false, true),
+            Some("Semantic search is still indexing sessions — try this phrase again in a moment.")
+        );
+        assert_eq!(
+            empty_status("oauth", true, false, false),
+            Some("no results found — try a different phrase")
+        );
+        assert_eq!(empty_status("oauth", false, false, false), None);
+        assert_eq!(empty_status("", true, false, false), None);
+    }
 }

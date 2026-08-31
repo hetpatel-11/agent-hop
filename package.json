@@ -1,6 +1,6 @@
 {
   "name": "agent-hop",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Runtime for coding-agent harnesses. Run Claude Code, Codex, OpenCode, Pi, and Grok in one terminal, hop a live session between them, and search or resume any local chat.",
   "keywords": [
     "runtime",
@@ -44,10 +44,10 @@
     "bin"
   ],
   "optionalDependencies": {
-    "agent-hop-darwin-arm64": "0.1.5",
-    "agent-hop-darwin-x64": "0.1.5",
-    "agent-hop-linux-x64": "0.1.5",
-    "agent-hop-linux-arm64": "0.1.5",
-    "agent-hop-windows-x64": "0.1.5"
+    "agent-hop-darwin-arm64": "0.1.6",
+    "agent-hop-darwin-x64": "0.1.6",
+    "agent-hop-linux-x64": "0.1.6",
+    "agent-hop-linux-arm64": "0.1.6",
+    "agent-hop-windows-x64": "0.1.6"
   }
 }

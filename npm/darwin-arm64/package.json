@@ -1,6 +1,6 @@
 {
   "name": "agent-hop-darwin-arm64",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "agent-hop native binary for macOS (Apple Silicon). Not meant to be installed directly -- installed automatically as an optionalDependency of the `agent-hop` package.",
   "license": "MIT",
   "os": ["darwin"],

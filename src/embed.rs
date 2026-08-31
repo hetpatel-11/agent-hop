@@ -5,8 +5,9 @@
 //! models). Faithful, literal port -- comments carried over from the TS
 //! source since they document real, hard-won behavior.
 
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::Tensor;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
@@ -104,8 +105,11 @@ fn ort_err<R>(e: ort::Error<R>) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
+static SESSION: OnceLock<ManuallyDrop<Mutex<Session>>> = OnceLock::new();
 static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
+/// Serializes the one-time ONNX load. Every keystroke used to race
+/// `ensure_model` and reload the 23MB graph in parallel.
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 async fn download_file(url: &str, dest: &std::path::Path, on_progress: &(impl Fn(&str) + Sync)) -> anyhow::Result<()> {
     on_progress(&format!("Downloading {}...", dest.file_name().unwrap_or_default().to_string_lossy()));
@@ -134,25 +138,34 @@ pub async fn ensure_model(on_progress: impl Fn(&str) + Sync) -> anyhow::Result<(
         download_file(TOKENIZER_CONFIG_URL, &tokenizer_config_path, &on_progress).await?;
     }
 
-    if SESSION.get().is_none() {
-        // Must happen before the first `Session::builder()` call anywhere
-        // in the process -- `ort`'s API loader is a lazily-initialized
-        // global that locks in whichever dylib path it finds (or its
-        // platform-default guess) the first time any `ort` API is touched.
-        let dylib_path = ensure_onnxruntime_dylib(&on_progress).await?;
-        // SAFETY: single-threaded at this point in startup (called once,
-        // guarded by `SESSION.get().is_none()` above, before any other
-        // thread has a reason to touch `ort`) -- `set_var` here can't race
-        // with a read of the same variable from another thread.
-        unsafe {
-            std::env::set_var("ORT_DYLIB_PATH", &dylib_path);
-        }
+    if SESSION.get().is_some() && TOKENIZER.get().is_some() {
+        return Ok(());
+    }
 
+    let dylib_path = ensure_onnxruntime_dylib(&on_progress).await?;
+    let _init = INIT_LOCK.lock().map_err(|_| anyhow::anyhow!("embedding init lock poisoned"))?;
+    if SESSION.get().is_some() && TOKENIZER.get().is_some() {
+        return Ok(());
+    }
+
+    // Must happen before the first `Session::builder()` call -- `ort`'s
+    // API loader locks in the first dylib it sees. `init_from` + commit
+    // is the supported load-dynamic path; env-var-only was leaving us
+    // on a stub API where Level3 reported "graph_optimization_level is
+    // not valid" and every refine silently fell back to BM25.
+    ort::init_from(&dylib_path)
+        .map_err(|e| anyhow::anyhow!("failed to load ONNX Runtime: {e}"))?
+        .commit();
+
+    if SESSION.get().is_none() {
         on_progress("Loading embedding model...");
-        let builder = Session::builder().map_err(ort_err)?;
-        let mut builder = builder.with_optimization_level(GraphOptimizationLevel::Level3).map_err(ort_err)?;
-        let session = builder.commit_from_file(&model_path).map_err(ort_err)?;
-        let _ = SESSION.set(Mutex::new(session));
+        let session = Session::builder()
+            .map_err(ort_err)?
+            .commit_from_file(&model_path)
+            .map_err(ort_err)?;
+        // Do not drop the Ort Session at process exit -- its C++ mutex
+        // is already torn down and abort()s with "mutex lock failed".
+        let _ = SESSION.set(ManuallyDrop::new(Mutex::new(session)));
     }
     if TOKENIZER.get().is_none() {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
